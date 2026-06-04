@@ -1,0 +1,4 @@
+# Runtime state — not part of the worker's source.
+/checkouts/
+/state/
+/logs/
