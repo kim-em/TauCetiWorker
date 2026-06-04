@@ -60,6 +60,14 @@ On `PATH`, logged in to the subscriptions you want used:
 
 - The agents run with broad permissions on your machine and push to GitHub as
   `kim-em`. They are constrained by the prompts (TauCeti/-only, no linter
-  silencing, build-green-before-push) but not sandboxed — run this only where you
-  are comfortable with that.
+  silencing, build-green-before-push) but **not sandboxed** — run this only where
+  you are comfortable with that. Sandboxing them (via `bubble`, with a scoped
+  GitHub token) is the top item in [TODO.md](TODO.md).
+- `loop.sh` runs a `preflight` at startup (checks `gh`/`git`/`jq`/`uvx`/`lake`,
+  at least one of `claude`/`codex`, the quota scripts, and `gh auth`) and exits
+  loudly if anything is missing. A GitHub API failure mid-round aborts that round
+  rather than silently falling through to authoring.
 - `checkouts/`, `state/`, and `logs/` are runtime-only and git-ignored.
+
+See [TODO.md](TODO.md) for the planned sandbox and a third (DeepSeek via
+OpenRouter+Pi) reviewer-author.

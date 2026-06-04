@@ -27,7 +27,7 @@ lake exe axioms
 Iterate until green. Never push red.
 
 ## Submit
-- Commit the fixes (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`).
+- Commit the fixes (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - `git push` to the PR's branch (this updates the PR; a re-review runs separately).
 - Do NOT open a new PR; do NOT touch other files.
 

@@ -23,8 +23,25 @@ CLAUDE_AVAIL="$HOME/.claude/skills/claude-usage/claude-available-model"
 CODEX_AVAIL="$HOME/.claude/skills/claude-usage/codex-available-model"
 POLL=300             # seconds between quota checks while waiting
 ROUND_TIMEOUT=5400   # 90 min hard cap per round (a full author+build can be long)
+INTERROUND=20        # min gap between rounds, so a no-op round can't busy-loop
 
 mkdir -p "$HERE/logs" "$HERE/state"
+
+# Fail loudly at startup if the environment can't do a round, rather than
+# sleeping forever or silently falling through to authoring.
+preflight() {
+    local bad=0 t
+    for t in gh git jq uvx lake; do
+        command -v "$t" >/dev/null || { echo "preflight: missing '$t' on PATH" >&2; bad=1; }
+    done
+    command -v claude >/dev/null || command -v codex >/dev/null \
+        || { echo "preflight: need claude and/or codex on PATH" >&2; bad=1; }
+    [[ -x "$CLAUDE_AVAIL" && -x "$CODEX_AVAIL" ]] \
+        || { echo "preflight: quota scripts not found under ~/.claude/skills/claude-usage/" >&2; bad=1; }
+    gh auth status >/dev/null 2>&1 || { echo "preflight: gh is not authenticated (run 'gh auth login')" >&2; bad=1; }
+    (( bad )) && { echo "preflight failed — fix the above and re-run" >&2; exit 1; }
+}
+preflight
 
 round_tpid=""
 trap 'echo "$(date "+%F %T") loop.sh: interrupted — stopping round and exiting" >&2;
@@ -72,4 +89,5 @@ while true; do
     # which subscription model to drive (prefers Codex for authoring/fixing; uses
     # whichever models are available for review).
     CODEX_OK="$codex_ok" OPUS_OK="$opus_ok" run_round task "$HERE/round.sh"
+    sleep "$INTERROUND"   # floor between rounds; a no-op round can't tight-loop
 done
