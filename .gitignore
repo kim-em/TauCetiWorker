@@ -1,4 +1,4 @@
 # Runtime state — not part of the worker's source.
-/checkouts/
+# (Per-round checkouts now live inside the bubble container, not on the host.)
 /state/
 /logs/

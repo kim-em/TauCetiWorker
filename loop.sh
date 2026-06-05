@@ -40,7 +40,9 @@ mkdir -p "$HERE/logs" "$HERE/state"
 # sleeping forever or silently falling through to authoring.
 preflight() {
     local bad=0 t
-    for t in gh git jq uvx lake; do
+    # Host tools: gh/git/jq drive orchestration; uvx runs the review CLI; bubble
+    # runs each authoring/fixing round in a container (lake now runs in-container).
+    for t in gh git jq uvx bubble; do
         command -v "$t" >/dev/null || { echo "preflight: missing '$t' on PATH" >&2; bad=1; }
     done
     command -v claude >/dev/null || command -v codex >/dev/null \
