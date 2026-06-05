@@ -11,6 +11,13 @@
 # Codex is exhausted but Opus has quota; sleep and re-check when neither is
 # available. (Sonnet-only does NOT count — this worker wants Opus or Codex.)
 #
+# Account selection: before measuring Claude quota we run `swap-account best
+# --force` so we read (and then run under) whichever Claude account has the most
+# quota. Without this we'd read whatever account happens to be active — which can
+# be a near-exhausted one (→ sonnet → sleep) while another sits idle with full
+# Opus. Codex quota is cache-backed; if the cache is stale (exit 2) we refresh it
+# once and re-check rather than treating "unknown" as "exhausted".
+#
 # Each round runs under a hard wall-clock timeout in its own process group, so a
 # wedged sub-task is torn down (SIGTERM then SIGKILL) instead of parking the loop
 # forever. The round runs in the background and we `wait` on it, recording the
@@ -21,6 +28,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_AVAIL="$HOME/.claude/skills/claude-usage/claude-available-model"
 CODEX_AVAIL="$HOME/.claude/skills/claude-usage/codex-available-model"
+CODEX_REFRESH="$HOME/.claude/skills/claude-usage/codex-usage-refresh"
+SWAP="$HOME/.claude/swap-account"   # picks the Claude account with the most quota
 POLL=300             # seconds between quota checks while waiting
 ROUND_TIMEOUT=5400   # 90 min hard cap per round (a full author+build can be long)
 INTERROUND=20        # min gap between rounds, so a no-op round can't busy-loop
@@ -72,8 +81,26 @@ run_round() {
 
 while true; do
     # Quota: Codex preferred (cheaper), Opus as fallback. Empty = unavailable.
-    codex_model=$("$CODEX_AVAIL" 2>/dev/null) || codex_model=""
+
+    # Codex is cache-backed. Exit 2 means the cache is stale/missing ("unknown",
+    # NOT exhausted) — the refresh timer fires less often than the cache TTL, so
+    # this is the common case mid-cycle. Refresh once and re-check before giving
+    # up, otherwise live Codex quota reads as "none" for half of every cycle.
+    codex_model=$("$CODEX_AVAIL" 2>/dev/null); codex_rc=$?
+    if (( codex_rc == 2 )) && [[ -x "$CODEX_REFRESH" ]]; then
+        "$CODEX_REFRESH" >/dev/null 2>&1 || true
+        codex_model=$("$CODEX_AVAIL" 2>/dev/null) || codex_model=""
+    fi
+
+    # Switch to the Claude account with the most remaining quota BEFORE measuring
+    # it, so the quota we read is the quota the round will actually run under. A
+    # failure here is non-fatal: we fall back to whichever account is active.
+    if [[ -x "$SWAP" ]]; then
+        "$SWAP" best --force >/dev/null 2>&1 \
+            || echo "$(date '+%F %T') swap-account best failed — using active account" >&2
+    fi
     claude_model=$("$CLAUDE_AVAIL" --force 2>/dev/null) || claude_model=""
+
     codex_ok=0; opus_ok=0
     [[ "$codex_model" == gpt-5* ]] && codex_ok=1
     [[ "$claude_model" == "opus" ]] && opus_ok=1   # sonnet does not count
