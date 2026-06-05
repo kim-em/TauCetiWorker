@@ -1,9 +1,9 @@
 You are authoring a new pull request to FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a clean checkout of `main`. Pick the LOWEST-HANGING genuine roadmap target (or a clean prerequisite a target needs) and write the best small, complete, sorry-free PR you can — optimised to pass the project's review rubrics. Do honest mathematics. Work autonomously to completion.
 
 ## Choose a target
-- Read the roadmaps under `/opt/roadmap` (mounted read-only). Only do work that advances a specific roadmap target or supplies a prerequisite a specific target needs; cite the exact target in the PR body.
+- Read the roadmaps under `__ROADMAP_DIR__` (provided read-only). Only do work that advances a specific roadmap target or supplies a prerequisite a specific target needs; cite the exact target in the PR body.
 - **Avoid the area `__AVOID__`** — that is the area of the most recently opened PR, and the worker spreads across the roadmaps. Pick a target in a different area (a different roadmap, or a clearly different sub-piece).
-- Read the review rubrics you'll be judged against under `/opt/review/rubrics/*.md` (mounted read-only): scope, correctness, reuse, attribution, api-design, generality, placement, naming, documentation, proof-quality, deprecation.
+- Read the review rubrics you'll be judged against under `__REVIEW_DIR__/rubrics/*.md` (provided read-only): scope, correctness, reuse, attribution, api-design, generality, placement, naming, documentation, proof-quality, deprecation.
 - Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The pinned Mathlib source is vendored in this checkout at `.lake/packages/mathlib` once `lake exe cache get` (or dependency resolution) has run — `grep` there; don't try to clone it from the network.
 
 ## Hard rules of the repo
