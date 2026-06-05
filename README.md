@@ -84,10 +84,21 @@ prompt-injected agent is bounded by the container, not the host:
 - **Credentials** — only the one subscription credential the work model needs
   (`~/.claude/.credentials.json` *or* `~/.codex/auth.json`) is seeded into the
   container; the other subscription and all host config (CLAUDE.md, skills, Codex
-  config) stay out.
+  config) stay out. The agent can necessarily read — and in principle exfiltrate —
+  the single subscription credential it runs under (exactly as the review clean
+  room can); that residual is accepted. The *other* subscription and the host
+  GitHub token remain out of reach.
+- **Isolation from operator config** — the worker drives bubble with a private
+  `BUBBLE_HOME` (`~/.cache/tauceti-worker/bubble`, override via
+  `$TAUCETI_BUBBLE_HOME`) and `--local`, so a round can't inherit ambient
+  `[[mounts]]` or a remote/cloud default from your `~/.bubble/config.toml`. The
+  shared Mathlib cache is set to `overlay` (read-only base + per-round writable
+  overlay) so one round can't poison a later round's build. First use builds the
+  worker's git mirrors and cache there — slow once, fast afterwards.
 - **Teardown** — the container is `--ephemeral` (popped when the round's command
-  exits, propagating its exit code); a leftover from a SIGKILLed round is cleared
-  at the start of the next round.
+  exits, propagating its exit code), and popped again explicitly in case that
+  failed; a leftover from a SIGKILLed round is cleared at the start of the next
+  round. `round.sh` also takes a `flock` so two rounds can't run at once.
 
 The agent still runs `--dangerously-skip-permissions` / `--sandbox
 danger-full-access` *inside* the container — that "full access" is now the

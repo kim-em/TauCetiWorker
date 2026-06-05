@@ -28,6 +28,11 @@ mkdir -p "$STATE"
 log() { echo "$(date '+%F %T') round: $*" >&2; }
 die() { log "$*"; exit 1; }
 
+# Refuse to run two rounds at once: they share a fixed bubble name and the state/
+# dir, and could pop each other's live container. The lock auto-releases on exit.
+exec 9>"$STATE/round.lock"
+flock -n 9 || die "another round holds $STATE/round.lock — refusing to run concurrently"
+
 # Models. Authoring/fixing prefers Codex (spare Opus); review uses every model
 # that currently has quota (so it stays dual-model when it can).
 CODEX_OK="${CODEX_OK:-0}"; OPUS_OK="${OPUS_OK:-0}"
@@ -70,6 +75,21 @@ counter() { local n; n=$(cat "$1" 2>/dev/null || echo 0); [[ "$n" =~ ^[0-9]+$ ]]
 # subscription credential the work model needs is seeded; no host config (notably
 # ~/.claude/CLAUDE.md) crosses the boundary.
 BUBBLE="tauceti-worker"   # fixed name; rounds are sequential, so one suffices
+# A worker-private bubble data dir, so the sandbox can't inherit ambient
+# `[[mounts]]` or a remote/cloud default from the operator's ~/.bubble/config.toml
+# — the mount set and runtime are exactly what this script asks for. First use
+# builds the worker's git mirrors + Mathlib cache here (slow once, then cached).
+export BUBBLE_HOME="${TAUCETI_BUBBLE_HOME:-$HOME/.cache/tauceti-worker/bubble}"
+
+# ensure_bubble_home — one-time hardening of the private bubble home: read-only
+# shared Mathlib cache (per-round writable overlay) so a compromised round can't
+# poison a later round's build. Best-effort; the round still runs if it fails.
+ensure_bubble_home() {
+    [[ -f "$BUBBLE_HOME/.worker-init" ]] && return 0
+    mkdir -p "$BUBBLE_HOME"
+    bubble security set shared-cache overlay >/dev/null 2>&1 || true
+    touch "$BUBBLE_HOME/.worker-init"
+}
 
 # agent_cred_flags — bubble flags seeding ONLY the work model's subscription
 # credential, with all config and the other subscription kept out of the sandbox.
@@ -102,13 +122,14 @@ agent_inner_cmd() {
 # the agent's exit code.
 run_in_bubble() {
     local target="$1" prompt="$2"; shift 2
+    ensure_bubble_home
     local rounddir="$STATE/bubble-round"
     rm -rf "$rounddir"; mkdir -p "$rounddir"
     printf '%s' "$prompt" > "$rounddir/prompt.txt"
 
     # Clear any container left by a previous round that loop.sh's timeout SIGKILLed
     # before --ephemeral could fire (a SIGKILL can't be trapped). Rounds run one at
-    # a time, so the fixed name is self-cleaning.
+    # a time (enforced by the flock above), so the fixed name is self-cleaning.
     bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true
     trap 'bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true' EXIT
 
@@ -116,15 +137,20 @@ run_in_bubble() {
     for m in "$@"; do mounts+=( --mount "$m" ); done
     local creds=(); while IFS= read -r m; do creds+=( "$m" ); done < <(agent_cred_flags)
 
-    # allowlist-write-graphql is the minimal level that still lets the agent open a
-    # PR and post review-thread replies, all repo-scoped to TauCeti by the proxy.
-    # Pinning it keeps the worker independent of the host's bubble default (a
-    # `security.github=off` lockdown still wins and would correctly abort).
+    # --local forces the local Incus runtime (a host remote/cloud default would
+    # reject the --mount). --github-security allowlist-write-graphql is the minimal
+    # level that still lets the agent open a PR and post review-thread replies, all
+    # repo-scoped to TauCeti by the proxy; pinning it keeps the worker independent
+    # of the host bubble default (a `security.github=off` lockdown still wins and
+    # would correctly abort).
     local rc=0
-    bubble open "$target" --shell --name "$BUBBLE" --ephemeral \
+    bubble open "$target" --shell --local --name "$BUBBLE" --ephemeral \
         --github-security allowlist-write-graphql \
         "${mounts[@]}" "${creds[@]}" --command "$(agent_inner_cmd)" || rc=$?
 
+    # Don't rely on --ephemeral's pop alone: if it failed, the container (with the
+    # mounted subscription credential) would linger. Pop again before returning.
+    bubble pop "$BUBBLE" -f >/dev/null 2>&1 || true
     trap - EXIT
     return $rc
 }
@@ -135,7 +161,11 @@ run_in_bubble() {
 fetch_ref() {
     local repo="$1" dir="$2"
     if [[ -d "$dir/.git" ]]; then
-        git -C "$dir" fetch -q --depth 1 origin HEAD && git -C "$dir" reset -q --hard FETCH_HEAD
+        # These dirs are worker-owned throwaway mirrors (no user work); reset hard
+        # and drop any untracked/planted files so the mount is exactly upstream.
+        git -C "$dir" fetch -q --depth 1 origin HEAD \
+            && git -C "$dir" reset -q --hard FETCH_HEAD \
+            && git -C "$dir" clean -fdxq
     else
         rm -rf "$dir"; mkdir -p "$(dirname "$dir")"
         git clone -q --depth 1 "https://github.com/$repo" "$dir"
