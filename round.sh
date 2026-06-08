@@ -4,10 +4,17 @@
 #
 # Priority:
 #   1. Review an open TauCeti PR whose current head has not been reviewed yet
-#      (and whose CI build is green) — via the `tauceti-review` CLI.
+#      (and whose CI build is green) — via the `tauceti-review` CLI. A given PR
+#      is reviewed at most MAX_REVIEW_ATTEMPTS times, ever (counted from real,
+#      ledger-recorded reviews).
 #   2. Fix one of kim-em's open PRs whose latest review (on the current head)
 #      requests changes (🟡) or blocks (⛔) — drive an agent to address them.
-#   3. Otherwise advance a roadmap target with a new PR.
+#      Bounded per-head (MAX_FIX_ATTEMPTS) and per-PR over its lifetime
+#      (MAX_FIX_PR_ATTEMPTS), so review↔fix can't ping-pong indefinitely.
+#   3. Fix red CI on one of kim-em's open PRs whose "build" check has FAILED at
+#      head (it can't be reviewed or review-fixed, so it would sit red forever).
+#      Bounded per-head (MAX_CI_ATTEMPTS) and per-PR (MAX_CI_PR_ATTEMPTS).
+#   4. Otherwise advance a roadmap target with a new PR.
 #
 # A GitHub API failure ABORTS the round (exit 1) rather than being read as "no
 # work" — otherwise a transient outage would silently fall through to authoring.
@@ -30,7 +37,12 @@ ME="kim-em"
 STORE="$HOME/.cache/tauceti-review/store/FormalFrontier__TauCeti/ledger.json"
 CHECKOUT="$HERE/checkouts/TauCeti"   # host authoring checkout (used without --bubble)
 STATE="$HERE/state"
-MAX_FIX_ATTEMPTS=3
+MAX_FIX_ATTEMPTS=3        # per-head: stop fixing the same head after this many tries
+MAX_FIX_PR_ATTEMPTS=5     # per-PR lifetime backstop: stop fixing a PR across all heads
+MAX_REVIEW_ATTEMPTS=3     # never re-review the same PR more than this many times (real reviews)
+MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
+MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
+MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
 mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
 log() { echo "$(date '+%F %T') round: $*" >&2; }
@@ -98,6 +110,13 @@ fi
 ledger_head() {
     [[ -f "$STORE" ]] || { echo ""; return; }
     jq -r --arg pr "$1" '.prs[$pr].rounds[-1].head_sha // ""' "$STORE"
+}
+# ledger_review_count PR — how many times this worker has actually reviewed PR
+# (number of recorded review rounds). Counts REAL reviews, not attempts, so a
+# transient review failure (which never writes a round) doesn't burn the cap.
+ledger_review_count() {
+    [[ -f "$STORE" ]] || { echo 0; return; }
+    jq -r --arg pr "$1" '(.prs[$pr].rounds // []) | length' "$STORE"
 }
 # ledger_blocking PR HEAD — "1" if the latest round at exactly HEAD has a
 # changes-requested (🟡) or blocked (⛔) rubric.
@@ -283,32 +302,67 @@ run_in_bubble() {
 do_review() {
     local pr="$1" head="$2"
     [[ -n "$REVIEWERS" ]] || die "no reviewer models available"
-    log "reviewing PR #$pr @ ${head:0:12} (reviewers=$REVIEWERS)"
+    local errkey="$STATE/review-err-$pr" nrev; nrev=$(ledger_review_count "$pr")
+    log "reviewing PR #$pr @ ${head:0:12} (review $((nrev+1))/$MAX_REVIEW_ATTEMPTS, reviewers=$REVIEWERS)"
     uvx --from "git+https://github.com/$REVIEW" tauceti-review "$pr" \
         --post --reviewer "$REVIEWERS" --expect-head "$head"
+    local rc=$?
+    # A clean run records a ledger round (the real-review cap counts those); reset
+    # the transient-error counter. A failure didn't review, so bound the retries.
+    if (( rc == 0 )); then echo 0 > "$errkey"
+    else local e; e=$(counter "$errkey"); echo $((e+1)) > "$errkey"; fi
+    return $rc
 }
 
 # 2. Fix -----------------------------------------------------------------------
 do_fix() {
     local pr="$1" head="$2"
-    local key="$STATE/fix-$pr-${head:0:12}" n rc; n=$(counter "$key")
+    local hkey="$STATE/fix-$pr-${head:0:12}" pkey="$STATE/fix-pr-$pr" n np rc
+    n=$(counter "$hkey"); np=$(counter "$pkey")
+    # Count the attempt UP FRONT. The host path can fail (and `return`) at
+    # checkout below; counting first stops an un-checkout-able PR from being
+    # reselected every round forever and starving review/roadmap work.
+    echo $((n+1))  > "$hkey"
+    echo $((np+1)) > "$pkey"
     if (( BUBBLE_MODE )); then
-        log "fixing PR #$pr (attempt $((n+1))/$MAX_FIX_ATTEMPTS) with $AGENT in a bubble"
+        log "fixing PR #$pr (head $((n+1))/$MAX_FIX_ATTEMPTS, PR total $((np+1))/$MAX_FIX_PR_ATTEMPTS) with $AGENT in a bubble"
         # bubble checks out the PR branch inside the container; the agent reads the
         # review, fixes, builds, and pushes to the PR branch — all repo-scoped.
         run_in_bubble "$TAUCETI/pull/$pr" \
             "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     else
-        prepare_checkout || die "checkout failed"
-        ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || die "gh pr checkout #$pr failed"
-        log "fixing PR #$pr (attempt $((n+1))/$MAX_FIX_ATTEMPTS) with $AGENT on the host"
+        prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
+        ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        log "fixing PR #$pr (head $((n+1))/$MAX_FIX_ATTEMPTS, PR total $((np+1))/$MAX_FIX_PR_ATTEMPTS) with $AGENT on the host"
         run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix.md" PR "$pr" AGENT "$AGENT")"; rc=$?
     fi
-    echo $((n+1)) > "$key"   # count the attempt only after it ran
     return $rc
 }
 
-# 3. Roadmap -------------------------------------------------------------------
+# 3. Fix red CI ----------------------------------------------------------------
+# Same shape as do_fix (bubble or host), but drives prompts/fix-ci.md to green a
+# PR whose "build" check has failed. Counters are kept separate from do_fix so
+# the two kinds of fix don't share a budget.
+do_fix_ci() {
+    local pr="$1" head="$2"
+    local hkey="$STATE/ci-$pr-${head:0:12}" pkey="$STATE/ci-pr-$pr" n np rc
+    n=$(counter "$hkey"); np=$(counter "$pkey")
+    echo $((n+1))  > "$hkey"
+    echo $((np+1)) > "$pkey"
+    if (( BUBBLE_MODE )); then
+        log "fixing red CI on PR #$pr (head $((n+1))/$MAX_CI_ATTEMPTS, PR total $((np+1))/$MAX_CI_PR_ATTEMPTS) with $AGENT in a bubble"
+        run_in_bubble "$TAUCETI/pull/$pr" \
+            "$(fill_prompt "$HERE/prompts/fix-ci.md" PR "$pr" AGENT "$AGENT")"; rc=$?
+    else
+        prepare_checkout || { log "checkout failed for #$pr — skipping this attempt"; return 1; }
+        ( cd "$CHECKOUT" && gh pr checkout "$pr" ) || { log "gh pr checkout #$pr failed — skipping this attempt"; return 1; }
+        log "fixing red CI on PR #$pr (head $((n+1))/$MAX_CI_ATTEMPTS, PR total $((np+1))/$MAX_CI_PR_ATTEMPTS) with $AGENT on the host"
+        run_agent "$CHECKOUT" "$(fill_prompt "$HERE/prompts/fix-ci.md" PR "$pr" AGENT "$AGENT")"; rc=$?
+    fi
+    return $rc
+}
+
+# 4. Roadmap -------------------------------------------------------------------
 # Both modes stage the read-only roadmap/review reference repos on the host (the
 # in-bubble proxy is TauCeti-scoped, so the agent can't fetch them itself) and
 # tell the agent where to read them via __ROADMAP_DIR__ / __REVIEW_DIR__.
@@ -338,11 +392,24 @@ main() {
         --json number,headRefOid,isDraft,statusCheckRollup,author) \
         || die "gh pr list failed (GitHub API?) — aborting round, not falling through to authoring"
 
-    # 1) Review: first non-draft, build-green PR whose current head is unreviewed.
+    # Visibility: how much review work the queue actually offers. If 'reviewable'
+    # is 0 while PRs are open, review silently can't fire (build pending/renamed,
+    # or every candidate is past its re-review cap) and the round falls through to
+    # authoring — this log makes that degradation visible instead of silent.
+    local n_open n_reviewable
+    n_open=$(echo "$open" | jq '[.[] | select(.isDraft|not)] | length')
+    n_reviewable=$(echo "$open" | jq '[.[] | select(.isDraft|not)
+        | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))] | length')
+    log "open PRs: ${n_open} non-draft, ${n_reviewable} build-green (before re-review caps)"
+
+    # 1) Review: first non-draft, build-green PR whose current head is unreviewed,
+    #    under the per-PR real-review cap and the transient-error retry bound.
     local pr head
     while read -r pr head; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_head "$pr")" == "$head" ]] && continue
+        (( $(ledger_review_count "$pr") >= MAX_REVIEW_ATTEMPTS )) && continue
+        (( $(counter "$STATE/review-err-$pr") >= MAX_REVIEW_ERRORS )) && continue
         do_review "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r '.[]
         | select(.isDraft|not)
@@ -355,10 +422,27 @@ main() {
         [[ "$(ledger_head "$pr")" == "$head" ]] || continue
         [[ "$(ledger_blocking "$pr" "$head")" == "1" ]] || continue
         (( $(counter "$STATE/fix-$pr-${head:0:12}") >= MAX_FIX_ATTEMPTS )) && continue
+        (( $(counter "$STATE/fix-pr-$pr") >= MAX_FIX_PR_ATTEMPTS )) && continue
         do_fix "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[] | select(.author.login==$me) | "\(.number) \(.headRefOid)"')
 
-    # 3) Roadmap: avoid the area (top TauCeti/ subdir) of the most recent PR.
+    # 3) Fix red CI: kim-em's open PRs whose "build" check has FAILED at the
+    #    current head (not merely pending). Such a PR is never reviewable (review
+    #    needs green) and never review-fixable (never reviewed), so without this it
+    #    sits red forever while the loop authors around it. Bounded per-head and
+    #    per-PR, like the review-fix step, so it can't churn one PR indefinitely.
+    while read -r pr head; do
+        [[ -z "$pr" ]] && break
+        (( $(counter "$STATE/ci-$pr-${head:0:12}") >= MAX_CI_ATTEMPTS )) && continue
+        (( $(counter "$STATE/ci-pr-$pr") >= MAX_CI_PR_ATTEMPTS )) && continue
+        do_fix_ci "$pr" "$head"; exit $?
+    done < <(echo "$open" | jq -r --arg me "$ME" '.[]
+        | select(.author.login==$me)
+        | select([.statusCheckRollup[]? | select(.name=="build")
+                  | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
+        | "\(.number) \(.headRefOid)"')
+
+    # 4) Roadmap: avoid the area (top TauCeti/ subdir) of the most recent PR.
     local recent avoid
     recent=$(gh pr list --repo "$TAUCETI" --state all --limit 1 --json files) \
         || die "gh pr list (recent) failed — aborting round"
