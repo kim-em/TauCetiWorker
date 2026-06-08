@@ -39,7 +39,8 @@ CHECKOUT="$HERE/checkouts/TauCeti"   # host authoring checkout (used without --b
 STATE="$HERE/state"
 MAX_FIX_ATTEMPTS=3        # per-head: stop fixing the same head after this many tries
 MAX_FIX_PR_ATTEMPTS=5     # per-PR lifetime backstop: stop fixing a PR across all heads
-MAX_REVIEW_ATTEMPTS=3     # never re-review the same PR more than this many times (real reviews)
+MAX_REVIEW_ATTEMPTS=3     # never re-review the same PR more than this many CLEAN (error-free) reviews
+MAX_REVIEW_ROUNDS=6       # hard ceiling on TOTAL review rounds (clean+errored) — error-loop backstop
 MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
@@ -76,8 +77,8 @@ declare -A AGENT_NAMES=(
 PI_RUN="${PI_RUN:-$HOME/.claude/skills/pi/scripts/run.sh}"   # host runner (without --bubble)
 
 # Models. Without an override, authoring/fixing prefers Codex (spare Opus) and
-# review uses every subscription model that currently has quota (so it stays
-# dual-model when it can). An override pins everything to the one named model.
+# review uses a single provider, Codex preferred (see REVIEWERS below). An
+# override pins everything to the one named model.
 CODEX_OK="${CODEX_OK:-0}"; OPUS_OK="${OPUS_OK:-0}"
 if [[ -n "$FORCE" ]]; then
     WORK_MODEL="$FORCE"; AGENT="${AGENT_NAMES[$FORCE]}"; REVIEWERS="$FORCE"
@@ -91,9 +92,15 @@ if [[ -n "$FORCE" ]]; then
     fi
 else
     if (( CODEX_OK )); then WORK_MODEL=codex; AGENT="Codex"; else WORK_MODEL=claude; AGENT="Claude Code"; fi
-    REVIEWERS=""
-    (( OPUS_OK ))  && REVIEWERS="claude"
-    (( CODEX_OK )) && REVIEWERS="${REVIEWERS:+$REVIEWERS,}codex"
+    # Review with a SINGLE provider, Codex preferred (Codex is fine for every
+    # rubric; the engine assigns rubrics to providers at random and only pins for
+    # consistency, so there is no capability reason to keep Claude). Never pass
+    # both: the per-rubric random split means one provider's outage silently
+    # errors ~half the rubrics, and an errored integrity rubric blocks the PR —
+    # which once benched the whole queue. Fall back to Opus only if Codex is dry.
+    if   (( CODEX_OK )); then REVIEWERS="codex"
+    elif (( OPUS_OK  )); then REVIEWERS="claude"
+    else REVIEWERS=""; fi
 fi
 
 # Refuse to run two rounds at once: they share a fixed bubble name and the host
@@ -106,15 +113,37 @@ if [[ -f "$STORE" ]] && ! jq empty "$STORE" 2>/dev/null; then
     die "review store ledger is malformed ($STORE) — aborting round"
 fi
 
-# ledger_head PR — last head_sha this worker reviewed for PR (empty if none).
+# A review round is "clean" if no rubric ended in the "error" state (a reviewer
+# crash / parse failure). An errored round did NOT really review the PR — half its
+# rubrics never ran — so the review gates below ignore it; otherwise a reviewer
+# outage permanently benches a PR at its current head, looking "reviewed" when it
+# wasn't. (The jq selects rounds with no "error" among their rubric states.)
+
+# ledger_head PR — last head_sha of ANY recorded round (used by the FIX step).
 ledger_head() {
     [[ -f "$STORE" ]] || { echo ""; return; }
     jq -r --arg pr "$1" '.prs[$pr].rounds[-1].head_sha // ""' "$STORE"
 }
-# ledger_review_count PR — how many times this worker has actually reviewed PR
-# (number of recorded review rounds). Counts REAL reviews, not attempts, so a
-# transient review failure (which never writes a round) doesn't burn the cap.
+# ledger_clean_head PR — head_sha of the last CLEAN round (empty if none). The
+# review head-guard uses this, so a PR whose only review at HEAD errored stays
+# eligible for a real re-review.
+ledger_clean_head() {
+    [[ -f "$STORE" ]] || { echo ""; return; }
+    jq -r --arg pr "$1" '
+        [ .prs[$pr].rounds[]? | select(([ (.states // {})[] ] | any(. == "error")) | not) ]
+        | last | .head_sha // ""' "$STORE"
+}
+# ledger_review_count PR — number of CLEAN review rounds. The quality cap counts
+# these, so transient failures / outages don't burn it.
 ledger_review_count() {
+    [[ -f "$STORE" ]] || { echo 0; return; }
+    jq -r --arg pr "$1" '
+        [ .prs[$pr].rounds[]? | select(([ (.states // {})[] ] | any(. == "error")) | not) ]
+        | length' "$STORE"
+}
+# ledger_total_rounds PR — ALL recorded rounds (clean+errored); the error-loop
+# ceiling, so a PR that keeps erroring still can't be re-reviewed forever.
+ledger_total_rounds() {
     [[ -f "$STORE" ]] || { echo 0; return; }
     jq -r --arg pr "$1" '(.prs[$pr].rounds // []) | length' "$STORE"
 }
@@ -408,13 +437,16 @@ main() {
         | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))] | length')
     log "open PRs: ${n_open} non-draft, ${n_reviewable} build-green (before re-review caps)"
 
-    # 1) Review: first non-draft, build-green PR whose current head is unreviewed,
-    #    under the per-PR real-review cap and the transient-error retry bound.
+    # 1) Review: first non-draft, build-green PR not yet CLEANLY reviewed at its
+    #    current head, under the clean-review cap, the total-round ceiling, and the
+    #    transient-error retry bound. Using the clean head/count means a PR whose
+    #    review errored (reviewer outage) is re-reviewed rather than benched.
     local pr head
     while read -r pr head; do
         [[ -z "$pr" ]] && break
-        [[ "$(ledger_head "$pr")" == "$head" ]] && continue
+        [[ "$(ledger_clean_head "$pr")" == "$head" ]] && continue
         (( $(ledger_review_count "$pr") >= MAX_REVIEW_ATTEMPTS )) && continue
+        (( $(ledger_total_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
         (( $(counter "$STATE/review-err-$pr") >= MAX_REVIEW_ERRORS )) && continue
         do_review "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r '.[]
