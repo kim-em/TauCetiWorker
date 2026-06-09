@@ -18,7 +18,10 @@
 #   3. Fix red CI on one of kim-em's open PRs whose "build" check has FAILED at
 #      head (it can't be reviewed or review-fixed, so it would sit red forever).
 #      Bounded per-head (MAX_CI_ATTEMPTS) and per-PR (MAX_CI_PR_ATTEMPTS).
-#   4. Otherwise advance a roadmap target with a new PR.
+#   4. Otherwise advance a roadmap target with a new PR — unless the worker
+#      already has >= MAX_OPEN_PRS of its PRs open (backpressure: drain before
+#      authoring more). The roadmap prompt also has the agent check open PRs and
+#      avoid duplicating one already in flight.
 #
 # A GitHub API failure ABORTS the round (exit 1) rather than being read as "no
 # work" — otherwise a transient outage would silently fall through to authoring.
@@ -48,6 +51,7 @@ MAX_REVIEW_ROUNDS=6       # hard ceiling on TOTAL review rounds (clean+errored) 
 MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
+MAX_OPEN_PRS=8            # backpressure: don't author new roadmap PRs while this many of the worker's PRs are already open
 mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
 log() { echo "$(date '+%F %T') round: $*" >&2; }
@@ -530,7 +534,17 @@ main() {
                   | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
         | "\(.number) \(.headRefOid)"')
 
-    # 4) Roadmap: avoid the area (top TauCeti/ subdir) of the most recent PR.
+    # 4) Roadmap: author a new PR — but hold off while the worker already has a
+    #    large backlog open. Backpressure stops the queue growing without bound
+    #    (and spawning more duplicates) while review/fix/merge drain it; authoring
+    #    resumes automatically once the open count falls back below the threshold.
+    local n_mine
+    n_mine=$(echo "$open" | jq --arg me "$ME" '[.[] | select(.isDraft|not) | select(.author.login==$me)] | length')
+    if (( n_mine >= MAX_OPEN_PRS )); then
+        log "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
+        exit 0
+    fi
+    # Avoid the area (top TauCeti/ subdir) of the most recent PR.
     local recent avoid
     recent=$(gh pr list --repo "$TAUCETI" --state all --limit 1 --json files) \
         || die "gh pr list (recent) failed — aborting round"
