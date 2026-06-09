@@ -4,13 +4,15 @@
 #
 # Priority:
 #   0. First, MERGE every PR the worker has already green-lit (all rubrics green
-#      at head, TauCeti/-only, build green, cleanly mergeable). CI-side review and
-#      auto-merge are intentionally off, so the worker is the only path that lands
-#      PRs. This is a cheap pre-pass (no quota), then the round does ONE work unit:
-#   1. Review an open TauCeti PR whose current head has not been reviewed yet
-#      (and whose CI build is green) — via the `tauceti-review` CLI. A given PR
-#      is reviewed at most MAX_REVIEW_ATTEMPTS times, ever (counted from real,
-#      ledger-recorded reviews).
+#      at head, TauCeti/-only, build green, cleanly mergeable), then ABANDON (close)
+#      any PR that spent its lifetime review/fix budget without reaching green.
+#      CI-side review and auto-merge are intentionally off, so the worker is the
+#      only path that lands or retires PRs. These are cheap pre-passes (no quota),
+#      then the round does ONE work unit:
+#   1. Review an open TauCeti PR whose current head has not been cleanly reviewed
+#      yet (and whose CI build is green) — via the `tauceti-review` CLI. A moved
+#      head (after a fix) is a new commit and gets reviewed; total review rounds
+#      per PR are bounded by MAX_REVIEW_ROUNDS (then step 0b abandons it).
 #   2. Fix one of kim-em's open PRs whose latest review (on the current head)
 #      requests changes (🟡) or blocks (⛔) — drive an agent to address them.
 #      Bounded per-head (MAX_FIX_ATTEMPTS) and per-PR over its lifetime
@@ -46,8 +48,7 @@ CHECKOUT="$HERE/checkouts/TauCeti"   # host authoring checkout (used without --b
 STATE="$HERE/state"
 MAX_FIX_ATTEMPTS=3        # per-head: stop fixing the same head after this many tries
 MAX_FIX_PR_ATTEMPTS=5     # per-PR lifetime backstop: stop fixing a PR across all heads
-MAX_REVIEW_ATTEMPTS=3     # never re-review the same PR more than this many CLEAN (error-free) reviews
-MAX_REVIEW_ROUNDS=6       # hard ceiling on TOTAL review rounds (clean+errored) — error-loop backstop
+MAX_REVIEW_ROUNDS=6       # lifetime review budget per PR: a non-green PR past this is abandoned (closed)
 MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
@@ -140,14 +141,6 @@ ledger_clean_head() {
     jq -r --arg pr "$1" '
         [ .prs[$pr].rounds[]? | select(([ (.states // {})[] ] | any(. == "error")) | not) ]
         | last | .head_sha // ""' "$STORE"
-}
-# ledger_review_count PR — number of CLEAN review rounds. The quality cap counts
-# these, so transient failures / outages don't burn it.
-ledger_review_count() {
-    [[ -f "$STORE" ]] || { echo 0; return; }
-    jq -r --arg pr "$1" '
-        [ .prs[$pr].rounds[]? | select(([ (.states // {})[] ] | any(. == "error")) | not) ]
-        | length' "$STORE"
 }
 # ledger_total_rounds PR — ALL recorded rounds (clean+errored); the error-loop
 # ceiling, so a PR that keeps erroring still can't be re-reviewed forever.
@@ -339,8 +332,8 @@ run_in_bubble() {
 do_review() {
     local pr="$1" head="$2"
     [[ -n "$REVIEWERS" ]] || die "no reviewer models available"
-    local errkey="$STATE/review-err-$pr" nrev; nrev=$(ledger_review_count "$pr")
-    log "reviewing PR #$pr @ ${head:0:12} (review $((nrev+1))/$MAX_REVIEW_ATTEMPTS, reviewers=$REVIEWERS)"
+    local errkey="$STATE/review-err-$pr" nrnd; nrnd=$(ledger_total_rounds "$pr")
+    log "reviewing PR #$pr @ ${head:0:12} (review $((nrnd+1))/$MAX_REVIEW_ROUNDS budget, reviewers=$REVIEWERS)"
     uvx --from "git+https://github.com/$REVIEW" tauceti-review "$pr" \
         --post --reviewer "$REVIEWERS" --expect-head "$head"
     local rc=$?
@@ -470,11 +463,51 @@ merge_ready_prs() {
         | [(.number|tostring), .headRefOid] | @tsv')
 }
 
+# 0b. Abandon -----------------------------------------------------------------
+# Close kim-em PRs that can no longer make progress: a non-green PR that has spent
+# its lifetime review budget (MAX_REVIEW_ROUNDS) or is blocking at head with its
+# fix budget (MAX_FIX_PR_ATTEMPTS) spent. With CI review/merge off, such a PR has
+# cycled review↔fix without reaching green and would otherwise wedge the queue
+# forever; closing it keeps the queue self-limiting and frees the worker to pursue
+# fresh targets. The branch is kept around (no --delete-branch) so the work can be
+# revived by hand. Cheap, no quota — runs every round, each close logged.
+abandon_stuck_prs() {
+    [[ -f "$STORE" ]] || return 0
+    local list; list=$(gh pr list --repo "$TAUCETI" --state open --author "$ME" \
+        --json number,headRefOid,isDraft 2>/dev/null) \
+        || { log "abandon: gh pr list failed — skipping"; return 0; }
+    local pr head total blk fixpr greenathead
+    while IFS=$'\t' read -r pr head; do
+        [[ -z "$pr" ]] && continue
+        # Never abandon a PR that is green at its current head — it merges elsewhere,
+        # or is only held up by a conflict/CI, which is not ours to close.
+        greenathead=$(jq -r --arg pr "$pr" --arg head "$head" '
+            (.prs[$pr].rounds[-1] // {}) as $r
+            | if ($r.head_sha//"")==$head and (($r.states//{})|length>0)
+                 and ([($r.states//{})[]]|all(.=="green")) then 1 else 0 end' "$STORE" 2>/dev/null) || greenathead=0
+        [[ "$greenathead" == "1" ]] && continue
+        total=$(ledger_total_rounds "$pr")
+        blk=$(ledger_blocking "$pr" "$head")
+        fixpr=$(counter "$STATE/fix-pr-$pr")
+        if (( total >= MAX_REVIEW_ROUNDS )) || { (( blk == 1 )) && (( fixpr >= MAX_FIX_PR_ATTEMPTS )); }; then
+            log "abandoning PR #$pr (review rounds=$total, fix attempts=$fixpr) — budget spent without reaching green"
+            if gh pr close "$pr" --repo "$TAUCETI" \
+                --comment "Closing automatically: this PR used its full review/fix budget (${total} review rounds) without reaching an all-green review, so the worker is abandoning it to keep the queue moving on other roadmap targets. The branch is left in place, so the work can be revived and finished by hand if it's worth completing." 2>&1 | tail -1; then
+                log "abandoned PR #$pr"
+            else
+                log "abandon of PR #$pr failed"
+            fi
+        fi
+    done < <(echo "$list" | jq -r '.[] | select(.isDraft|not) | [(.number|tostring), .headRefOid] | @tsv')
+}
+
 # ------------------------------------------------------------------------------
 main() {
-    # Land anything already green-lit before doing more work (CI merge is off; the
-    # worker is the only path that merges). Cheap, no quota — every round.
+    # Land anything already green-lit, then abandon anything that has exhausted its
+    # budget without converging — both before doing more work (CI merge/review is
+    # off; the worker is the only path that merges or retires PRs). Cheap, no quota.
     merge_ready_prs
+    abandon_stuck_prs
 
     # One authoritative fetch of open PRs; a GitHub failure aborts the round.
     local open; open=$(gh pr list --repo "$TAUCETI" --state open \
@@ -491,15 +524,17 @@ main() {
         | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))] | length')
     log "open PRs: ${n_open} non-draft, ${n_reviewable} build-green (before re-review caps)"
 
-    # 1) Review: first non-draft, build-green PR not yet CLEANLY reviewed at its
-    #    current head, under the clean-review cap, the total-round ceiling, and the
-    #    transient-error retry bound. Using the clean head/count means a PR whose
-    #    review errored (reviewer outage) is re-reviewed rather than benched.
+    # 1) Review: first non-draft, build-green PR whose CURRENT head has not been
+    #    cleanly reviewed yet. The head-guard (clean_head != head) is what prevents
+    #    re-reviewing the same commit; a head that moved after a fix is a NEW commit
+    #    and gets reviewed even if earlier heads were reviewed — otherwise a fix
+    #    leaves the PR stuck (reviewed at an old head, unreviewable at the new one).
+    #    The lifetime budget (MAX_REVIEW_ROUNDS) bounds total churn; a PR that blows
+    #    through it without going green is abandoned in step 3b below.
     local pr head
     while read -r pr head; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_clean_head "$pr")" == "$head" ]] && continue
-        (( $(ledger_review_count "$pr") >= MAX_REVIEW_ATTEMPTS )) && continue
         (( $(ledger_total_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
         (( $(counter "$STATE/review-err-$pr") >= MAX_REVIEW_ERRORS )) && continue
         do_review "$pr" "$head"; exit $?
