@@ -3,6 +3,10 @@
 # loop.sh once per round.
 #
 # Priority:
+#   0. First, MERGE every PR the worker has already green-lit (all rubrics green
+#      at head, TauCeti/-only, build green, cleanly mergeable). CI-side review and
+#      auto-merge are intentionally off, so the worker is the only path that lands
+#      PRs. This is a cheap pre-pass (no quota), then the round does ONE work unit:
 #   1. Review an open TauCeti PR whose current head has not been reviewed yet
 #      (and whose CI build is green) — via the `tauceti-review` CLI. A given PR
 #      is reviewed at most MAX_REVIEW_ATTEMPTS times, ever (counted from real,
@@ -420,8 +424,51 @@ do_roadmap() {
     fi
 }
 
+# 0. Merge ---------------------------------------------------------------------
+# Drain every PR the worker has already green-lit. Mirrors the engine's own gate
+# (TauCetiReview review.py --auto-merge): merge iff every rubric is green on the
+# CURRENT head AND the PR changes only TauCeti/ files, plus the build is green and
+# Git reports it cleanly mergeable. Runs as kim-em (admin; enforce_admins is off,
+# so this satisfies branch protection just as the review bot's approval would).
+# CI-side review/merge is intentionally disabled, so this is the ONLY path that
+# lands PRs. No quota/agent, so it runs every round; each merge is logged and a
+# failed merge is left open for human attention.
+merge_ready_prs() {
+    [[ -f "$STORE" ]] || return 0   # nothing reviewed yet ⇒ nothing to merge
+    local list; list=$(gh pr list --repo "$TAUCETI" --state open --author "$ME" \
+        --json number,headRefOid,isDraft,mergeable,statusCheckRollup,files 2>/dev/null) \
+        || { log "merge: gh pr list failed — skipping merge pass"; return 0; }
+    local pr head ready
+    while IFS=$'\t' read -r pr head; do
+        [[ -z "$pr" ]] && continue
+        # Ledger: latest round must be at this exact head with EVERY rubric green.
+        ready=$(jq -r --arg pr "$pr" --arg head "$head" '
+            (.prs[$pr].rounds[-1] // {}) as $r
+            | if ($r.head_sha // "") == $head
+                 and (($r.states // {}) | length > 0)
+                 and ([ ($r.states // {})[] ] | all(. == "green"))
+              then 1 else 0 end' "$STORE" 2>/dev/null) || ready=0
+        [[ "$ready" == "1" ]] || continue
+        log "merging PR #$pr (all rubrics green @ ${head:0:12}, TauCeti/-only)"
+        if gh pr merge "$pr" --repo "$TAUCETI" --squash --delete-branch; then
+            log "merged PR #$pr"
+        else
+            log "merge of PR #$pr failed — left open for human attention"
+        fi
+    done < <(echo "$list" | jq -r '.[]
+        | select(.isDraft | not)
+        | select(.mergeable == "MERGEABLE")
+        | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))
+        | select([.files[].path] | (length > 0 and all(startswith("TauCeti/"))))
+        | [(.number|tostring), .headRefOid] | @tsv')
+}
+
 # ------------------------------------------------------------------------------
 main() {
+    # Land anything already green-lit before doing more work (CI merge is off; the
+    # worker is the only path that merges). Cheap, no quota — every round.
+    merge_ready_prs
+
     # One authoritative fetch of open PRs; a GitHub failure aborts the round.
     local open; open=$(gh pr list --repo "$TAUCETI" --state open \
         --json number,headRefOid,isDraft,statusCheckRollup,author) \
