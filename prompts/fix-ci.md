@@ -17,7 +17,7 @@ You are fixing FAILING CI on pull request #__PR__ of FormalFrontier/TauCeti, an 
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if almost nothing survives, stop and report that rather than pushing an empty shell.
 
 ## Rules of the repo (hard constraints)
-- Code goes ONLY under `TauCeti/`. Do NOT touch `Scripts/`, `.github/`, `lakefile`/`lake-manifest.json`, or `TauCeti.lean`.
+- Code goes under `TauCeti/`. You MAY also edit the root `TauCeti.lean` to add a missing `import TauCeti.Your.Module` (keep the import list alphabetically ordered). Do NOT touch `Scripts/`, `.github/`, `lakefile`, or `lake-manifest.json`.
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 

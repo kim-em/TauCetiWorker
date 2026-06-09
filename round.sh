@@ -446,7 +446,7 @@ merge_ready_prs() {
                  and ([ ($r.states // {})[] ] | all(. == "green"))
               then 1 else 0 end' "$STORE" 2>/dev/null) || ready=0
         [[ "$ready" == "1" ]] || continue
-        log "merging PR #$pr (all rubrics green @ ${head:0:12}, TauCeti/-only)"
+        log "merging PR #$pr (all rubrics green @ ${head:0:12}, TauCeti/ + root only)"
         # --admin: kim-em is a repo admin and enforce_admins is off, so this
         # overrides the "1 approving review" branch policy (CI's bot approval is
         # disabled). Without it gh refuses: "base branch policy prohibits the merge".
@@ -459,7 +459,7 @@ merge_ready_prs() {
         | select(.isDraft | not)
         | select(.mergeable == "MERGEABLE")
         | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))
-        | select([.files[].path] | (length > 0 and all(startswith("TauCeti/"))))
+        | select([.files[].path] | (length > 0 and all(startswith("TauCeti/") or . == "TauCeti.lean")))
         | [(.number|tostring), .headRefOid] | @tsv')
 }
 
