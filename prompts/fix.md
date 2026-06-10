@@ -4,7 +4,13 @@ You are addressing AI code review on pull request #__PR__ of FormalFrontier/TauC
 - The review is posted as a sticky scoreboard comment plus one thread per flagged rubric. Read them:
   - `gh pr view __PR__ --repo FormalFrontier/TauCeti --json comments`
   - `gh api "/repos/FormalFrontier/TauCeti/pulls/__PR__/comments?per_page=100"` (the per-rubric review threads; each root carries a `<!--tauceti-rubric:NAME-->` marker, and the finding text + suggested fix).
-- The blocking rubrics are the ones marked ⛔ (block) or 🟡 (changes requested) on the scoreboard.
+- The blocking rubrics are the ones marked ⛔ (block) or 🟡 (changes requested) on the scoreboard. The other rubrics are already ✅ approved — note which ones.
+
+## Do not regress what is already green
+The scoreboard shows several rubrics already approved (✅). A re-review re-runs the rubrics you touched, so a change that fixes one blocker but degrades an approved rubric will turn that rubric red and the PR will not converge — this is the single most common reason a nearly-done PR is eventually abandoned. So:
+- Make the SMALLEST change that clears each blocker; do not refactor or restructure beyond what the finding requires.
+- Before pushing, re-read the approved rubrics (scope, reuse, generality, api-design, placement, naming, documentation, proof-quality, …) and confirm your change does not undermine any of them — e.g. don't add a less-general lemma (generality), a duplicate of Mathlib (reuse), an unexposed/ misplaced declaration (placement/api-design), or an undocumented public def (documentation).
+- If clearing a blocker would genuinely force a regression of an approved rubric, that tension is a sign the finding may be wrong — contest it (below) with that trade-off as evidence, rather than pushing a change that just moves the redness around.
 
 ## Decide, per finding, on its merits
 For each finding, judge whether it is actually correct:

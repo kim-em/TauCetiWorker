@@ -50,8 +50,8 @@ STORE="$HOME/.cache/tauceti-review/store/FormalFrontier__TauCeti/ledger.json"
 CHECKOUT="$HERE/checkouts/TauCeti"   # host authoring checkout (used without --bubble)
 STATE="$HERE/state"
 MAX_FIX_ATTEMPTS=3        # per-head: stop fixing the same head after this many tries
-MAX_FIX_PR_ATTEMPTS=5     # per-PR lifetime backstop: stop fixing a PR across all heads
-MAX_REVIEW_ROUNDS=6       # lifetime review budget per PR: a non-green PR past this is abandoned (closed)
+MAX_FIX_PR_ATTEMPTS=7     # per-PR lifetime backstop: stop fixing a PR across all heads
+MAX_REVIEW_ROUNDS=8       # lifetime review budget per PR: a non-green PR past this is abandoned (closed)
 MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
@@ -151,6 +151,14 @@ ledger_clean_head() {
 ledger_total_rounds() {
     [[ -f "$STORE" ]] || { echo 0; return; }
     jq -r --arg pr "$1" '(.prs[$pr].rounds // []) | length' "$STORE"
+}
+# review_rounds PR — review rounds counted against the budget, i.e. ledger rounds
+# MINUS the resurrection baseline (state/round-base-PR). Reviving a PR writes the
+# baseline = its round count at that moment, so it gets a fresh MAX_REVIEW_ROUNDS
+# budget while its ledger history (which re-reviews audit) is preserved.
+review_rounds() {
+    local total base; total=$(ledger_total_rounds "$1"); base=$(counter "$STATE/round-base-$1")
+    local n=$(( total - base )); (( n < 0 )) && n=0; echo "$n"
 }
 # ledger_blocking PR HEAD — "1" if the latest round at exactly HEAD has a
 # changes-requested (🟡) or blocked (⛔) rubric.
@@ -336,7 +344,7 @@ run_in_bubble() {
 do_review() {
     local pr="$1" head="$2"
     [[ -n "$REVIEWERS" ]] || die "no reviewer models available"
-    local errkey="$STATE/review-err-$pr" nrnd; nrnd=$(ledger_total_rounds "$pr")
+    local errkey="$STATE/review-err-$pr" nrnd; nrnd=$(review_rounds "$pr")
     log "reviewing PR #$pr @ ${head:0:12} (review $((nrnd+1))/$MAX_REVIEW_ROUNDS budget, reviewers=$REVIEWERS)"
     uvx --from "git+https://github.com/$REVIEW" tauceti-review "$pr" \
         --post --reviewer "$REVIEWERS" --expect-head "$head"
@@ -515,7 +523,7 @@ abandon_stuck_prs() {
             | if ($r.head_sha//"")==$head and (($r.states//{})|length>0)
                  and ([($r.states//{})[]]|all(.=="green")) then 1 else 0 end' "$STORE" 2>/dev/null) || greenathead=0
         [[ "$greenathead" == "1" ]] && continue
-        total=$(ledger_total_rounds "$pr")
+        total=$(review_rounds "$pr")
         blk=$(ledger_blocking "$pr" "$head")
         fixpr=$(counter "$STATE/fix-pr-$pr")
         if (( total >= MAX_REVIEW_ROUNDS )) || { (( blk == 1 )) && (( fixpr >= MAX_FIX_PR_ATTEMPTS )); }; then
@@ -561,7 +569,7 @@ main() {
     local pr head
     while read -r pr head; do
         [[ -z "$pr" ]] && break
-        (( $(ledger_total_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
+        (( $(review_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
         (( $(counter "$STATE/rebase-pr-$pr") >= MAX_REBASE_ATTEMPTS )) && continue
         do_rebase "$pr"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[]
@@ -579,7 +587,7 @@ main() {
     while read -r pr head; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_clean_head "$pr")" == "$head" ]] && continue
-        (( $(ledger_total_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
+        (( $(review_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
         (( $(counter "$STATE/review-err-$pr") >= MAX_REVIEW_ERRORS )) && continue
         do_review "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r '.[]
