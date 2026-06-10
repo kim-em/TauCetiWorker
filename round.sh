@@ -23,10 +23,11 @@
 #   4. Fix red CI on one of kim-em's open PRs whose "build" check has FAILED at
 #      head (it can't be reviewed or review-fixed, so it would sit red forever).
 #      Bounded per-head (MAX_CI_ATTEMPTS) and per-PR (MAX_CI_PR_ATTEMPTS).
-#   5. Otherwise advance a roadmap target with a new PR — unless the worker
-#      already has >= MAX_OPEN_PRS of its PRs open (backpressure: drain before
-#      authoring more). The roadmap prompt also has the agent check open PRs and
-#      avoid duplicating one already in flight.
+#   5. Otherwise advance a roadmap target with a new PR, confined to the
+#      ROADMAP_FOCUS area (default ReductiveGroups; empty ranges over all areas)
+#      — unless the worker already has >= MAX_OPEN_PRS of its PRs open
+#      (backpressure: drain before authoring more). The roadmap prompt also has
+#      the agent check open PRs and avoid duplicating one already in flight.
 #
 # A GitHub API failure ABORTS the round (exit 1) rather than being read as "no
 # work" — otherwise a transient outage would silently fall through to authoring.
@@ -57,6 +58,7 @@ MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after t
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
 MAX_REBASE_ATTEMPTS=3     # per-PR: stop trying to rebase/resolve a conflicting PR after this many tries
 MAX_OPEN_PRS=8            # backpressure: don't author new roadmap PRs while this many of the worker's PRs are already open
+ROADMAP_FOCUS="ReductiveGroups"   # confine authoring to this TauCetiRoadmap/ area; empty = spread across all areas
 mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
 log() { echo "$(date '+%F %T') round: $*" >&2; }
@@ -439,21 +441,24 @@ do_rebase() {
 # Both modes stage the read-only roadmap/review reference repos on the host (the
 # in-bubble proxy is TauCeti-scoped, so the agent can't fetch them itself) and
 # tell the agent where to read them via __ROADMAP_DIR__ / __REVIEW_DIR__.
+# FOCUS is the single TauCetiRoadmap/ area to confine authoring to (e.g.
+# ReductiveGroups), or "any" to range over all areas. It reaches the prompt as
+# __FOCUS__.
 do_roadmap() {
-    local avoid="$1" refs="$STATE/refs"
+    local focus="$1" refs="$STATE/refs"
     fetch_ref "$ROADMAP" "$refs/roadmap" || die "fetch $ROADMAP failed"
     fetch_ref "$REVIEW"  "$refs/review"  || die "fetch $REVIEW failed"
     if (( BUBBLE_MODE )); then
-        log "roadmap round with $AGENT in a bubble (avoiding area: $avoid)"
+        log "roadmap round with $AGENT in a bubble (focus: $focus)"
         run_in_bubble "$TAUCETI" \
-            "$(fill_prompt "$HERE/prompts/roadmap.md" AVOID "$avoid" AGENT "$AGENT" \
+            "$(fill_prompt "$HERE/prompts/roadmap.md" FOCUS "$focus" AGENT "$AGENT" \
                 ROADMAP_DIR /opt/roadmap REVIEW_DIR /opt/review)" \
             "$refs/roadmap:/opt/roadmap:ro" "$refs/review:/opt/review:ro"
     else
         prepare_checkout || die "checkout failed"
-        log "roadmap round with $AGENT on the host (avoiding area: $avoid)"
+        log "roadmap round with $AGENT on the host (focus: $focus)"
         run_agent "$CHECKOUT" \
-            "$(fill_prompt "$HERE/prompts/roadmap.md" AVOID "$avoid" AGENT "$AGENT" \
+            "$(fill_prompt "$HERE/prompts/roadmap.md" FOCUS "$focus" AGENT "$AGENT" \
                 ROADMAP_DIR "$refs/roadmap" REVIEW_DIR "$refs/review")"
     fi
 }
@@ -631,12 +636,9 @@ main() {
         log "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
         exit 0
     fi
-    # Avoid the area (top TauCeti/ subdir) of the most recent PR.
-    local recent avoid
-    recent=$(gh pr list --repo "$TAUCETI" --state all --limit 1 --json files) \
-        || die "gh pr list (recent) failed — aborting round"
-    avoid=$(echo "$recent" | jq -r '[.[0].files[]?.path | select(startswith("TauCeti/")) | split("/")[1]] | unique | join(", ")')
-    avoid="${avoid:-none}"; echo "$avoid" > "$STATE/last-roadmap-avoid"
-    do_roadmap "$avoid"
+    # Confine authoring to ROADMAP_FOCUS (a single TauCetiRoadmap/ area), or range
+    # over all areas when it is empty. Dedup against open PRs (handled in the
+    # prompt) keeps successive rounds from repeating the same target within the area.
+    do_roadmap "${ROADMAP_FOCUS:-any}"
 }
 main
