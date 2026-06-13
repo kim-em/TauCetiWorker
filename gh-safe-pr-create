@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# gh-safe-pr-create — the ONLY sanctioned way to open a Tau Ceti PR (authoring path).
+#
+# Verifies the author target claim is still held (fail closed if another agent took the target), then
+# runs `gh pr create` with the given args. The branch must already have been pushed via git-safe-push
+# (which create-only-pushes it, so two agents can't both create the same branch). It also checks the
+# PR body carries the machine-readable target marker the dup-sweeper relies on (coordination contract §4).
+#
+# Inputs:
+#   TAUCETI_AUTHOR_CLAIM_KEY   the author/<focus>/<target-id> claim acquired in shell before the agent ran
+#   TAUCETI_TARGET_MARKER      the exact <!--tauceti-target:v1 {...}--> string the PR body must contain
+#   TAUCETI_CLAIM_SH           path to claim.sh (default: alongside this script)
+# All `gh pr create` flags pass through unchanged.
+set -uo pipefail
+
+CLAIM_KEY="${TAUCETI_AUTHOR_CLAIM_KEY:-}"
+MARKER="${TAUCETI_TARGET_MARKER:-}"
+CLAIM_SH="${TAUCETI_CLAIM_SH:-$(cd "$(dirname "$0")" && pwd)/claim.sh}"
+
+die() { echo "gh-safe-pr-create: $*" >&2; exit 1; }
+
+# 1) Author claim must still be ours (else another agent is authoring this target — abandon).
+if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
+    "$CLAIM_SH" holds "$CLAIM_KEY" \
+        || die "author lease '$CLAIM_KEY' lost (another agent took the target) — do NOT create the PR"
+fi
+
+# 2) The PR body must carry the target marker so the conservative dup-sweeper can match it. Find the
+#    body in the passed args (--body <s> / --body-file <f> / -F <f>) and verify the marker is present.
+if [[ -n "$MARKER" ]]; then
+    body="" prev=""
+    for a in "$@"; do
+        case "$prev" in
+            --body|-b) body="$a";;
+            --body-file|-F) [[ -f "$a" ]] && body="$(cat "$a")";;
+        esac
+        prev="$a"
+    done
+    [[ "$body" == *"$MARKER"* ]] \
+        || die "PR body is missing the required target marker:
+  $MARKER
+Add it to the PR body (it lets other agents and the dup-sweeper recognize this target)."
+fi
+
+echo "gh-safe-pr-create: gh pr create $*" >&2
+exec gh pr create "$@"

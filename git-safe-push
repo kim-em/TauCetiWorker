@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# git-safe-push — the ONLY sanctioned way to push a Tau Ceti PR branch.
+#
+# This is the [HARD] write arbiter (coordination contract §1): every PR-branch update goes through a
+# branch-level compare-and-swap, so we NEVER silently overwrite another agent's work — cooperating or
+# not — and we detect the race and bail. It does NOT depend on anyone honoring claims.
+#
+#   git push --force-with-lease=<ref>:<expected>  origin HEAD:<ref>
+#     expected = <oid>  → succeeds iff the remote branch still equals the oid we observed at checkout
+#     expected = ""     → create-only (succeeds iff the branch does not exist) — for authoring
+#
+# If a claim is in play, it is re-checked/renewed immediately before the push and the push FAILS CLOSED
+# if the lease was lost (someone took over). The claim is [COOP] (avoids duplicate work); the branch CAS
+# is what actually protects the write.
+#
+# Inputs (exported by round.sh; the agent just runs `git-safe-push [<branch>]`):
+#   TAUCETI_PUSH_REF     destination branch on the head repo (or pass as $1)
+#   TAUCETI_PUSH_EXPECT  observed remote head oid; empty/unset ⇒ create-only (new branch)
+#   TAUCETI_PUSH_REMOTE  git remote or URL to push to (default: origin)
+#   TAUCETI_CLAIM_KEY    optional claim key to verify/renew before pushing
+#   TAUCETI_CLAIM_SH     path to claim.sh (default: alongside this script)
+set -uo pipefail
+
+REF="${1:-${TAUCETI_PUSH_REF:-}}"
+EXPECT="${TAUCETI_PUSH_EXPECT:-}"
+REMOTE="${TAUCETI_PUSH_REMOTE:-origin}"
+CLAIM_KEY="${TAUCETI_CLAIM_KEY:-}"
+CLAIM_SH="${TAUCETI_CLAIM_SH:-$(cd "$(dirname "$0")" && pwd)/claim.sh}"
+
+die() { echo "git-safe-push: $*" >&2; exit 1; }
+[[ -n "$REF" ]] || die "no destination branch (set TAUCETI_PUSH_REF or pass it as an argument)"
+
+# 1) Lease check (fail closed if we no longer hold the claim someone may have taken over).
+if [[ -n "$CLAIM_KEY" && -x "$CLAIM_SH" ]]; then
+    if ! "$CLAIM_SH" holds "$CLAIM_KEY"; then
+        "$CLAIM_SH" renew "$CLAIM_KEY" >/dev/null 2>&1 \
+            || die "lease '$CLAIM_KEY' lost (another agent took over) — refusing to push"
+    fi
+fi
+
+# 2) Branch-level CAS push. expected="" ⇒ create-only; else must still equal the observed oid.
+echo "git-safe-push: $REMOTE HEAD:$REF (--force-with-lease=$REF:${EXPECT:-<create-only>})" >&2
+if git push --force-with-lease="$REF:$EXPECT" "$REMOTE" "HEAD:$REF"; then
+    exit 0
+fi
+die "push rejected — the branch '$REF' moved since checkout (a concurrent push), or it already exists.
+This is the safety mechanism working: we did NOT overwrite anyone. Re-sync to the current head and retry
+next round; do not retry a plain 'git push'."
