@@ -47,9 +47,15 @@ TAUCETI="FormalFrontier/TauCeti"
 ROADMAP="FormalFrontier/TauCetiRoadmap"
 REVIEW="FormalFrontier/TauCetiReview"
 ME="kim-em"
-STORE="$HOME/.cache/tauceti-review/store/FormalFrontier__TauCeti/ledger.json"
-CHECKOUT="$HERE/checkouts/TauCeti"   # host authoring checkout (used without --bubble)
-STATE="$HERE/state"
+# Per-worker isolation: every local path is namespaced by a worker id so N copies on one host don't
+# share state/checkout/store/bubble. loop.sh generates+persists a globally-unique id (hostname-uuid)
+# and exports TAUCETI_WORKER_ID; a bare round.sh run falls back to "default". Sanitized for path/
+# container-name use (lowercased, [a-z0-9-]).
+WID="${TAUCETI_WORKER_ID:-default}"; WID="${WID,,}"; WID="${WID//[^a-z0-9-]/-}"
+STORE_DIR="$HOME/.cache/tauceti-review/$WID/store/FormalFrontier__TauCeti"   # per-worker review store
+STORE="$STORE_DIR/ledger.json"
+CHECKOUT="$HERE/checkouts/$WID/TauCeti"   # host authoring checkout (used without --bubble)
+STATE="$HERE/state/$WID"
 MAX_FIX_ATTEMPTS=3        # per-head: stop fixing the same head after this many tries
 MAX_FIX_PR_ATTEMPTS=7     # per-PR lifetime backstop: stop fixing a PR across all heads
 MAX_REVIEW_ROUNDS=8       # lifetime review budget per PR: a non-green PR past this is abandoned (closed)
@@ -118,10 +124,12 @@ else
     else REVIEWERS=""; fi
 fi
 
-# Refuse to run two rounds at once: they share a fixed bubble name and the host
-# checkout / state dir, and could clobber each other. The lock auto-releases on exit.
+# One round at a time PER WORKER: rounds of the same worker id share its (now per-worker) checkout,
+# state dir, and bubble, so they must not overlap. This is NOT cross-worker concurrency protection —
+# different worker ids have different lock files and run in parallel by design (cross-worker
+# de-contention is GitHub-side: branch --force-with-lease + claims). Auto-releases on exit.
 exec 9>"$STATE/round.lock"
-flock -n 9 || die "another round holds $STATE/round.lock — refusing to run concurrently"
+flock -n 9 || die "another round for worker '$WID' holds $STATE/round.lock — one round per worker at a time"
 
 # Validate the ledger once; a malformed ledger would misclassify every PR.
 if [[ -f "$STORE" ]] && ! jq empty "$STORE" 2>/dev/null; then
@@ -245,12 +253,12 @@ run_agent() {
 # rejected by the proxy (not merely flagged by CI after the fact). Only the one
 # credential the work model needs is seeded; no host config (notably
 # ~/.claude/CLAUDE.md) crosses the boundary.
-BUBBLE="tauceti-worker"   # fixed name; rounds are sequential, so one suffices
+BUBBLE="tauceti-worker-$WID"   # per-worker name so concurrent workers don't tear down each other's container
 # A worker-private bubble data dir, so the sandbox can't inherit ambient
 # `[[mounts]]` or a remote/cloud default from the operator's ~/.bubble/config.toml
 # — the mount set and runtime are exactly what this script asks for. First use
 # builds the worker's git mirrors + Mathlib cache here (slow once, then cached).
-export BUBBLE_HOME="${TAUCETI_BUBBLE_HOME:-$HOME/.cache/tauceti-worker/bubble}"
+export BUBBLE_HOME="${TAUCETI_BUBBLE_HOME:-$HOME/.cache/tauceti-worker/$WID/bubble}"
 
 # ensure_bubble_home — one-time hardening of the private bubble home: read-only
 # shared Mathlib cache (per-round writable overlay) so a compromised round can't
@@ -349,7 +357,7 @@ do_review() {
     local errkey="$STATE/review-err-$pr" nrnd; nrnd=$(review_rounds "$pr")
     log "reviewing PR #$pr @ ${head:0:12} (review $((nrnd+1))/$MAX_REVIEW_ROUNDS budget, reviewers=$REVIEWERS)"
     uvx --from "git+https://github.com/$REVIEW" tauceti-review "$pr" \
-        --post --reviewer "$REVIEWERS" --expect-head "$head"
+        --store "$STORE_DIR" --post --reviewer "$REVIEWERS" --expect-head "$head"
     local rc=$?
     # A clean run records a ledger round (the real-review cap counts those); reset
     # the transient-error counter. A failure didn't review, so bound the retries.

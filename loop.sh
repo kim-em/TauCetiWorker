@@ -36,10 +36,17 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CLAUDE_AVAIL="$HOME/.claude/skills/claude-usage/claude-available-model"
-CODEX_AVAIL="$HOME/.claude/skills/claude-usage/codex-available-model"
-CODEX_REFRESH="$HOME/.claude/skills/claude-usage/codex-usage-refresh"
-SWAP="$HOME/.claude/swap-account"   # picks the Claude account with the most quota
+# Worker identity. For uncoordinated multi-worker use, each loop must have a GLOBALLY-UNIQUE id (it
+# namespaces this worker's state/checkout/store/bubble/logs in round.sh, and tags its claim leases).
+# `--worker-id <id>` (or TAUCETI_WORKER_ID) pins a stable name; otherwise we mint a fresh unique id
+# per start (NOT persisted to a shared file — two concurrent loops must never share an id).
+# Tool discovery (skills, swap-account) always resolves against the REAL home; only mutable Claude/
+# Codex auth state is (optionally) isolated per worker — see WORKER_HOME below.
+REAL_HOME="$HOME"
+CLAUDE_AVAIL="$REAL_HOME/.claude/skills/claude-usage/claude-available-model"
+CODEX_AVAIL="$REAL_HOME/.claude/skills/claude-usage/codex-available-model"
+CODEX_REFRESH="$REAL_HOME/.claude/skills/claude-usage/codex-usage-refresh"
+SWAP="$REAL_HOME/.claude/swap-account"   # picks the Claude account with the most quota
 POLL=300             # seconds between quota checks while waiting
 ROUND_TIMEOUT=5400   # 90 min hard cap per round (a full author+build can be long)
 INTERROUND=20        # min gap between rounds, so a no-op round can't busy-loop
@@ -49,23 +56,61 @@ INTERROUND=20        # min gap between rounds, so a no-op round can't busy-loop
 OPENROUTER_PROVIDERS=" deepseek minimax "
 is_openrouter() { [[ "$OPENROUTER_PROVIDERS" == *" $1 "* ]]; }
 
-# Optional explicit model override and/or --bubble (sandbox); forwarded to round.sh.
-FORCE=""; BUBBLE_MODE=0
+# Optional explicit model override, --bubble (sandbox), --worker-id, --isolate-home.
+FORCE=""; BUBBLE_MODE=0; ISOLATE_HOME=0
 while (( $# )); do
     case "$1" in
         --codex|--claude|--deepseek|--minimax) FORCE="${1#--}";;
         --bubble) BUBBLE_MODE=1;;
-        -h|--help) echo "usage: $0 [--codex|--claude|--deepseek|--minimax] [--bubble]"; exit 0;;
-        *) echo "unknown argument: $1 (expected --codex|--claude|--deepseek|--minimax|--bubble)" >&2; exit 64;;
+        --worker-id) shift; TAUCETI_WORKER_ID="$1";;
+        --isolate-home) ISOLATE_HOME=1;;   # per-worker Claude/Codex auth state (needed for multi-worker)
+        -h|--help) echo "usage: $0 [--codex|--claude|--deepseek|--minimax] [--bubble] [--worker-id ID] [--isolate-home]"; exit 0;;
+        *) echo "unknown argument: $1" >&2; exit 64;;
     esac
     shift
 done
+
+# Resolve a globally-unique worker id (mint a fresh one per start if not pinned) and export it so
+# round.sh derives matching per-worker paths. Never persist a minted id to a shared file.
+if [[ -z "${TAUCETI_WORKER_ID:-}" ]]; then
+    TAUCETI_WORKER_ID="$(hostname)-$( (uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid) | cut -c1-8 )"
+    echo "$(date '+%F %T') loop.sh: no --worker-id given; using ephemeral id '$TAUCETI_WORKER_ID'" >&2
+fi
+WID="${TAUCETI_WORKER_ID,,}"; WID="${WID//[^a-z0-9-]/-}"
+export TAUCETI_WORKER_ID="$WID"
+
+# Account isolation (opt-in via --isolate-home; REQUIRED for safe multi-worker — two workers sharing
+# ~/.claude/.current-account race and corrupt it). Build a per-worker HOME that SYMLINKS the read-only
+# tool surface (skills, swap-account, bin, config) from the real home but gets its OWN mutable auth
+# state (.credentials.json, .current-account, gist id/key, ~/.codex). Default OFF, so the existing
+# single-worker setup is byte-for-byte unchanged. NOTE: exercise this on a live host before relying on
+# it for concurrent workers — it touches credential/account plumbing this script can't unit-test.
+if (( ISOLATE_HOME )); then
+    WORKER_HOME="$HERE/state/$WID/home"
+    mkdir -p "$WORKER_HOME/.claude" "$WORKER_HOME/.codex"
+    # symlink tool/skill surface read-only from the real home (don't copy — stay current)
+    for item in skills swap-account bin config.json settings.json CLAUDE.md; do
+        [[ -e "$REAL_HOME/.claude/$item" && ! -e "$WORKER_HOME/.claude/$item" ]] \
+            && ln -s "$REAL_HOME/.claude/$item" "$WORKER_HOME/.claude/$item"
+    done
+    # seed mutable auth state ONCE (thereafter the worker swaps within its own copy)
+    for f in .credentials.json .gist-id .gist-encryption-key; do
+        [[ -e "$REAL_HOME/.claude/$f" && ! -e "$WORKER_HOME/.claude/$f" ]] \
+            && cp -p "$REAL_HOME/.claude/$f" "$WORKER_HOME/.claude/$f"
+    done
+    [[ -e "$REAL_HOME/.codex/auth.json" && ! -e "$WORKER_HOME/.codex/auth.json" ]] \
+        && cp -p "$REAL_HOME/.codex/auth.json" "$WORKER_HOME/.codex/auth.json"
+    export HOME="$WORKER_HOME"
+    echo "$(date '+%F %T') loop.sh: isolated HOME=$WORKER_HOME (worker '$WID')" >&2
+fi
+
 # Args forwarded to round.sh each round (model override and/or --bubble).
 ROUND_ARGS=()
 [[ -n "$FORCE" ]] && ROUND_ARGS+=( "--$FORCE" )
 (( BUBBLE_MODE )) && ROUND_ARGS+=( --bubble )
 
-mkdir -p "$HERE/logs" "$HERE/state"
+LOGDIR="$HERE/logs/$WID"
+mkdir -p "$LOGDIR" "$HERE/state/$WID"
 
 # Fail loudly at startup if the environment can't do a round, rather than
 # sleeping forever or silently falling through to authoring.
@@ -118,7 +163,7 @@ trap 'echo "$(date "+%F %T") loop.sh: interrupted — stopping round and exiting
 # fire.
 run_round() {
     local label="$1"; shift
-    local log="$HERE/logs/${label}-$(date '+%Y%m%d-%H%M%S').log"
+    local log="$LOGDIR/${label}-$(date '+%Y%m%d-%H%M%S').log"
     local rc=0
     echo "$(date '+%F %T') round[$label] → $log" >&2
     timeout --kill-after=30s "$ROUND_TIMEOUT" "$@" >"$log" 2>&1 &
