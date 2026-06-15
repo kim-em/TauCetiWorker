@@ -20,7 +20,7 @@ For each finding, judge whether it is actually correct:
   (A re-review reads these replies, so a well-evidenced contest can clear a wrong finding.)
 
 ## Rules of the repo (hard constraints)
-- Code goes under `TauCeti/`. You MAY also edit the root `TauCeti.lean` to add a missing `import TauCeti.Your.Module` — in particular if a reviewer notes the new API is not reachable from the `TauCeti` root, adding that import is the correct fix (keep the import list alphabetically ordered). Do NOT touch `Scripts/`, `.github/`, `lakefile`, or `lake-manifest.json`.
+- Code goes under `TauCeti/`. You MAY also edit the root `TauCeti.lean` to add a missing `import TauCeti.Your.Module` — in particular if a reviewer notes the new API is not reachable from the `TauCeti` root, adding that import is the correct fix (keep the import list alphabetically ordered). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
 - Everything under `namespace TauCeti`.
 - Must stay green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force a change through — that is itself a reason to push back on the finding.
 

@@ -10,7 +10,12 @@ subscriptions, modelled on `../lean-eval-knill`'s pipeline. Each round does
 2. **Fix** — one of `kim-em`'s open PRs whose latest review (on the current head)
    requests changes or blocks: an agent reads the findings and either fixes the
    code or contests a wrong finding on its thread.
-3. **Roadmap** — otherwise, an agent starts a new PR advancing a roadmap target,
+3. **Bump** — if Mathlib's `master` has moved past our pin and no bump PR is open,
+   an agent bumps `lake-manifest.json` + `lean-toolchain` to the current master and
+   fixes whatever breaks in `TauCeti/` (never the lakefile). CI's `bump-guard`
+   re-validates the move as forward-only, so a green bump can auto-merge after
+   review. (Complements the downstream-reports "hopscotch" last-known-good bumps.)
+4. **Roadmap** — otherwise, an agent starts a new PR advancing a roadmap target,
    avoiding the area of the most recently opened PR.
 
 ## Quota policy
