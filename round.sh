@@ -64,7 +64,9 @@ MAX_REVIEW_ERRORS=3       # give up re-trying a PR whose review keeps erroring (
 MAX_CI_ATTEMPTS=3         # per-head: stop trying to green a red CI head after this many tries
 MAX_CI_PR_ATTEMPTS=5      # per-PR lifetime backstop for red-CI fixing across all heads
 MAX_REBASE_ATTEMPTS=3     # per-PR: stop trying to rebase/resolve a conflicting PR after this many tries
+MAX_BUMP_ATTEMPTS=3       # per mathlib-master-tip: stop trying to bump-to-and-fix a given tip after this many tries (a newer tip resets it)
 MAX_OPEN_PRS=8            # backpressure: don't author new roadmap PRs while this many of the worker's PRs are already open
+BUMP_BRANCH_PREFIX="bump-mathlib"   # worker's mathlib-bump branches; an open one (or a hopscotch/* PR) suppresses a new bump
 ROADMAP_FOCUS="ReductiveGroups"   # confine authoring to this TauCetiRoadmap/ area; empty = spread across all areas
 mkdir -p "$STATE" "$(dirname "$CHECKOUT")"
 
@@ -617,6 +619,57 @@ do_roadmap() {
     fi
 }
 
+# 4.5 Bump --------------------------------------------------------------------
+# When mathlib's master has advanced past our pin, drive an agent to bump to the
+# current master tip and FIX whatever breaks in TauCeti/ — the automated form of a
+# hand bump: set lean-toolchain to match mathlib, `lake update mathlib`, build, fix
+# the breakage, stay axiom-clean. The agent touches ONLY TauCeti/ + lean-toolchain +
+# lake-manifest.json (never the lakefile); CI's bump-guard re-validates the pins as a
+# forward move, and a green bump can auto-merge after review. Bounded per master-tip so
+# a genuinely hard bump can't churn — a newer tip resets the budget. hopscotch (the
+# downstream-reports automation) opens its own last-known-good bump PRs; an open one of
+# those, or any open bump branch of ours, suppresses this so the two never collide.
+mathlib_master_tip() {
+    gh api repos/leanprover-community/mathlib4/commits/master --jq '.sha' 2>/dev/null
+}
+our_mathlib_pin() {
+    gh api "repos/${TAUCETI}/contents/lake-manifest.json?ref=main" --jq '.content' 2>/dev/null \
+        | base64 -d 2>/dev/null \
+        | python3 -c 'import json,sys
+m=json.load(sys.stdin); print(next((p["rev"] for p in m["packages"] if p.get("name")=="mathlib"), ""))' 2>/dev/null
+}
+# bump_candidate <open-json> — echo the target master sha and return 0 if a bump is
+# warranted (master ahead of our pin, no bump/hopscotch PR open, under budget); else 1.
+bump_candidate() {
+    local open="$1"
+    if echo "$open" | jq -e --arg p "$BUMP_BRANCH_PREFIX" '.[]
+        | select(.isDraft|not)
+        | select((.headRefName|startswith($p)) or (.headRefName|startswith("hopscotch/")))' >/dev/null 2>&1; then
+        return 1   # a bump PR (ours or hopscotch's) already owns the lane
+    fi
+    local tip pin; tip=$(mathlib_master_tip); pin=$(our_mathlib_pin)
+    [[ -n "$tip" && -n "$pin" ]] || return 1   # API hiccup → don't bump on bad data
+    [[ "$tip" == "$pin" ]] && return 1         # already at master tip
+    (( $(counter "$STATE/bump-${tip:0:12}") >= MAX_BUMP_ATTEMPTS )) && return 1
+    echo "$tip"
+}
+
+do_bump() {
+    local tip="$1" pkey="$STATE/bump-${1:0:12}" np branch
+    np=$(counter "$pkey"); echo $((np+1)) > "$pkey"   # count up front: a wedged attempt can't loop
+    branch="${BUMP_BRANCH_PREFIX}-${tip:0:12}"        # deterministic: concurrent workers collide here, the create-only CAS picks one
+    if (( BUBBLE_MODE )); then
+        log "bump to mathlib master ${tip:0:12} (attempt $((np+1))/$MAX_BUMP_ATTEMPTS) with $AGENT in a bubble"
+        run_in_bubble "$TAUCETI" \
+            "$(fill_prompt "$HERE/prompts/bump.md" TARGET "$tip" BRANCH "$branch" AGENT "$AGENT")"
+    else
+        prepare_checkout || die "checkout failed"
+        log "bump to mathlib master ${tip:0:12} (attempt $((np+1))/$MAX_BUMP_ATTEMPTS) with $AGENT on the host"
+        run_agent "$CHECKOUT" \
+            "$(fill_prompt "$HERE/prompts/bump.md" TARGET "$tip" BRANCH "$branch" AGENT "$AGENT")"
+    fi
+}
+
 # 0. Merge ---------------------------------------------------------------------
 # Drain every PR the worker has already green-lit. Mirrors the engine's own gate
 # (TauCetiReview review.py --auto-merge): merge iff every rubric is green on the
@@ -827,6 +880,15 @@ main() {
         | select([.statusCheckRollup[]? | select(.name=="build")
                   | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
         | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
+
+    # 4.5) Bump: mathlib master has moved past our pin and no bump PR is open —
+    #      author one that bumps to master and fixes the breakage. After all
+    #      firefighting (so landing/un-blocking existing PRs is never delayed) but
+    #      before roadmap (keeping current beats authoring features on a stale base).
+    local bump_tip
+    if bump_tip=$(bump_candidate "$open"); then
+        do_bump "$bump_tip"; exit $?
+    fi
 
     # 5) Roadmap: author a new PR — but hold off while the worker already has a
     #    large backlog open. Backpressure stops the queue growing without bound

@@ -12,7 +12,7 @@ You are resolving merge conflicts on pull request #__PR__ of FormalFrontier/TauC
 - Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
 
 ## Rules of the repo (hard constraints)
-- Code goes under `TauCeti/`. You MAY edit the root `TauCeti.lean` (that is expected here). Do NOT touch `Scripts/`, `.github/`, `lakefile`, or `lake-manifest.json`.
+- Code goes under `TauCeti/`. You MAY edit the root `TauCeti.lean` (that is expected here). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
