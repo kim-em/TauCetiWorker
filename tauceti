@@ -716,6 +716,7 @@ class Candidate:
     attempts: int = 0
     budget: int = 0
     provenance: str = "fresh"
+    touches_pins: bool = False   # merge must re-validate the Lake-pin move with check-bump at act time
 
 
 @dataclass
@@ -933,8 +934,8 @@ def _bump_is_forward(gh: GitHub, head: str) -> bool:
 
 def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
     try:
-        mine = gh.pr_list(["number", "headRefOid", "isDraft", "mergeable", "statusCheckRollup",
-                           "files", "body"], author=ME)
+        mine = gh.pr_list(["number", "headRefOid", "headRefName", "isDraft", "mergeable",
+                           "statusCheckRollup", "files", "body"], author=ME)
     except GitHubError as e:
         sv.errors.append(f"housekeeping list: {e}")
         return
@@ -945,26 +946,34 @@ def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
         pr, head = d["number"], d.get("headRefOid", "")
         files = [f["path"] for f in (d.get("files") or [])]
         rollup = d.get("statusCheckRollup") or []
-        build_green = any(c.get("name") == "build" and c.get("conclusion") == "SUCCESS" for c in rollup)
+        # Bind "build green" to the trusted pr-build workflow's check run, not just any check named
+        # "build" — so a look-alike status/check can't satisfy the gate (esp. the no-rubric pins path).
+        build_green = any(c.get("name") == "build" and c.get("workflowName") == "pr-build"
+                          and c.get("conclusion") == "SUCCESS" for c in rollup)
         green_meta = rs.review_all_green(pr, head)
         all_green = green_meta.data.get("_all_green", False)
         # merge: MERGEABLE, build green, and only auto-mergeable paths changed — TauCeti/ math
-        # (+ the root aggregator) and/or the Lake pins. A pins-only diff is a pure forward bump:
-        # check-bump (re-run vs current main) plus the sandboxed build ARE its review, so it needs no
-        # rubrics. Any TauCeti/ content — a real bump that also carries adaptation fixes, or a plain
-        # content PR — still needs all rubrics green. Pin changes, wherever they appear, are gated on
-        # check-bump; the lakefile and every other human-owned path stay out of scope.
+        # (+ the root aggregator) and/or the Lake pins. A pins-only diff *on a recognized bump
+        # branch* is a pure forward bump: check-bump plus the sandboxed build ARE its review, so it
+        # skips rubrics. Any TauCeti/ content — a real bump that also carries adaptation fixes, or a
+        # plain content PR — still needs all rubrics green, as does a pins-only diff on any other
+        # branch. The lakefile and every other human-owned path stay out of scope. A pin change is
+        # re-validated by check-bump at merge time (prepass_merge), not here, so the authoritative
+        # check runs once against current main right before the privileged merge.
+        ref = d.get("headRefName", "")
+        is_bump_branch = ref.startswith(BUMP_BRANCH_PREFIX) or ref.startswith("hopscotch/")
         in_scope = bool(files) and all(
             p.startswith("TauCeti/") or p == "TauCeti.lean" or p in PIN_FILES for p in files)
         touches_pins = any(p in PIN_FILES for p in files)
         pins_only = bool(files) and all(p in PIN_FILES for p in files)
+        skip_review = pins_only and is_bump_branch   # only a real bump branch may merge unreviewed
         if (d.get("mergeable") == "MERGEABLE" and build_green and in_scope
-                and (pins_only or all_green)
-                and (not touches_pins or _bump_is_forward(gh, head))):
-            reason = ("forward Lake-pin bump (check-bump @ merge), pins only" if pins_only
+                and (skip_review or all_green)):
+            reason = ("forward Lake-pin bump (check-bump @ merge), pins only" if skip_review
                       else "rubrics green @ head + forward Lake-pin bump" if touches_pins
                       else "all rubrics green @ head, TauCeti/ only")
-            sv.mergeable_now.append(Candidate(pr, head, reason, provenance=green_meta.provenance))
+            sv.mergeable_now.append(Candidate(pr, head, reason, provenance=green_meta.provenance,
+                                              touches_pins=touches_pins))
         # abandon: not green, head IS the reviewed head, past budget, (human-activity checked lazily).
         elif (not all_green and rs.ledger_head(pr) == head
               and rs.review_rounds(pr, counters) >= MAX_REVIEW_ROUNDS):
@@ -1627,11 +1636,20 @@ def prepass_merge(w: Worker, sv: Survey, dry: bool) -> None:
             log(f"merge: skip #{c.pr} — scoreboard provenance={c.provenance} (refuse to act on stale data)")
             continue
         if dry:
-            log(f"[dry-run] would merge #{c.pr} ({c.reason})")
+            extra = " (pending check-bump)" if c.touches_pins else ""
+            log(f"[dry-run] would merge #{c.pr} ({c.reason}){extra}")
             continue
-        log(f"merging PR #{c.pr} (all rubrics green @ {c.head[:12]}, TauCeti/ + root only)")
+        # A Lake-pin change is re-validated here, at act time, against current main — so a bump that
+        # has fallen behind a newer pin since classification cannot slip through.
+        if c.touches_pins and not _bump_is_forward(w.gh, c.head):
+            log(f"merge: skip #{c.pr} — check-bump did not validate the pin move @ {c.head[:12]}")
+            continue
+        log(f"merging PR #{c.pr} ({c.reason} @ {c.head[:12]})")
+        # --match-head-commit binds the privileged merge to the exact head we validated: if the
+        # branch was updated after classification, the merge fails closed instead of landing an
+        # unvalidated head.
         r = subprocess.run(["gh", "pr", "merge", str(c.pr), "--repo", TAUCETI,
-                            "--squash", "--delete-branch", "--admin"])
+                            "--squash", "--delete-branch", "--admin", "--match-head-commit", c.head])
         log(f"merged PR #{c.pr}" if r.returncode == 0 else f"merge of PR #{c.pr} failed — left open for a human")
 
 
