@@ -60,13 +60,13 @@ MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while t
 BUMP_BRANCH_PREFIX = "bump-mathlib"
 ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # "" = all areas
 
-# Loop timing (loop.sh).
-POLL = 300            # seconds between quota checks while waiting
-ROUND_TIMEOUT = 5400  # 90 min hard cap per round
-INTERROUND = 20       # min gap after a PRODUCTIVE round
+# Loop timing (loop.sh). Env-overridable for tuning and tests.
+POLL = int(os.environ.get("TAUCETI_POLL", "300"))            # seconds between quota checks while waiting
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
+INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 EX_NOPROGRESS = 75    # round did NO productive work (distinct from error=1 / success=0)
-BACKOFF_BASE = 30     # first no-progress sleep (doubles each consecutive no-progress round)
-BACKOFF_MAX = 900     # cap on the escalating sleep (15 min)
+BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
+BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))   # cap on the escalating sleep (15 min)
 # The escalating back-off exists because a no-op round must NOT re-cycle every INTERROUND seconds and
 # re-hammer the API — the failure that ran ~700 no-op rounds against a rate-limited GitHub.
 
@@ -1547,20 +1547,45 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
 
 
-# Housekeeping pre-passes (real execution lands in M11; here they dry-run / no-op so the picker runs).
+# Housekeeping pre-passes — quota-free, run every round. The worker is the ONLY path that lands or
+# retires PRs (CI-side merge is off). All safety gates (TauCeti/-only, all-green, human-activity,
+# target marker) were applied in survey(); here we ALSO refuse to act on stale/fetch_failed scoreboard
+# data so a transient GitHub blip can't merge/close on a phantom verdict.
+ABANDON_COMMENT = (
+    "Closing automatically: this PR used its full review budget ({total} review rounds) without "
+    "reaching an all-green review at its current head, so an autonomous worker is abandoning it to "
+    "keep the queue moving. The branch is left in place — revive and finish it by hand if it's worth "
+    "completing, or add the `keep` label to stop auto-close.")
+DEDUP_COMMENT = (
+    "Closing automatically: this PR authors the same roadmap target (`{tid}`) as the older open "
+    "#{kept}. An autonomous worker keeps the earlier PR and closes this duplicate to avoid redundant "
+    "review. The branch is left in place — add the `keep` label if it is intentionally distinct.")
+
+
 def prepass_merge(w: Worker, sv: Survey, dry: bool) -> None:
     for c in sv.mergeable_now:
         if c.provenance in ("stale", "fetch_failed"):
             log(f"merge: skip #{c.pr} — scoreboard provenance={c.provenance} (refuse to act on stale data)")
             continue
-        log(f"[dry-run] would merge #{c.pr} ({c.reason})" if dry else f"merge: #{c.pr} (M11)")
+        if dry:
+            log(f"[dry-run] would merge #{c.pr} ({c.reason})")
+            continue
+        log(f"merging PR #{c.pr} (all rubrics green @ {c.head[:12]}, TauCeti/ + root only)")
+        r = subprocess.run(["gh", "pr", "merge", str(c.pr), "--repo", TAUCETI,
+                            "--squash", "--delete-branch", "--admin"])
+        log(f"merged PR #{c.pr}" if r.returncode == 0 else f"merge of PR #{c.pr} failed — left open for a human")
 
 
 def prepass_dedup(w: Worker, sv: Survey, dry: bool) -> None:
     for tid, prs in sv.dup_groups.items():
+        kept = prs[0]
         for pr in prs[1:]:
-            log(f"[dry-run] would close duplicate #{pr} (target '{tid}', keep #{prs[0]})"
-                if dry else f"dup-sweep: #{pr} (M11)")
+            if dry:
+                log(f"[dry-run] would close duplicate #{pr} (target '{tid}', keep #{kept})")
+                continue
+            log(f"dup-sweep: closing PR #{pr} — duplicate target '{tid}' (older open #{kept} kept)")
+            subprocess.run(["gh", "pr", "close", str(pr), "--repo", TAUCETI,
+                            "--comment", DEDUP_COMMENT.format(tid=tid, kept=kept)], capture_output=True)
 
 
 def prepass_abandon(w: Worker, sv: Survey, dry: bool) -> None:
@@ -1568,7 +1593,12 @@ def prepass_abandon(w: Worker, sv: Survey, dry: bool) -> None:
         if c.provenance in ("stale", "fetch_failed"):
             log(f"abandon: skip #{c.pr} — provenance={c.provenance}")
             continue
-        log(f"[dry-run] would abandon #{c.pr} ({c.reason})" if dry else f"abandon: #{c.pr} (M11)")
+        if dry:
+            log(f"[dry-run] would abandon #{c.pr} ({c.reason})")
+            continue
+        log(f"abandoning PR #{c.pr} (review rounds={c.attempts}) — budget spent without reaching green")
+        subprocess.run(["gh", "pr", "close", str(c.pr), "--repo", TAUCETI,
+                        "--comment", ABANDON_COMMENT.format(total=c.attempts)], capture_output=True)
 
 
 # ============================================================================
@@ -1757,7 +1787,7 @@ def cmd_status(args) -> int:
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     cfg = Config.resolve(getattr(args, "worker_id", None))
     if getattr(args, "loop", False) and not one_round:
-        raise SystemExit("tauceti work --loop: the driver loop lands in milestone 12 — one round works now")
+        return cmd_loop(args, cfg, only=only, agent=agent)
     dry = getattr(args, "dry_run", False)
     no_pace = getattr(args, "no_pace", False)
 
@@ -1780,7 +1810,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             time.sleep(int(slp))
             return 0
 
-        work_model = resolve_work_model(cfg, agent, dry=dry, no_pace=no_pace)
+        # Housekeeping-only (--only merge, no work task): drives no model, so don't resolve/pace one.
+        housekeeping_only = bool(only) and not any(t in WORK_TASKS for t in only)
+        work_model = "none" if housekeeping_only else resolve_work_model(cfg, agent, dry=dry, no_pace=no_pace)
         gh = GitHub()
         w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
         opts = RoundOpts(only=only, agent=agent, work_model=work_model,
@@ -1789,6 +1821,61 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         if not dry:
             preflight(cfg, opts)
         return run_round(w, opts)   # NoProgress/Die propagate to main()'s handler
+
+
+def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
+    """The driver: pace against quota (codex preferred), run ONE round as a child under a hard timeout,
+    then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
+    round and exits. Mirrors loop.sh — including the back-off that stopped ~700 no-op rounds hammering
+    a rate-limited GitHub."""
+    openrouter = agent in OPENROUTER_MODELS
+    housekeeping = bool(only) and not any(t in WORK_TASKS for t in only)
+    no_pace = getattr(args, "no_pace", False)
+    host = getattr(args, "host", False)
+    log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}"
+        f"{' [housekeeping]' if housekeeping else ''}{' [host]' if host else ''}")
+    streak = 0
+    try:
+        while True:
+            # 1) Decide the model and whether to run this cycle.
+            if housekeeping:
+                model = None                       # no model; run every cycle (loop.sh HOUSEKEEPING_ONLY)
+            elif openrouter:
+                model = agent                      # pay-per-token; no quota wait
+            elif no_pace:
+                if agent == "auto":
+                    raise SystemExit("--no-pace --loop needs an explicit --agent (codex/claude)")
+                model = agent
+            else:
+                model, snap = Quota(cfg).choose(None if agent == "auto" else agent)
+                if model is None:
+                    log(f"quota: {quota_line(snap)} — sleeping {POLL}s")
+                    time.sleep(POLL)
+                    continue
+
+            # 2) Run ONE round as a child in its own process group, under the hard timeout.
+            tail = ["--worker-id", cfg.wid]
+            if only:
+                tail += ["--only", ",".join(only)]
+            if model:
+                tail += [f"--agent", model, "--no-pace"]   # loop already paced; child must not re-pace
+            if host:
+                tail.append("--host")
+            rc = run_round_subprocess(tail)
+
+            # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
+            if rc == 0:
+                streak = 0
+                time.sleep(INTERROUND)
+            else:
+                streak += 1
+                nap = min(BACKOFF_BASE * (1 << min(streak, 5)), BACKOFF_MAX)
+                tag = "timed out" if rc in (124, 137) else ("no progress" if rc == EX_NOPROGRESS else f"rc={rc}")
+                log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
+                time.sleep(nap)
+    except KeyboardInterrupt:
+        log("loop interrupted — stopping")
+        return 130
 
 
 def resolve_work_model(cfg: Config, agent: str, *, dry: bool, no_pace: bool) -> str:
@@ -1808,8 +1895,98 @@ def resolve_work_model(cfg: Config, agent: str, *, dry: bool, no_pace: bool) -> 
     return chosen
 
 
+KIND_KEYS = {"1": "rebase", "2": "review", "3": "fix", "4": "fix-ci", "5": "bump", "6": "roadmap"}
+
+
+def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool) -> list[str]:
+    """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command')."""
+    cmd = [str(Path(__file__).resolve()), "work"]
+    if loop:
+        cmd.append("--loop")
+    if only:
+        cmd += ["--only", only]
+    if model_dial != "auto":
+        cmd.append(f"--{model_dial}")
+    if host:
+        cmd.append("--host")
+    return cmd
+
+
 def cmd_tui(args) -> int:
-    raise SystemExit("tauceti TUI: not yet implemented (milestone 13). Try `tauceti status` or `tauceti work`.")
+    """Default view: a dashboard of available work + a launcher. NOT a supervisor — launching a loop
+    detaches it (coordination lives in GitHub, not here). Over a pipe / no TTY it prints a snapshot."""
+    from rich.console import Console
+    console = Console()
+    cfg = Config.resolve(None)
+
+    def snapshot() -> "Survey":
+        gh = GitHub()
+        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+        _, q = Quota(cfg).choose(None)
+        render_survey(sv, console, q)
+        return sv
+
+    if not sys.stdin.isatty():
+        snapshot()
+        console.print("[dim](not a TTY — snapshot only; use `tauceti status [--json]` in scripts)[/]")
+        return 0
+
+    model_dial, host = "auto", False
+    while True:
+        console.clear()
+        sv = snapshot()
+        sandbox = "host" if host else "bubble"
+        console.print(
+            f"\n  [bold]model[/]={model_dial}  [bold]sandbox[/]={sandbox}\n"
+            "  [enter] one auto round   [1..6] one round of KIND   [l] loop (auto)   "
+            "[L] focused loop of KIND\n  [m] cycle model   [s] toggle sandbox   [r] refresh   "
+            "[c] copy command   [q] quit")
+        try:
+            choice = input("  > ").strip()
+        except EOFError:
+            return 0
+        if choice == "q":
+            return 0
+        if choice == "r":
+            continue
+        if choice == "m":
+            order = ["auto", "codex", "claude", "deepseek", "minimax"]
+            model_dial = order[(order.index(model_dial) + 1) % len(order)]
+            continue
+        if choice == "s":
+            host = not host
+            continue
+        if choice in ("", "l") or choice in KIND_KEYS or choice == "L":
+            loop = choice in ("l", "L")
+            only = None
+            if choice in KIND_KEYS:
+                only = KIND_KEYS[choice]
+            elif choice == "L":
+                k = input("  loop which KIND? (rebase/review/fix/fix-ci/bump/roadmap) > ").strip()
+                if k not in ALLOWED_TASKS:
+                    console.print(f"[red]unknown kind '{k}'[/]"); input("  enter…"); continue
+                only = k
+            cmd = launch_cmd(only, model_dial, host, loop)
+            if loop:
+                _launch_detached(cfg, cmd, console)
+                input("  enter to return…")
+            else:
+                console.print(f"\n  running: {' '.join(_shq(a) for a in cmd)}\n")
+                os.execvp(cmd[0], cmd)   # replace this process; the round owns the tty
+        if choice == "c":
+            for loop in (False, True):
+                console.print("  " + " ".join(_shq(a) for a in launch_cmd(None, model_dial, host, loop)))
+            input("  enter…")
+
+
+def _launch_detached(cfg: Config, cmd: list[str], console) -> None:
+    cfg.logdir.mkdir(parents=True, exist_ok=True)
+    logf = cfg.logdir / f"loop-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    f = open(logf, "ab")
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=f, start_new_session=True)
+    console.print(f"\n  started loop  pid {p.pid}  →  {logf}\n"
+                  f"  command: {' '.join(_shq(a) for a in cmd)}\n"
+                  f"  stop it: kill {p.pid}\n")
 
 
 def _have(tool: str) -> bool:
