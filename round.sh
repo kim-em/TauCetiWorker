@@ -40,6 +40,11 @@
 #     to a metered provider.
 #   --bubble  run authoring/fixing inside a `bubble` container (kim-em/bubble),
 #     repo-scoped to TauCeti, instead of on the host. Default: host.
+#   --only <task>[,<task>...]  restrict the round to these work units (any of
+#     merge, rebase, review, fix, fix-ci, bump, roadmap). Default (omitted): the
+#     full cascade — "do whatever is most helpful". The quota-free housekeeping
+#     pre-passes (merge ready PRs, abandon stuck ones, sweep duplicates) run in
+#     every mode; 'merge' alone means "housekeeping only, no quota work".
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -79,16 +84,37 @@ die() { log "$*"; exit 1; }
 EX_NOPROGRESS=75
 noprogress() { log "$*"; exit "$EX_NOPROGRESS"; }
 
-# Args: an optional model override and an optional --bubble (sandbox) flag.
-FORCE=""; BUBBLE_MODE=0
+# Args: an optional model override, an optional --bubble (sandbox) flag, and an
+# optional --only task restriction.
+FORCE=""; BUBBLE_MODE=0; ONLY=""
 while (( $# )); do
     case "$1" in
         --codex|--claude|--deepseek|--minimax) FORCE="${1#--}";;
         --bubble) BUBBLE_MODE=1;;
-        *) die "unknown argument: $1 (expected --codex|--claude|--deepseek|--minimax|--bubble)";;
+        --only) shift; [[ -n "${1:-}" ]] || die "--only needs a task list"; ONLY="${ONLY:+$ONLY,}$1";;
+        *) die "unknown argument: $1 (expected --codex|--claude|--deepseek|--minimax|--bubble|--only)";;
     esac
     shift
 done
+
+# Task restriction (--only). By default a round does "whatever is most helpful": it walks the full
+# priority cascade and performs the first unit of work it finds. --only <task>[,<task>...] confines a
+# round to the named work units — a worker pinned to one kind of work (e.g. a review-only or
+# roadmap-only fleet member). The quota-free housekeeping pre-passes (merge ready PRs, abandon stuck
+# ones, sweep duplicates) ALWAYS run, in every mode, so a focused worker still keeps the queue healthy.
+# The pseudo-task 'merge' names "housekeeping only" — run the pre-passes, then do no quota-spending work.
+ALLOWED_TASKS=" merge rebase review fix fix-ci bump roadmap "
+ONLY="${ONLY// /}"   # tolerate "review, fix"
+if [[ -n "$ONLY" ]]; then
+    IFS=',' read -ra _only_tasks <<< "$ONLY"
+    for _t in "${_only_tasks[@]}"; do
+        [[ -z "$_t" ]] && continue
+        [[ "$ALLOWED_TASKS" == *" $_t "* ]] \
+            || die "unknown --only task '$_t' (valid: merge, rebase, review, fix, fix-ci, bump, roadmap)"
+    done
+fi
+# want TASK — is this work-unit stage enabled this round? Empty ONLY ⇒ everything is enabled.
+want() { [[ -z "$ONLY" ]] || [[ ",$ONLY," == *",$1,"* ]]; }
 
 # OpenRouter models driven through the `pi` agentic loop (badlogic/pi-mono),
 # billed per-token to OPENROUTER_API_KEY. Add a provider here and it is usable
@@ -823,6 +849,7 @@ main() {
     #    one would be wasted. Bounded per-PR; a PR that can't be rebased rides to
     #    the review budget and is abandoned. Skip past-budget PRs (abandon owns them).
     local pr head refname owner repo
+    if want rebase; then
     while read -r pr head refname owner repo; do
         [[ -z "$pr" ]] && break
         (( $(review_rounds "$pr") >= MAX_REVIEW_ROUNDS )) && continue
@@ -833,6 +860,7 @@ main() {
         | select(.isDraft|not) | select(.author.login==$me)
         | select(.mergeable=="CONFLICTING")
         | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
+    fi
 
     # 2) Review: first non-draft, build-green PR whose CURRENT head has not been
     #    cleanly reviewed yet. The head-guard (clean_head != head) is what prevents
@@ -841,6 +869,7 @@ main() {
     #    leaves the PR stuck (reviewed at an old head, unreviewable at the new one).
     #    The lifetime budget (MAX_REVIEW_ROUNDS) bounds total churn; a PR that blows
     #    through it without going green is abandoned by the abandon pre-pass.
+    if want review; then
     while read -r pr head; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_clean_head "$pr")" == "$head" ]] && continue
@@ -851,8 +880,10 @@ main() {
         | select(.isDraft|not)
         | select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))
         | "\(.number) \(.headRefOid)"')
+    fi
 
     # 3) Fix: first of kim-em's open PRs reviewed-at-head with a 🟡/⛔ rubric.
+    if want fix; then
     while read -r pr head refname owner repo; do
         [[ -z "$pr" ]] && break
         [[ "$(ledger_head "$pr")" == "$head" ]] || continue
@@ -863,12 +894,14 @@ main() {
         do_fix "$pr" "$head"; exit $?
     done < <(echo "$open" | jq -r --arg me "$ME" '.[] | select(.author.login==$me)
         | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
+    fi
 
     # 4) Fix red CI: kim-em's open PRs whose "build" check has FAILED at the
     #    current head (not merely pending). Such a PR is never reviewable (review
     #    needs green) and never review-fixable (never reviewed), so without this it
     #    sits red forever while the loop authors around it. Bounded per-head and
     #    per-PR, like the review-fix step, so it can't churn one PR indefinitely.
+    if want fix-ci; then
     while read -r pr head refname owner repo; do
         [[ -z "$pr" ]] && break
         (( $(counter "$STATE/ci-$pr-${head:0:12}") >= MAX_CI_ATTEMPTS )) && continue
@@ -880,13 +913,14 @@ main() {
         | select([.statusCheckRollup[]? | select(.name=="build")
                   | select(.conclusion | IN("FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"))] | any)
         | "\(.number) \(.headRefOid) \(.headRefName) \(.headRepositoryOwner.login) \(.headRepository.name)"')
+    fi
 
     # 4.5) Bump: mathlib master has moved past our pin and no bump PR is open —
     #      author one that bumps to master and fixes the breakage. After all
     #      firefighting (so landing/un-blocking existing PRs is never delayed) but
     #      before roadmap (keeping current beats authoring features on a stale base).
     local bump_tip
-    if bump_tip=$(bump_candidate "$open"); then
+    if want bump && bump_tip=$(bump_candidate "$open"); then
         do_bump "$bump_tip"; exit $?
     fi
 
@@ -894,14 +928,21 @@ main() {
     #    large backlog open. Backpressure stops the queue growing without bound
     #    (and spawning more duplicates) while review/fix/merge drain it; authoring
     #    resumes automatically once the open count falls back below the threshold.
-    local n_mine
-    n_mine=$(echo "$open" | jq --arg me "$ME" '[.[] | select(.isDraft|not) | select(.author.login==$me)] | length')
-    if (( n_mine >= MAX_OPEN_PRS )); then
-        noprogress "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
+    if want roadmap; then
+        local n_mine
+        n_mine=$(echo "$open" | jq --arg me "$ME" '[.[] | select(.isDraft|not) | select(.author.login==$me)] | length')
+        if (( n_mine >= MAX_OPEN_PRS )); then
+            noprogress "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
+        fi
+        # Confine authoring to ROADMAP_FOCUS (a single TauCetiRoadmap/ area), or range
+        # over all areas when it is empty. Dedup against open PRs (handled in the
+        # prompt) keeps successive rounds from repeating the same target within the area.
+        do_roadmap "${ROADMAP_FOCUS:-any}"
+    else
+        # A focused worker (--only without roadmap) found no work in its allowed stages
+        # this round. The pre-passes (merge/abandon/dup-sweep) already ran; report
+        # no-progress so loop.sh backs off instead of busy-spinning.
+        noprogress "no eligible work this round under --only=$ONLY (housekeeping pre-passes ran)"
     fi
-    # Confine authoring to ROADMAP_FOCUS (a single TauCetiRoadmap/ area), or range
-    # over all areas when it is empty. Dedup against open PRs (handled in the
-    # prompt) keeps successive rounds from repeating the same target within the area.
-    do_roadmap "${ROADMAP_FOCUS:-any}"
 }
 main
