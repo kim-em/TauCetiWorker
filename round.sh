@@ -83,6 +83,12 @@ die() { log "$*"; exit 1; }
 # re-hammering the API (the failure mode that ran 700 no-op rounds against a rate-limited GitHub).
 EX_NOPROGRESS=75
 noprogress() { log "$*"; exit "$EX_NOPROGRESS"; }
+# A round that performs no work UNIT but DID land / retire / de-dup a PR via the quota-free housekeeping
+# pre-passes is still productive — exit 0 so loop.sh resets its back-off instead of escalating (a
+# --only merge janitor that is actively merging must not be treated as idle). HK_WORK is set by the
+# pre-passes below when they actually change state.
+HK_WORK=0
+end_no_work() { (( HK_WORK )) && { log "no work unit this round, but housekeeping changed state — productive"; exit 0; }; noprogress "$1"; }
 
 # Args: an optional model override, an optional --bubble (sandbox) flag, and an
 # optional --only task restriction.
@@ -108,7 +114,7 @@ ONLY="${ONLY// /}"   # tolerate "review, fix"
 if [[ -n "$ONLY" ]]; then
     IFS=',' read -ra _only_tasks <<< "$ONLY"
     for _t in "${_only_tasks[@]}"; do
-        [[ -z "$_t" ]] && continue
+        [[ -z "$_t" ]] && die "empty task in --only (no leading/trailing/repeated commas)"
         [[ "$ALLOWED_TASKS" == *" $_t "* ]] \
             || die "unknown --only task '$_t' (valid: merge, rebase, review, fix, fix-ci, bump, roadmap)"
     done
@@ -720,7 +726,7 @@ merge_ready_prs() {
         # overrides the "1 approving review" branch policy (CI's bot approval is
         # disabled). Without it gh refuses: "base branch policy prohibits the merge".
         if gh pr merge "$pr" --repo "$TAUCETI" --squash --delete-branch --admin; then
-            log "merged PR #$pr"
+            log "merged PR #$pr"; HK_WORK=1
         else
             log "merge of PR #$pr failed — left open for human attention"
         fi
@@ -774,7 +780,7 @@ abandon_stuck_prs() {
         log "abandoning PR #$pr (review rounds=$total) — review budget spent at the reviewed head without reaching green"
         if gh pr close "$pr" --repo "$TAUCETI" \
             --comment "Closing automatically: this PR used its full review budget (${total} review rounds) without reaching an all-green review at its current head, so an autonomous worker is abandoning it to keep the queue moving. The branch is left in place — revive and finish it by hand if it's worth completing, or add the \`keep\` label to stop auto-close." 2>&1 | tail -1; then
-            log "abandoned PR #$pr"
+            log "abandoned PR #$pr"; HK_WORK=1
         else
             log "abandon of PR #$pr failed"
         fi
@@ -808,7 +814,7 @@ sweep_duplicate_authored_prs() {
             log "dup-sweep: closing PR #$pr — duplicate authored target '$id' (older open #${seen[$id]} kept)"
             if gh pr close "$pr" --repo "$TAUCETI" \
                 --comment "Closing automatically: this PR authors the same roadmap target (\`$id\`) as the older open #${seen[$id]}. An autonomous worker keeps the earlier PR and closes this duplicate to avoid redundant review. The branch is left in place — add the \`keep\` label if it is intentionally distinct." >/dev/null 2>&1; then
-                log "dup-sweep: closed #$pr"
+                log "dup-sweep: closed #$pr"; HK_WORK=1
             else
                 log "dup-sweep: close of #$pr failed"
             fi
@@ -932,17 +938,17 @@ main() {
         local n_mine
         n_mine=$(echo "$open" | jq --arg me "$ME" '[.[] | select(.isDraft|not) | select(.author.login==$me)] | length')
         if (( n_mine >= MAX_OPEN_PRS )); then
-            noprogress "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
+            end_no_work "roadmap: $n_mine open PRs (>= $MAX_OPEN_PRS) — backpressure, not authoring this round"
         fi
         # Confine authoring to ROADMAP_FOCUS (a single TauCetiRoadmap/ area), or range
         # over all areas when it is empty. Dedup against open PRs (handled in the
         # prompt) keeps successive rounds from repeating the same target within the area.
         do_roadmap "${ROADMAP_FOCUS:-any}"
     else
-        # A focused worker (--only without roadmap) found no work in its allowed stages
-        # this round. The pre-passes (merge/abandon/dup-sweep) already ran; report
-        # no-progress so loop.sh backs off instead of busy-spinning.
-        noprogress "no eligible work this round under --only=$ONLY (housekeeping pre-passes ran)"
+        # A focused worker (--only without roadmap) found no work in its allowed stages this round. The
+        # pre-passes (merge/abandon/dup-sweep) already ran; if they changed state the round was still
+        # productive (exit 0), otherwise report no-progress so loop.sh backs off instead of busy-spinning.
+        end_no_work "no eligible work this round under --only=$ONLY (housekeeping pre-passes ran)"
     fi
 }
 main

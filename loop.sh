@@ -88,10 +88,15 @@ done
 ONLY="${ONLY// /}"   # tolerate "review, fix"
 
 # Validate --only task names up front (round.sh re-checks, but catch a typo here so a bad name can't
-# masquerade as housekeeping-only and busy-fail every round).
+# masquerade as housekeeping-only and busy-fail every round). Split on commas with a real array (no
+# unquoted word-splitting/globbing) and reject empty elements (a stray ',' would otherwise be read as
+# housekeeping-only and silently do nothing).
 ALLOWED_TASKS=" merge rebase review fix fix-ci bump roadmap "
+declare -a ONLY_TASKS=()
 if [[ -n "$ONLY" ]]; then
-    for _t in ${ONLY//,/ }; do
+    IFS=',' read -ra ONLY_TASKS <<< "$ONLY"
+    for _t in "${ONLY_TASKS[@]}"; do
+        [[ -z "$_t" ]] && { echo "empty task in --only (no leading/trailing/repeated commas)" >&2; exit 64; }
         [[ "$ALLOWED_TASKS" == *" $_t "* ]] \
             || { echo "unknown --only task '$_t' (valid: merge, rebase, review, fix, fix-ci, bump, roadmap)" >&2; exit 64; }
     done
@@ -100,11 +105,11 @@ fi
 # A worker confined to housekeeping (--only merge, with no quota-spending stage) drives no model: it
 # only merges green PRs, abandons stuck ones, and sweeps duplicates. Detect that so we skip the quota
 # wait and the model preflight entirely and run a round every cycle. Any of rebase/review/fix/fix-ci/
-# bump/roadmap in the set means a model IS needed. (round.sh validates the task names strictly.)
+# bump/roadmap in the set means a model IS needed.
 HOUSEKEEPING_ONLY=0
-if [[ -n "$ONLY" ]]; then
+if (( ${#ONLY_TASKS[@]} )); then
     HOUSEKEEPING_ONLY=1
-    for _t in ${ONLY//,/ }; do
+    for _t in "${ONLY_TASKS[@]}"; do
         case "$_t" in rebase|review|fix|fix-ci|bump|roadmap) HOUSEKEEPING_ONLY=0;; esac
     done
 fi
@@ -143,9 +148,11 @@ if (( ISOLATE_HOME )); then
     echo "$(date '+%F %T') loop.sh: isolated HOME=$WORKER_HOME (worker '$WID')" >&2
 fi
 
-# Args forwarded to round.sh each round (model override, --bubble, and/or --only).
+# Args forwarded to round.sh each round (model override, --bubble, and/or --only). A housekeeping-only
+# worker drives no model, so don't forward the model flag — otherwise --only merge --deepseek/--minimax
+# would make round.sh demand OPENROUTER_API_KEY / pi for a round that runs no model.
 ROUND_ARGS=()
-[[ -n "$FORCE" ]] && ROUND_ARGS+=( "--$FORCE" )
+[[ -n "$FORCE" ]] && (( ! HOUSEKEEPING_ONLY )) && ROUND_ARGS+=( "--$FORCE" )
 (( BUBBLE_MODE )) && ROUND_ARGS+=( --bubble )
 [[ -n "$ONLY" ]] && ROUND_ARGS+=( --only "$ONLY" )
 
