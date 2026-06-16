@@ -909,6 +909,11 @@ def _bump_is_forward(gh: GitHub, head: str) -> bool:
     against *current* main, so a PR that has fallen behind a newer pin can't slip through. Any fetch
     or exec problem fails closed (returns False)."""
     import base64, tempfile
+    # Pin the base to one commit SHA, captured once: fetching by the moving "main" ref across several
+    # calls could otherwise mix files from before and after a concurrent push into one base snapshot.
+    base_sha = gh.api_jq(f"repos/{TAUCETI}/commits/main", ".sha")
+    if not base_sha:
+        return False
     def fetch(ref: str, name: str, dest: Path, *, required: bool) -> bool:
         content = gh.api_jq(f"repos/{TAUCETI}/contents/{name}?ref={ref}", ".content")
         if content is None:
@@ -922,9 +927,9 @@ def _bump_is_forward(gh: GitHub, head: str) -> bool:
         root = Path(td)
         base, pr = root / "base", root / "pr"
         base.mkdir(); pr.mkdir()
-        if not fetch("main", "Scripts/check-bump.sh", root / "check-bump.sh", required=True):
+        if not fetch(base_sha, "Scripts/check-bump.sh", root / "check-bump.sh", required=True):
             return False
-        for ref, d in (("main", base), (head, pr)):
+        for ref, d in ((base_sha, base), (head, pr)):
             for name in ("lean-toolchain", "lake-manifest.json", "lakefile.toml"):
                 if not fetch(ref, name, d / name, required=True):
                     return False
