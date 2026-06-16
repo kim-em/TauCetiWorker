@@ -58,6 +58,7 @@ MAX_BUMP_ATTEMPTS = 3       # per mathlib-master-tip (a newer tip resets it)
 MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
 
 BUMP_BRANCH_PREFIX = "bump-mathlib"
+PIN_FILES = {"lake-manifest.json", "lean-toolchain"}   # the Lake pins: a forward bump may touch these
 ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # "" = all areas
 
 # Loop timing (loop.sh). Env-overridable for tuning and tests.
@@ -897,6 +898,39 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     return sv
 
 
+def _bump_is_forward(gh: GitHub, head: str) -> bool:
+    """Re-validate a Lake-pin change at merge time with the TRUSTED base validator.
+
+    Fetches Scripts/check-bump.sh from `main` and the pin/lakefile texts from both `main` and the PR
+    head, then runs the script (base vs pr). check-bump proves the manifest/toolchain move is a
+    forward-only bump of mathlib on the branch the lakefile nominates, with the lakefile unchanged.
+    Re-running it here (rather than trusting the posted bump-guard status) re-checks forward-ness
+    against *current* main, so a PR that has fallen behind a newer pin can't slip through. Any fetch
+    or exec problem fails closed (returns False)."""
+    import base64, tempfile
+    def fetch(ref: str, name: str, dest: Path, *, required: bool) -> bool:
+        content = gh.api_jq(f"repos/{TAUCETI}/contents/{name}?ref={ref}", ".content")
+        if content is None:
+            return not required   # an absent optional file (e.g. lakefile.lean) is fine; a required miss fails closed
+        try:
+            dest.write_bytes(base64.b64decode(content))
+        except Exception:
+            return False
+        return True
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        base, pr = root / "base", root / "pr"
+        base.mkdir(); pr.mkdir()
+        if not fetch("main", "Scripts/check-bump.sh", root / "check-bump.sh", required=True):
+            return False
+        for ref, d in (("main", base), (head, pr)):
+            for name in ("lean-toolchain", "lake-manifest.json", "lakefile.toml"):
+                if not fetch(ref, name, d / name, required=True):
+                    return False
+            fetch(ref, "lakefile.lean", d / "lakefile.lean", required=False)
+        return run(["bash", str(root / "check-bump.sh"), str(base), str(pr)]).returncode == 0
+
+
 def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
     try:
         mine = gh.pr_list(["number", "headRefOid", "isDraft", "mergeable", "statusCheckRollup",
@@ -914,11 +948,23 @@ def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
         build_green = any(c.get("name") == "build" and c.get("conclusion") == "SUCCESS" for c in rollup)
         green_meta = rs.review_all_green(pr, head)
         all_green = green_meta.data.get("_all_green", False)
-        # merge: all rubrics green at head, TauCeti/-only (+ root), MERGEABLE, build green.
-        if (all_green and d.get("mergeable") == "MERGEABLE" and build_green
-                and files and all(p.startswith("TauCeti/") or p == "TauCeti.lean" for p in files)):
-            sv.mergeable_now.append(Candidate(pr, head, "all rubrics green @ head, TauCeti/ only",
-                                              provenance=green_meta.provenance))
+        # merge: MERGEABLE, build green, and only auto-mergeable paths changed — TauCeti/ math
+        # (+ the root aggregator) and/or the Lake pins. A pins-only diff is a pure forward bump:
+        # check-bump (re-run vs current main) plus the sandboxed build ARE its review, so it needs no
+        # rubrics. Any TauCeti/ content — a real bump that also carries adaptation fixes, or a plain
+        # content PR — still needs all rubrics green. Pin changes, wherever they appear, are gated on
+        # check-bump; the lakefile and every other human-owned path stay out of scope.
+        in_scope = bool(files) and all(
+            p.startswith("TauCeti/") or p == "TauCeti.lean" or p in PIN_FILES for p in files)
+        touches_pins = any(p in PIN_FILES for p in files)
+        pins_only = bool(files) and all(p in PIN_FILES for p in files)
+        if (d.get("mergeable") == "MERGEABLE" and build_green and in_scope
+                and (pins_only or all_green)
+                and (not touches_pins or _bump_is_forward(gh, head))):
+            reason = ("forward Lake-pin bump (check-bump @ merge), pins only" if pins_only
+                      else "rubrics green @ head + forward Lake-pin bump" if touches_pins
+                      else "all rubrics green @ head, TauCeti/ only")
+            sv.mergeable_now.append(Candidate(pr, head, reason, provenance=green_meta.provenance))
         # abandon: not green, head IS the reviewed head, past budget, (human-activity checked lazily).
         elif (not all_green and rs.ledger_head(pr) == head
               and rs.review_rounds(pr, counters) >= MAX_REVIEW_ROUNDS):
