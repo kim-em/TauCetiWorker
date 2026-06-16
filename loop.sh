@@ -24,6 +24,11 @@
 #                            (pay-per-token, no subscription quota to wait on).
 # DeepSeek/MiniMax run ONLY when their flag is passed — never auto-dispatched.
 #
+# Task restriction: by default a round does whatever is most helpful (the full
+# review→fix→bump→roadmap cascade). --only <task>[,<task>...] pins the worker to
+# one kind of work (e.g. --only review, or --only roadmap), forwarded to round.sh.
+# --only merge (housekeeping only) drives no model, so it skips the quota wait.
+#
 # Sandboxing: by default authoring/fixing runs on the HOST. Pass --bubble to run
 # each authoring/fixing round inside a `bubble` container instead (repo-scoped to
 # TauCeti). The flag is forwarded to round.sh and combines with any model flag.
@@ -65,19 +70,49 @@ noprogress_streak=0
 OPENROUTER_PROVIDERS=" deepseek minimax "
 is_openrouter() { [[ "$OPENROUTER_PROVIDERS" == *" $1 "* ]]; }
 
-# Optional explicit model override, --bubble (sandbox), --worker-id, --isolate-home.
-FORCE=""; BUBBLE_MODE=0; ISOLATE_HOME=0
+# Optional explicit model override, --bubble (sandbox), --only (task restriction),
+# --worker-id, --isolate-home.
+FORCE=""; BUBBLE_MODE=0; ISOLATE_HOME=0; ONLY=""
 while (( $# )); do
     case "$1" in
         --codex|--claude|--deepseek|--minimax) FORCE="${1#--}";;
         --bubble) BUBBLE_MODE=1;;
+        --only) shift; [[ -n "${1:-}" ]] || { echo "--only needs a task list" >&2; exit 64; }; ONLY="${ONLY:+$ONLY,}$1";;
         --worker-id) shift; TAUCETI_WORKER_ID="$1";;
         --isolate-home) ISOLATE_HOME=1;;   # per-worker Claude/Codex auth state (needed for multi-worker)
-        -h|--help) echo "usage: $0 [--codex|--claude|--deepseek|--minimax] [--bubble] [--worker-id ID] [--isolate-home]"; exit 0;;
+        -h|--help) echo "usage: $0 [--codex|--claude|--deepseek|--minimax] [--bubble] [--only TASKS] [--worker-id ID] [--isolate-home]"; exit 0;;
         *) echo "unknown argument: $1" >&2; exit 64;;
     esac
     shift
 done
+ONLY="${ONLY// /}"   # tolerate "review, fix"
+
+# Validate --only task names up front (round.sh re-checks, but catch a typo here so a bad name can't
+# masquerade as housekeeping-only and busy-fail every round). Split on commas with a real array (no
+# unquoted word-splitting/globbing) and reject empty elements (a stray ',' would otherwise be read as
+# housekeeping-only and silently do nothing).
+ALLOWED_TASKS=" merge rebase review fix fix-ci bump roadmap "
+declare -a ONLY_TASKS=()
+if [[ -n "$ONLY" ]]; then
+    IFS=',' read -ra ONLY_TASKS <<< "$ONLY"
+    for _t in "${ONLY_TASKS[@]}"; do
+        [[ -z "$_t" ]] && { echo "empty task in --only (no leading/trailing/repeated commas)" >&2; exit 64; }
+        [[ "$ALLOWED_TASKS" == *" $_t "* ]] \
+            || { echo "unknown --only task '$_t' (valid: merge, rebase, review, fix, fix-ci, bump, roadmap)" >&2; exit 64; }
+    done
+fi
+
+# A worker confined to housekeeping (--only merge, with no quota-spending stage) drives no model: it
+# only merges green PRs, abandons stuck ones, and sweeps duplicates. Detect that so we skip the quota
+# wait and the model preflight entirely and run a round every cycle. Any of rebase/review/fix/fix-ci/
+# bump/roadmap in the set means a model IS needed.
+HOUSEKEEPING_ONLY=0
+if (( ${#ONLY_TASKS[@]} )); then
+    HOUSEKEEPING_ONLY=1
+    for _t in "${ONLY_TASKS[@]}"; do
+        case "$_t" in rebase|review|fix|fix-ci|bump|roadmap) HOUSEKEEPING_ONLY=0;; esac
+    done
+fi
 
 # Resolve a globally-unique worker id (mint a fresh one per start if not pinned) and export it so
 # round.sh derives matching per-worker paths. Never persist a minted id to a shared file.
@@ -113,10 +148,13 @@ if (( ISOLATE_HOME )); then
     echo "$(date '+%F %T') loop.sh: isolated HOME=$WORKER_HOME (worker '$WID')" >&2
 fi
 
-# Args forwarded to round.sh each round (model override and/or --bubble).
+# Args forwarded to round.sh each round (model override, --bubble, and/or --only). A housekeeping-only
+# worker drives no model, so don't forward the model flag — otherwise --only merge --deepseek/--minimax
+# would make round.sh demand OPENROUTER_API_KEY / pi for a round that runs no model.
 ROUND_ARGS=()
-[[ -n "$FORCE" ]] && ROUND_ARGS+=( "--$FORCE" )
+[[ -n "$FORCE" ]] && (( ! HOUSEKEEPING_ONLY )) && ROUND_ARGS+=( "--$FORCE" )
 (( BUBBLE_MODE )) && ROUND_ARGS+=( --bubble )
+[[ -n "$ONLY" ]] && ROUND_ARGS+=( --only "$ONLY" )
 
 LOGDIR="$HERE/logs/$WID"
 mkdir -p "$LOGDIR" "$HERE/state/$WID"
@@ -125,9 +163,17 @@ mkdir -p "$LOGDIR" "$HERE/state/$WID"
 # sleeping forever or silently falling through to authoring.
 preflight() {
     local bad=0 t
-    for t in gh git jq uvx; do
+    for t in gh git jq; do
         command -v "$t" >/dev/null || { echo "preflight: missing '$t' on PATH" >&2; bad=1; }
     done
+    # Housekeeping-only worker (--only merge): no model, no toolchain, no review
+    # engine — just merge/abandon/sweep over the GitHub API. Check gh auth and stop.
+    if (( HOUSEKEEPING_ONLY )); then
+        gh auth status >/dev/null 2>&1 || { echo "preflight: gh is not authenticated (run 'gh auth login')" >&2; bad=1; }
+        (( bad )) && { echo "preflight failed — fix the above and re-run" >&2; exit 1; }
+        return
+    fi
+    command -v uvx >/dev/null || { echo "preflight: missing 'uvx' on PATH (the review engine needs it)" >&2; bad=1; }
     # Sandbox vs host: --bubble runs the round in a container; host authoring
     # builds with lake on the host.
     if (( BUBBLE_MODE )); then
@@ -209,6 +255,15 @@ settle() {
 }
 
 while true; do
+    # Housekeeping-only (--only merge): no model to drive, so no quota to wait on —
+    # merge/abandon/sweep over the GitHub API and re-cycle. Back-off still applies
+    # via settle (a round with nothing to land exits EX_NOPROGRESS).
+    if (( HOUSEKEEPING_ONLY )); then
+        echo "$(date '+%F %T') housekeeping only (--only $ONLY)${BUBBLE_MODE:+ [bubble]} — one round" >&2
+        run_round task "$HERE/round.sh" "${ROUND_ARGS[@]}"; settle $?
+        continue
+    fi
+
     # Forced OpenRouter model (DeepSeek/MiniMax via pi): pay-per-token, so there
     # is no subscription quota to wait on — run a round every cycle. Cost is
     # bounded by you having chosen to run with --$FORCE.
