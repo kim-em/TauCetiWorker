@@ -15,7 +15,7 @@ lake exe axioms
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and the code builds clean locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
 
 ## Rules of the repo (hard constraints)
-- Adapt code under `TauCeti/` (and the root `TauCeti.lean` import list if a module is added/removed, kept alphabetical). The only files outside `TauCeti/` you may leave changed are the pins the bot already bumped. Do NOT touch `Scripts/`, `.github/`, or the lakefile (`lakefile.toml`/`lakefile.lean`).
+- Adapt code under `TauCeti/`. Do NOT edit the root `TauCeti.lean`: it is regenerated and committed automatically on `main` after merge. The only files outside `TauCeti/` you may leave changed are the pins the bot already bumped. Do NOT touch `Scripts/`, `.github/`, or the lakefile (`lakefile.toml`/`lakefile.lean`).
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter (e.g. with `set_option ... false`) to force the build green.
 
