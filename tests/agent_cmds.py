@@ -27,7 +27,7 @@ a, env = tc.host_agent_argv(P, "deepseek")
 check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"], "--prompt", P])
 
 # PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
-assert env["PATH"].startswith(str(tc.HERE) + ":"), "PATH must prepend the repo dir"
+assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

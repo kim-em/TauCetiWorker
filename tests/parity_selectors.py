@@ -86,17 +86,12 @@ def main():
           '| select(.conclusion | IN(%s))] | any)' % (ME, fail_set),
           [p.number for p in prs if p.author == ME and p.build_failed])
 
-    # bump branch open: any non-draft head starting bump-mathlib or hopscotch/ (round.sh 645-648).
-    ref_bump = bool(jq(data,
-                       '[.[] | select(.isDraft|not) '
-                       '| select((.headRefName|startswith("%s")) or (.headRefName|startswith("hopscotch/")))] | length'
-                       % tc.BUMP_BRANCH_PREFIX))
-    py_bump = any((p.head_ref.startswith(tc.BUMP_BRANCH_PREFIX) or p.head_ref.startswith("hopscotch/"))
-                  for p in prs if not p.is_draft)
-    okb = bool(ref_bump) == py_bump
-    print(f"[{'OK ' if okb else 'XX '}] {'bump_pr_open':14} jq={bool(ref_bump)} py={py_bump}")
-    if not okb:
-        fails += 1
+    # bump: a hopscotch/lkg-bump PR (bot-authored) whose build is red.
+    check("bump (hopscotch)",
+          '.[] | select(.headRefName|startswith("hopscotch/")) '
+          '| select([.statusCheckRollup[]? | select(.name=="build") '
+          '| select(.conclusion | IN(%s))] | any)' % fail_set,
+          [p.number for p in prs if p.head_ref.startswith("hopscotch/") and p.build_failed])
 
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} selector mismatch(es)")
     return 1 if fails else 0

@@ -5,18 +5,19 @@
 # ///
 """tauceti — the Tau Ceti worker, one self-contained tool.
 
-Consolidates the former loop.sh + round.sh into a single program. Bare `tauceti`
-opens a TUI overview + launcher; `tauceti work [--loop]` does the work (one round,
-or the driver loop); `tauceti status` prints the read-only survey.
+Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the work
+(one round, or the driver loop); `tauceti status` prints the read-only survey.
 
-The worker maintains FormalFrontier/TauCeti as `kim-em`: each round does exactly ONE
-unit of work, chosen in priority order — merge/abandon/dedup housekeeping (always),
-then rebase → review → fix → fix-ci → bump → roadmap. CI-side review and auto-merge
-are intentionally off, so the worker is the only path that lands or retires PRs.
+The worker acts on FormalFrontier/TauCeti as the authenticated `gh` account (and
+treats `kim-em`'s PRs as ours). Each round does exactly ONE unit of work, chosen in
+priority order: rebase → review → fix-ci → fix → bump → roadmap. The `bump` step
+adapts a red hopscotch/lkg-bump PR (the review bot opens those; the worker never
+authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI, not
+the worker.
 
-Kept as standalone shell on PATH (invoked BY the agents inside a round): claim.sh,
-git-safe-push, gh-safe-pr-create. Prompts live in prompts/*.md. External tools we
-call: gh, git, uvx tauceti-review, bubble, the agent CLIs (claude/codex/pi).
+Kept as standalone shell in scripts/ (invoked BY the agents on PATH inside a round):
+claim.sh, git-safe-push, gh-safe-pr-create. Prompts live in prompts/*.md. External
+tools: gh, git, uvx (runs the review engine), bubble, the agent CLIs (claude/codex/pi).
 """
 from __future__ import annotations
 
@@ -49,16 +50,15 @@ ME = "kim-em"
 # Per-PR budgets (a PR can never churn forever). Names match round.sh.
 MAX_FIX_ATTEMPTS = 3        # per-head: stop fixing the same head after this many tries
 MAX_FIX_PR_ATTEMPTS = 7     # per-PR lifetime backstop across all heads
-MAX_REVIEW_ROUNDS = 8       # lifetime review budget per PR; past this the abandon pass closes it
+MAX_REVIEW_ROUNDS = 8       # lifetime review budget per PR; past this we stop re-reviewing it
 MAX_REVIEW_ERRORS = 3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS = 3         # per-head: stop trying to green a red-CI head
 MAX_CI_PR_ATTEMPTS = 5      # per-PR lifetime backstop for red-CI fixing
 MAX_REBASE_ATTEMPTS = 3     # per-PR: stop trying to rebase a conflicting PR
-MAX_BUMP_ATTEMPTS = 3       # per mathlib-master-tip (a newer tip resets it)
+MAX_BUMP_ATTEMPTS = 3       # per-head: stop trying to green a red hopscotch bump head
+MAX_BUMP_PR_ATTEMPTS = 5    # per-PR lifetime backstop for bump fixing across heads
 MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
 
-BUMP_BRANCH_PREFIX = "bump-mathlib"
-PIN_FILES = {"lake-manifest.json", "lean-toolchain"}   # the Lake pins: a forward bump may touch these
 ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # "" = all areas
 
 # Loop timing (loop.sh). Env-overridable for tuning and tests.
@@ -84,11 +84,11 @@ OPENROUTER_MODELS = {
 AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek", "minimax": "MiniMax"}
 PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
 
-# Task taxonomy. WORK_TASKS spend a model; `merge` is housekeeping-only (no model, no quota wait).
-ALLOWED_TASKS = ["merge", "rebase", "review", "fix", "fix-ci", "bump", "roadmap"]
-WORK_TASKS = ["rebase", "review", "fix", "fix-ci", "bump", "roadmap"]
-# Every mode that runs a MODEL on third-party content defaults to bubble (opt out with --host).
-SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}  # review included; merge runs no model.
+# Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "roadmap"]
+WORK_TASKS = list(ALLOWED_TASKS)
+# Every mode runs a MODEL on third-party content, so each defaults to bubble (opt out with --host).
+SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 
 AGENTS = ["auto", "codex", "claude", "deepseek", "minimax"]
 SUBSCRIPTION_AGENTS = {"codex", "claude"}
@@ -754,7 +754,6 @@ class Candidate:
     attempts: int = 0
     budget: int = 0
     provenance: str = "fresh"
-    touches_pins: bool = False   # merge must re-validate the Lake-pin move with check-bump at act time
 
 
 @dataclass
@@ -769,16 +768,6 @@ class WorkKind:
 
 
 @dataclass
-class BumpStatus:
-    master_tip: Optional[str] = None
-    our_pin: Optional[str] = None
-    behind: bool = False
-    bump_pr_open: bool = False
-    attempts: int = 0
-    due: bool = False
-
-
-@dataclass
 class Survey:
     worker_id: str
     open_prs: list[PRInfo] = field(default_factory=list)
@@ -788,55 +777,17 @@ class Survey:
     reviewable: WorkKind = field(default_factory=lambda: WorkKind("review"))
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
     red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
-    bump: BumpStatus = field(default_factory=BumpStatus)
+    bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))   # broken hopscotch/lkg-bump PRs
     roadmap_focus: str = ""
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
-    mergeable_now: list[Candidate] = field(default_factory=list)
-    abandon_eligible: list[Candidate] = field(default_factory=list)
-    dup_groups: dict[str, list[int]] = field(default_factory=dict)
     next_auto_stage: Optional[str] = None
     github_failed: bool = False
     errors: list[str] = field(default_factory=list)
 
     def kind(self, name: str) -> WorkKind:
-        return {"rebase": self.rebaseable, "review": self.reviewable,
-                "fix": self.needs_fix, "fix-ci": self.red_ci}[name]
-
-
-def mathlib_master_tip(gh: GitHub) -> Optional[str]:
-    return gh.api_jq("repos/leanprover-community/mathlib4/commits/master", ".sha") or None
-
-
-def our_mathlib_pin(gh: GitHub) -> Optional[str]:
-    import base64
-    content = gh.api_jq(f"repos/{TAUCETI}/contents/lake-manifest.json?ref=main", ".content")
-    if not content:
-        return None
-    try:
-        manifest = json.loads(base64.b64decode(content))
-    except Exception:
-        return None
-    for pkg in manifest.get("packages", []):
-        if pkg.get("name") == "mathlib":
-            return pkg.get("rev")
-    return None
-
-
-def has_human_activity(gh: GitHub, pr: int) -> bool:
-    """Fail-safe: True (treat as human-touched) on any API error or doubt, so we never auto-close a
-    PR a person cares about. True if a protective label, or a comment/review by a non-bot non-worker."""
-    d = gh.pr_view(pr, ["labels", "comments", "reviews"])
-    if d is None:
-        return True
-    labels = {(l.get("name") or "").lower() for l in (d.get("labels") or [])}
-    if labels & {"keep", "hold", "wip", "human", "do-not-close"}:
-        return True
-    for item in (d.get("comments") or []) + (d.get("reviews") or []):
-        login = (item.get("author") or {}).get("login", "")
-        if login and login != ME and not login.endswith("[bot]") and not login.startswith("app/"):
-            return True
-    return False
+        return {"rebase": self.rebaseable, "review": self.reviewable, "fix": self.needs_fix,
+                "fix-ci": self.red_ci, "bump": self.bump}[name]
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
@@ -844,7 +795,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     """Classify every open PR per work-kind. Read-only — performs no actions.
 
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
-    and the housekeeping passes always use deep=True.
+    always uses deep=True.
     """
     sv = Survey(worker_id=cfg.wid, roadmap_focus=ROADMAP_FOCUS or "any")
     try:
@@ -918,144 +869,25 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
         else:
             sv.red_ci.actionable.append(c)
 
-    # 4.5) bump: mathlib master ahead of our pin, no bump/hopscotch PR open, under budget.
-    bump_open = any(p.head_ref.startswith(BUMP_BRANCH_PREFIX) or p.head_ref.startswith("hopscotch/")
-                    for p in nondraft)
-    tip = mathlib_master_tip(gh)
-    pin = our_mathlib_pin(gh)
-    sv.bump = BumpStatus(master_tip=tip, our_pin=pin, bump_pr_open=bump_open)
-    if tip and pin:
-        sv.bump.behind = tip != pin
-        sv.bump.attempts = counters.read(f"bump-{tip[:12]}")
-        sv.bump.due = (sv.bump.behind and not bump_open and sv.bump.attempts < MAX_BUMP_ATTEMPTS)
-
-    # Housekeeping classifications (author-scoped; need files/body). These drive merge/abandon/dedup.
-    if deep:
-        _classify_housekeeping(cfg, gh, rs, counters, sv)
+    # 5) bump: a hopscotch/lkg-bump PR (opened by the review bot) whose build is RED — mathlib moved
+    #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
+    #    author a bump (the bot owns opening them, CI owns merging the green ones). These PRs are
+    #    bot-authored, so the fix/fix-ci steps (which scope to our own PRs) never touch them.
+    for p in nondraft:
+        if not (p.head_ref.startswith("hopscotch/") and p.build_failed):
+            continue
+        c = Candidate(p.number, p.head_oid, "hopscotch bump, build red")
+        per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
+        per_pr = counters.read(f"bump-pr-{p.number}")
+        c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
+        if per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS:
+            sv.bump.suppressed.append(c)
+        else:
+            sv.bump.actionable.append(c)
 
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv
 
-
-def _bump_is_forward(gh: GitHub, head: str) -> bool:
-    """Re-validate a Lake-pin change at merge time with the TRUSTED base validator.
-
-    Fetches Scripts/check-bump.sh from `main` and the pin/lakefile texts from both `main` and the PR
-    head, then runs the script (base vs pr). check-bump proves the manifest/toolchain move is a
-    forward-only bump of mathlib on the branch the lakefile nominates, with the lakefile unchanged.
-    Re-running it here (rather than trusting the posted bump-guard status) re-checks forward-ness
-    against *current* main, so a PR that has fallen behind a newer pin can't slip through. Any fetch
-    or exec problem fails closed (returns False)."""
-    import base64, tempfile
-    # Pin the base to one commit SHA, captured once: fetching by the moving "main" ref across several
-    # calls could otherwise mix files from before and after a concurrent push into one base snapshot.
-    base_sha = gh.api_jq(f"repos/{TAUCETI}/commits/main", ".sha")
-    if not base_sha:
-        return False
-    def fetch(ref: str, name: str, dest: Path, *, required: bool) -> bool:
-        content = gh.api_jq(f"repos/{TAUCETI}/contents/{name}?ref={ref}", ".content")
-        if content is None:
-            return not required   # an absent optional file (e.g. lakefile.lean) is fine; a required miss fails closed
-        try:
-            dest.write_bytes(base64.b64decode(content))
-        except Exception:
-            return False
-        return True
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        base, pr = root / "base", root / "pr"
-        base.mkdir(); pr.mkdir()
-        if not fetch(base_sha, "Scripts/check-bump.sh", root / "check-bump.sh", required=True):
-            return False
-        for ref, d in ((base_sha, base), (head, pr)):
-            for name in ("lean-toolchain", "lake-manifest.json", "lakefile.toml"):
-                if not fetch(ref, name, d / name, required=True):
-                    return False
-            fetch(ref, "lakefile.lean", d / "lakefile.lean", required=False)
-        return run(["bash", str(root / "check-bump.sh"), str(base), str(pr)]).returncode == 0
-
-
-def _merge_decision(rs: "ReviewState", d: dict) -> Optional[tuple]:
-    """Is this PR auto-mergeable RIGHT NOW at its current head? Returns (reason, touches_pins,
-    provenance) or None. A pure predicate over a PR's JSON so survey() (bulk list) and prepass_merge
-    (a fresh act-time `pr view`) apply IDENTICAL gates — the act-time call is what closes the TOCTOU
-    before the privileged `gh pr merge --admin`.
-
-    Gates: ours, not draft, MERGEABLE, the trusted pr-build check green at head, and only
-    auto-mergeable paths changed — TauCeti/ math (+ the root aggregator) and/or the Lake pins. A
-    pins-only diff on a recognized bump branch (bump-mathlib*/hopscotch/*) is a pure forward bump:
-    check-bump (run in prepass_merge) plus the sandboxed build ARE its review, so it skips rubrics.
-    Anything else needs all rubrics green at head. The lakefile and every other human-owned path stay
-    out of scope. (Follow-up, pre-existing: `files` from gh can truncate a >100-file diff; a bump PR
-    is tiny so the skip-review path is unaffected, but a paginated count-verified fetch would close it.)"""
-    if d.get("isDraft") or (d.get("author") or {}).get("login") != ME:
-        return None
-    if d.get("mergeable") != "MERGEABLE":
-        return None
-    pr, head = d["number"], d.get("headRefOid", "")
-    files = [f["path"] for f in (d.get("files") or [])]
-    rollup = d.get("statusCheckRollup") or []
-    build_green = any(c.get("name") == "build" and c.get("workflowName") == "pr-build"
-                      and c.get("conclusion") == "SUCCESS" for c in rollup)
-    in_scope = bool(files) and all(
-        p.startswith("TauCeti/") or p == "TauCeti.lean" or p in PIN_FILES for p in files)
-    if not (build_green and in_scope):
-        return None
-    ref = d.get("headRefName", "")
-    is_bump_branch = ref.startswith(BUMP_BRANCH_PREFIX) or ref.startswith("hopscotch/")
-    touches_pins = any(p in PIN_FILES for p in files)
-    pins_only = bool(files) and all(p in PIN_FILES for p in files)
-    skip_review = pins_only and is_bump_branch   # only a real bump branch may merge unreviewed
-    green_meta = rs.review_all_green(pr, head)
-    if not (skip_review or green_meta.data.get("_all_green", False)):
-        return None
-    reason = ("forward Lake-pin bump (check-bump @ merge), pins only" if skip_review
-              else "rubrics green @ head + forward Lake-pin bump" if touches_pins
-              else "all rubrics green @ head, TauCeti/ only")
-    return reason, touches_pins, green_meta.provenance
-
-
-def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
-    try:
-        mine = gh.pr_list(["number", "headRefOid", "headRefName", "isDraft", "mergeable",
-                           "statusCheckRollup", "files", "body"], author=ME)
-    except GitHubError as e:
-        sv.errors.append(f"housekeeping list: {e}")
-        return
-    seen: dict[str, int] = {}
-    for d in sorted(mine, key=lambda x: x["number"]):
-        if d.get("isDraft"):
-            continue
-        pr, head = d["number"], d.get("headRefOid", "")
-        green_meta = rs.review_all_green(pr, head)
-        all_green = green_meta.data.get("_all_green", False)
-        # merge: the same predicate prepass_merge re-applies on a fresh fetch at act time (one source
-        # of truth for the privileged gate). A pin change is additionally re-validated by check-bump in
-        # prepass_merge against current main right before the merge.
-        dec = _merge_decision(rs, d)
-        if dec:
-            reason, touches_pins, prov = dec
-            sv.mergeable_now.append(Candidate(pr, head, reason, provenance=prov, touches_pins=touches_pins))
-        # abandon: not green, head IS the reviewed head, past budget, (human-activity checked lazily).
-        elif (not all_green and rs.ledger_head(pr) == head
-              and rs.review_rounds(pr, counters) >= MAX_REVIEW_ROUNDS):
-            if not has_human_activity(gh, pr):
-                sv.abandon_eligible.append(Candidate(pr, head, "review budget spent, no human activity",
-                                                     attempts=rs.review_rounds(pr, counters),
-                                                     budget=MAX_REVIEW_ROUNDS,
-                                                     provenance=green_meta.provenance))
-        # dedup: newer PR sharing a tauceti-target id with an older open one.
-        body = (d.get("body") or "").replace("\n", " ").replace("\r", " ").replace("\t", " ")
-        mk = TARGET_MARKER_RE.search(body)
-        if mk:
-            mid = TARGET_ID_RE.search(mk.group(0))
-            if mid:
-                tid = mid.group(1)
-                if tid in seen:
-                    sv.dup_groups.setdefault(tid, [seen[tid]])
-                    sv.dup_groups[tid].append(pr)
-                else:
-                    seen[tid] = pr
 
 
 def _next_auto_stage(sv: Survey) -> Optional[str]:
@@ -1063,11 +895,11 @@ def _next_auto_stage(sv: Survey) -> Optional[str]:
         return "rebase"
     if sv.reviewable.actionable:
         return "review"
-    if sv.needs_fix.actionable:
-        return "fix"
     if sv.red_ci.actionable:
         return "fix-ci"
-    if sv.bump.due:
+    if sv.needs_fix.actionable:
+        return "fix"
+    if sv.bump.actionable:
         return "bump"
     if not sv.roadmap_backpressure:
         return "roadmap"
@@ -1165,7 +997,7 @@ def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
         p.wait()
 
 
-CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "claim.sh")
+CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "scripts" / "claim.sh")
 
 
 class Claims:
@@ -1323,7 +1155,7 @@ def fetch_ref(repo: str, dir: Path) -> bool:
 def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent (round.sh run_agent). HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
-    env = {**os.environ, "PATH": f"{HERE}:{os.environ.get('PATH', '')}"}
+    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     if work_model == "codex":
         argv = ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
     elif work_model in OPENROUTER_MODELS:
@@ -1353,6 +1185,26 @@ def _shq(s: str) -> str:
 # enters); only the one credential the work model needs is seeded; no host config
 # crosses the boundary. Byte-for-byte the same agent invocation as round.sh.
 
+BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
+
+
+def bubble_cmd() -> list[str]:
+    """The bubble CLI. Fetched on demand via uvx when not installed, so the operator never has to
+    preinstall it (uvx caches the build after first use). $TAUCETI_BUBBLE overrides the executable."""
+    import shutil
+    override = os.environ.get("TAUCETI_BUBBLE")
+    if override:
+        return shlex_split(override)
+    if shutil.which("bubble"):
+        return ["bubble"]
+    return ["uvx", "--from", BUBBLE_REPO, "bubble"]
+
+
+def shlex_split(s: str) -> list[str]:
+    import shlex
+    return shlex.split(s)
+
+
 def bubble_name(cfg: Config) -> str:
     return f"tauceti-worker-{cfg.wid}"
 
@@ -1370,7 +1222,7 @@ def ensure_bubble_home(cfg: Config) -> dict:
     if (home / ".worker-init").exists():
         return env
     home.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["bubble", "security", "set", "shared-cache", "overlay"],
+    subprocess.run([*bubble_cmd(), "security", "set", "shared-cache", "overlay"],
                    env=env, capture_output=True)
     (home / ".worker-init").touch()
     return env
@@ -1404,22 +1256,25 @@ def _codex_model() -> str:
 def agent_inner_cmd(work_model: str) -> str:
     """The command bubble runs INSIDE the container (bash -lc). Byte-for-byte round.sh's agent_inner_cmd:
     the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force subscription auth."""
+    import shlex
     if work_model == "codex":
         # Pin the model explicitly: the bubble seeds codex *credentials* but NOT host config
         # (--no-codex-config, for isolation), so in-container codex would otherwise fall back to its
         # built-in default (e.g. gpt-5.3-codex), which a ChatGPT-subscription account may not support.
-        return (f'env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {_codex_model()} '
+        # shlex.quote the model id: it comes from env / ~/.codex/config.toml, not a literal, and is
+        # spliced into a bash -lc string inside a credential-seeded, repo-write container.
+        return (f'env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {shlex.quote(_codex_model())} '
                 '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"')
     if work_model in OPENROUTER_MODELS:
         return ('env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY="$(cat /opt/round/openrouter.key)" '
-                f'pi --provider openrouter --model {OPENROUTER_MODELS[work_model]} --print '
+                f'pi --provider openrouter --model {shlex.quote(OPENROUTER_MODELS[work_model])} --print '
                 '"$(cat /opt/round/prompt.txt)"')
     return ('env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
             '--dangerously-skip-permissions --model opus')
 
 
 def _bubble_pop(cfg: Config, env: dict) -> None:
-    subprocess.run(["bubble", "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
+    subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
 
 
 def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
@@ -1445,7 +1300,7 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
-        shutil.copy(HERE / f, rounddir / f)
+        shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
     if wm in OPENROUTER_MODELS:   # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
@@ -1470,7 +1325,7 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
             tcenv += f" {var}={shlex.quote(val)}"
     command = f"{tcenv} {inner_cmd or agent_inner_cmd(wm)}"
 
-    argv = ["bubble", "open", target, "--shell", "--local", "--name", bubble_name(cfg), "--ephemeral",
+    argv = [*bubble_cmd(), "open", target, "--shell", "--local", "--name", bubble_name(cfg), "--ephemeral",
             "--github-security", "allowlist-write-graphql", *mount_flags, *agent_cred_flags(cred_model),
             "--command", command]
 
@@ -1572,27 +1427,19 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     if sv.github_failed:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
 
-    # Housekeeping pre-passes — quota-free, run in EVERY mode (land green PRs, retire stuck ones,
-    # de-dup). The worker is the only path that merges or retires PRs (CI-side merge is off).
-    prepass_merge(w, sv, opts.dry_run)
-    prepass_dedup(w, sv, opts.dry_run)
-    prepass_abandon(w, sv, opts.dry_run)
-
     log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
     # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
-    for stage in ("rebase", "review", "fix", "fix-ci"):
+    # fix-ci before fix: a red PR can't be reviewed or review-fixed until it builds. bump adapts a
+    # hopscotch/lkg-bump PR (opened by the review bot) that mathlib moved out from under.
+    for stage in ("rebase", "review", "fix-ci", "fix", "bump"):
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:
             rc = dispatch(stage, w, sv, c, opts)
             if rc is not None:
                 return rc   # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
-    if want(opts.only, "bump") and sv.bump.due:
-        rc = dispatch("bump", w, sv, Candidate(0, sv.bump.master_tip or "", "bump"), opts)
-        if rc is not None:
-            return rc
     if want(opts.only, "roadmap"):
         if sv.roadmap_backpressure:
             raise NoProgress(f"roadmap: {sv.n_mine_open} open PRs (>= {MAX_OPEN_PRS}) — backpressure, not authoring")
@@ -1600,8 +1447,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         if rc is not None:
             return rc
 
-    raise NoProgress(f"no eligible work this round under --only={','.join(opts.only) or '(all)'} "
-                     f"(housekeeping pre-passes ran)")
+    raise NoProgress(f"no eligible work this round under --only={','.join(opts.only) or '(all)'}")
 
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a
@@ -1749,17 +1595,13 @@ def do_rebase(w, sv, c, opts, bubble) -> Optional[int]:
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase")
 
 
-def do_bump(w, sv, c, opts, bubble) -> int:
-    tip = c.head
-    branch = f"{BUMP_BRANCH_PREFIX}-{tip[:12]}"
-    w.counters.incr(f"bump-{tip[:12]}")
-    log(f"bump to mathlib master {tip[:12]} with {opts.agent_name} ({'bubble' if bubble else 'host'})")
-    prompt = fill_prompt(HERE / "prompts" / "bump.md", TARGET=tip, BRANCH=branch, AGENT=opts.agent_name)
-    if bubble:
-        return run_in_bubble(w, TAUCETI, prompt, opts)            # M9
-    if not prepare_checkout(w.cfg):
-        raise Die("checkout failed")
-    return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
+def do_bump(w, sv, c, opts, bubble) -> Optional[int]:
+    """Adapt a red hopscotch/lkg-bump PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
+    shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
+    pr, head = c.pr, c.head
+    w.counters.incr(f"bump-{pr}-{head[:12]}")   # count up front so an un-checkout-able PR can't loop
+    w.counters.incr(f"bump-pr-{pr}")
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump")
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
@@ -1783,91 +1625,6 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
 
 
-# Housekeeping pre-passes — quota-free, run every round. The worker is the ONLY path that lands or
-# retires PRs (CI-side merge is off). All safety gates (TauCeti/-only, all-green, human-activity,
-# target marker) were applied in survey(); here we ALSO refuse to act on stale/fetch_failed scoreboard
-# data so a transient GitHub blip can't merge/close on a phantom verdict.
-ABANDON_COMMENT = (
-    "Closing automatically: this PR used its full review budget ({total} review rounds) without "
-    "reaching an all-green review at its current head, so an autonomous worker is abandoning it to "
-    "keep the queue moving. The branch is left in place — revive and finish it by hand if it's worth "
-    "completing, or add the `keep` label to stop auto-close.")
-DEDUP_COMMENT = (
-    "Closing automatically: this PR authors the same roadmap target (`{tid}`) as the older open "
-    "#{kept}. An autonomous worker keeps the earlier PR and closes this duplicate to avoid redundant "
-    "review. The branch is left in place — add the `keep` label if it is intentionally distinct.")
-
-
-def prepass_merge(w: Worker, sv: Survey, dry: bool) -> None:
-    for c in sv.mergeable_now:
-        if c.provenance in ("stale", "fetch_failed"):
-            log(f"merge: skip #{c.pr} — scoreboard provenance={c.provenance} (refuse to act on stale data)")
-            continue
-        if dry:
-            extra = " (pending check-bump)" if c.touches_pins else ""
-            log(f"[dry-run] would merge #{c.pr} ({c.reason}){extra}")
-            continue
-        # ACT-TIME REVALIDATION before the privileged --admin merge. Checks can rerun, mergeability and
-        # the file scope can change, and the scoreboard can move after survey() — and --admin bypasses
-        # branch protection — so re-fetch the PR and a FRESH scoreboard and re-apply the exact same
-        # gates at the same head right before merging. Bust the meta cache first so the scoreboard read
-        # is current, not a TTL-stale copy.
-        w.rs.bust(c.pr)
-        fresh = w.gh.pr_view(c.pr, ["number", "headRefOid", "headRefName", "isDraft", "mergeable",
-                                    "statusCheckRollup", "files", "author"])
-        if fresh is None:
-            log(f"merge: skip #{c.pr} — could not re-fetch at act time")
-            continue
-        if fresh.get("headRefOid") != c.head:
-            log(f"merge: skip #{c.pr} — head moved since classification")
-            continue
-        dec = _merge_decision(w.rs, fresh)
-        if dec is None:
-            log(f"merge: skip #{c.pr} — no longer meets the merge gates at act time")
-            continue
-        _reason, touches_pins, _prov = dec
-        # A Lake-pin change is re-validated against current main — a bump that has fallen behind a newer
-        # pin since classification cannot slip through.
-        if touches_pins and not _bump_is_forward(w.gh, c.head):
-            log(f"merge: skip #{c.pr} — check-bump did not validate the pin move @ {c.head[:12]}")
-            continue
-        log(f"merging PR #{c.pr} ({_reason} @ {c.head[:12]})")
-        # --match-head-commit binds the privileged merge to the exact head we just validated: if the
-        # branch is updated in the remaining window, the merge fails closed instead of landing an
-        # unvalidated head.
-        r = subprocess.run(["gh", "pr", "merge", str(c.pr), "--repo", TAUCETI,
-                            "--squash", "--delete-branch", "--admin", "--match-head-commit", c.head])
-        log(f"merged PR #{c.pr}" if r.returncode == 0 else f"merge of PR #{c.pr} failed — left open for a human")
-
-
-def prepass_dedup(w: Worker, sv: Survey, dry: bool) -> None:
-    for tid, prs in sv.dup_groups.items():
-        kept = prs[0]
-        for pr in prs[1:]:
-            if dry:
-                log(f"[dry-run] would close duplicate #{pr} (target '{tid}', keep #{kept})")
-                continue
-            # Fail-safe (as round.sh): never auto-close a PR a human has engaged (keep-label or a
-            # non-bot comment/review) — re-checked at act time, not at classification.
-            if has_human_activity(w.gh, pr):
-                log(f"dup-sweep: PR #{pr} duplicates #{kept} (target '{tid}') but has human activity — leaving")
-                continue
-            log(f"dup-sweep: closing PR #{pr} — duplicate target '{tid}' (older open #{kept} kept)")
-            subprocess.run(["gh", "pr", "close", str(pr), "--repo", TAUCETI,
-                            "--comment", DEDUP_COMMENT.format(tid=tid, kept=kept)], capture_output=True)
-
-
-def prepass_abandon(w: Worker, sv: Survey, dry: bool) -> None:
-    for c in sv.abandon_eligible:
-        if c.provenance in ("stale", "fetch_failed"):
-            log(f"abandon: skip #{c.pr} — provenance={c.provenance}")
-            continue
-        if dry:
-            log(f"[dry-run] would abandon #{c.pr} ({c.reason})")
-            continue
-        log(f"abandoning PR #{c.pr} (review rounds={c.attempts}) — budget spent without reaching green")
-        subprocess.run(["gh", "pr", "close", str(c.pr), "--repo", TAUCETI,
-                        "--comment", ABANDON_COMMENT.format(total=c.attempts)], capture_output=True)
 
 
 # ============================================================================
@@ -1880,15 +1637,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
                    help="restrict to these work units (comma list): " + ", ".join(ALLOWED_TASKS))
     p.add_argument("--agent", choices=AGENTS, default=None,
                    help="which agent to run (default: $TAUCETI_AGENT or auto)")
-    # Back-compat aliases for the agent choice.
-    g = p.add_mutually_exclusive_group()
-    for a in ("codex", "claude", "deepseek", "minimax"):
-        g.add_argument(f"--{a}", dest="agent_alias", action="store_const", const=a, help=argparse.SUPPRESS)
-    p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble for model modes)")
-    p.add_argument("--bubble", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op (now default)
+    p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble)")
     p.add_argument("--ignore-quota", dest="ignore_quota", action="store_true",
                    help="ignore the quota pacer; run the requested --agent regardless of pace "
-                        "(needs an explicit --codex/--claude — 'auto' can't choose without the pacer)")
+                        "(needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)")
     p.add_argument("--quota-cmd", default=os.environ.get("TAUCETI_QUOTA_CMD"),
                    help="external command that decides agent availability (overrides the built-in pacer)")
     p.add_argument("--worker-id", dest="worker_id", default=None, help="stable worker id (else 'default')")
@@ -1912,10 +1664,7 @@ def parse_only(values: list[str]) -> list[str]:
 
 
 def resolve_agent(args) -> str:
-    if getattr(args, "agent", None) and getattr(args, "agent_alias", None):
-        raise SystemExit("pass either --agent or a model alias (--codex/--claude/...), not both")
-    return (getattr(args, "agent", None) or getattr(args, "agent_alias", None)
-            or os.environ.get("TAUCETI_AGENT") or "auto")
+    return getattr(args, "agent", None) or os.environ.get("TAUCETI_AGENT") or "auto"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2004,33 +1753,19 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None) -> Non
 
     t = Table(show_header=True, header_style="bold")
     t.add_column("KIND"); t.add_column("READY", justify="right"); t.add_column("SAMPLE / NOTE")
-    for name in ("rebase", "review", "fix", "fix-ci"):
+    for name in ("rebase", "review", "fix-ci", "fix", "bump"):
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
         extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
-        t.add_row(name, ready, (_sample(wk.actionable) or "") + extra)
-    # bump
-    if sv.bump.due:
-        t.add_row("bump", "1", f"mathlib master {sv.bump.master_tip[:12] if sv.bump.master_tip else '?'} ahead of pin")
-    else:
-        note = "pin current with master" if sv.bump.master_tip and sv.bump.master_tip == sv.bump.our_pin else \
-               ("bump PR already open" if sv.bump.bump_pr_open else
-                ("over budget" if sv.bump.behind else "unknown"))
-        t.add_row("bump", "—", note)
-    # roadmap
+        note = (_sample(wk.actionable) or "") + extra
+        if name == "bump" and not wk.actionable and not wk.suppressed:
+            note = "no broken hopscotch bump"
+        t.add_row(name, ready, note)
     if sv.roadmap_backpressure:
         t.add_row("roadmap", "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})")
     else:
         t.add_row("roadmap", "∞", f"focus: {sv.roadmap_focus}")
     console.print(t)
-
-    h = Table(show_header=True, header_style="bold dim", title="housekeeping (quota-free, every round)")
-    h.add_column("KIND"); h.add_column("READY", justify="right"); h.add_column("SAMPLE / NOTE")
-    h.add_row("merge", str(len(sv.mergeable_now)) or "—", _sample(sv.mergeable_now) or "—")
-    h.add_row("abandon", str(len(sv.abandon_eligible)) or "—", _sample(sv.abandon_eligible) or "—")
-    dups = [pr for group in sv.dup_groups.values() for pr in group[1:]]
-    h.add_row("dup-sweep", str(len(dups)) or "—", " ".join(f"#{p}" for p in dups[:3]) or "—")
-    console.print(h)
 
     nxt = sv.next_auto_stage
     console.print(f"\nNext auto round would: [bold]{nxt.upper() if nxt else 'NOTHING (no eligible work)'}[/]")
@@ -2087,10 +1822,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             time.sleep(int(slp))
             return 0
 
-        # Housekeeping-only (--only merge, no work task): drives no model, so don't resolve/pace one.
-        housekeeping_only = bool(only) and not any(t in WORK_TASKS for t in only)
-        work_model = "none" if housekeeping_only else resolve_work_model(
-            cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd)
+        work_model = resolve_work_model(cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd)
         gh = GitHub()
         w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
         opts = RoundOpts(only=only, agent=agent, work_model=work_model,
@@ -2107,19 +1839,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     round and exits. Mirrors loop.sh — including the back-off that stopped ~700 no-op rounds hammering
     a rate-limited GitHub."""
     openrouter = agent in OPENROUTER_MODELS
-    housekeeping = bool(only) and not any(t in WORK_TASKS for t in only)
     ignore_quota = getattr(args, "ignore_quota", False)
     host = getattr(args, "host", False)
     quota_cmd = getattr(args, "quota_cmd", None)
     log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}"
-        f"{' [housekeeping]' if housekeeping else ''}{' [host]' if host else ''}")
+        f"{' [host]' if host else ''}")
     streak = 0
     try:
         while True:
             # 1) Decide the model and whether to run this cycle.
-            if housekeeping:
-                model = None                       # no model; run every cycle (loop.sh HOUSEKEEPING_ONLY)
-            elif openrouter:
+            if openrouter:
                 model = agent                      # pay-per-token; no quota wait
             elif ignore_quota and not quota_cmd:
                 if agent == "auto":
@@ -2229,7 +1958,7 @@ def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool) -> 
     if only:
         cmd += ["--only", only]
     if model_dial != "auto":
-        cmd.append(f"--{model_dial}")
+        cmd += ["--agent", model_dial]
     if host:
         cmd.append("--host")
     return cmd
@@ -2318,18 +2047,19 @@ def _have(tool: str) -> bool:
 
 
 def cmd_doctor(args) -> int:
-    """Report which capabilities the environment can do, and suggest --host where bubble is missing."""
+    """Report what the environment can do. bubble and the review engine are fetched on demand, so they
+    are informational, not required."""
     cfg = Config.resolve(getattr(args, "worker_id", None))
     rows: list[tuple[str, bool, str]] = []
-    for t in ("gh", "git", "jq", "uvx"):
-        rows.append((t, _have(t), "required" if t in ("gh", "git") else
-                     ("review engine" if t == "uvx" else "claim.sh needs it")))
+    rows.append(("gh", _have("gh"), "required"))
+    rows.append(("git", _have("git"), "required"))
+    rows.append(("uv/uvx", _have("uvx"), "required (runs tauceti, fetches bubble + review engine)"))
+    rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
-    rows.append(("gh auth", gh_auth, "logged in as kim-em"))
-    rows.append(("lake", _have("lake"), "host authoring (--host) builds with it"))
-    rows.append(("bubble", _have("bubble"), "default sandbox; without it pass --host"))
+    rows.append(("gh auth", gh_auth, f"the worker acts as this account (and treats {ME}'s PRs as ours)"))
+    rows.append(("bubble", _have("bubble"), "default sandbox (fetched on demand if absent)"))
+    rows.append(("lake", _have("lake"), "only --host authoring builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
-    # Quota credentials (read-only).
     rows.append(("codex creds", (cfg.home / ".codex" / "auth.json").exists(), "~/.codex/auth.json"))
     rows.append(("claude creds", (cfg.home / ".claude" / ".credentials.json").exists(),
                  "~/.claude/.credentials.json"))
@@ -2337,27 +2067,19 @@ def cmd_doctor(args) -> int:
     print(f"tauceti doctor — worker '{cfg.wid}'")
     for name, ok, note in rows:
         mark = "ok " if ok else "MISSING"
-        if not ok and name in ("gh", "git", "gh auth"):
+        if not ok and name in ("gh", "git", "uv/uvx", "gh auth"):
             bad += 1
         print(f"  [{mark:7}] {name:14} {note}")
-    if not _have("bubble"):
-        print("  note: bubble missing → every model mode needs --host (the host path still works).")
     return 1 if bad else 0
 
 
 def preflight(cfg: Config, opts: "RoundOpts") -> None:
-    """Fail a round early if its chosen mode can't run, rather than partway through."""
-    for t in ("gh", "git"):
+    """Fail a round early if its chosen mode can't run, rather than partway through. bubble and the
+    review engine are fetched on demand, so we don't require them on PATH (only uvx + a runtime)."""
+    for t in ("gh", "git", "uvx"):
         if not _have(t):
             raise Die(f"preflight: missing '{t}' on PATH")
-    if want(opts.only, "review") and not _bubble("review", opts) and not _have("uvx"):
-        raise Die("preflight: --host review needs 'uvx' on PATH (the tauceti-review engine; "
-                  "bubble review runs the engine with the image's python3)")
-    needs_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s))
-    if needs_bubble and not _have("bubble"):
-        raise Die("preflight: bubble is the default for model modes but is not on PATH — pass --host, "
-                  "or install kim-em/bubble")
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die("preflight: --host authoring needs an elan/lake toolchain on PATH (or drop --host)")
 
