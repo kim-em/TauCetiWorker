@@ -198,6 +198,17 @@ class GitHub:
         except json.JSONDecodeError:
             return None
 
+    def review_comments(self, pr: int) -> Optional[list[dict]]:
+        """All review (inline / thread) comments for a PR — distinct from issue_comments. A contested
+        fix replies on a review thread, so the progress guard must count these too. None on failure."""
+        p = self._gh(["api", "--paginate", f"/repos/{self.repo}/pulls/{pr}/comments?per_page=100"])
+        if p.returncode != 0:
+            return None
+        try:
+            return json.loads(p.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+
     def api_jq(self, path: str, jq: str) -> Optional[str]:
         p = self._gh(["api", path, "--jq", jq])
         if p.returncode != 0:
@@ -1531,31 +1542,41 @@ def _open_pr_numbers(w: Worker) -> Optional[set[int]]:
         return None
 
 
+def _pr_comment_count(w: Worker, pr: int) -> Optional[int]:
+    """Issue comments + review-thread comments. A contested fix replies on a review thread, so both
+    count as a mark. None if either fetch fails (caller treats that as 'can't tell')."""
+    cs = w.gh.issue_comments(pr)
+    rcs = w.gh.review_comments(pr)
+    if cs is None or rcs is None:
+        return None
+    return len(cs) + len(rcs)
+
+
 def _progress_snapshot(w: Worker, c: Candidate) -> Optional[dict]:
     """Capture just enough GitHub state to tell, after the round, whether the agent actually changed
     anything. Returns None if we can't snapshot — then the guard is skipped (never block a real
     success on a flaky query)."""
     if c.pr:
         v = w.gh.pr_view(c.pr, ["headRefOid"])
-        cs = w.gh.issue_comments(c.pr)
-        if v is None or cs is None:
+        nc = _pr_comment_count(w, c.pr)
+        if v is None or nc is None:
             return None
-        return {"head": v.get("headRefOid", c.head), "ncomments": len(cs)}
+        return {"head": v.get("headRefOid", c.head), "ncomments": nc}
     nums = _open_pr_numbers(w)                 # roadmap / bump: a new PR appearing = progress
     return {"prs": nums} if nums is not None else None
 
 
 def _progressed(w: Worker, c: Candidate, pre: Optional[dict]) -> bool:
-    """True if the round left an observable mark (push / new PR / new comment). Conservative: any
-    query failure or ambiguity returns True, so we never falsely discard genuine work."""
+    """True if the round left an observable mark (push / new PR / new issue-or-review comment).
+    Conservative: any query failure or ambiguity returns True, so we never falsely discard real work."""
     if pre is None:
         return True
     if c.pr:
         v = w.gh.pr_view(c.pr, ["headRefOid"])
-        cs = w.gh.issue_comments(c.pr)
-        if v is None or cs is None:
+        nc = _pr_comment_count(w, c.pr)
+        if v is None or nc is None:
             return True
-        return v.get("headRefOid", "") != pre["head"] or len(cs) > pre["ncomments"]
+        return v.get("headRefOid", "") != pre["head"] or nc > pre["ncomments"]
     now = _open_pr_numbers(w)
     return bool(now - pre["prs"]) if now is not None else True
 
