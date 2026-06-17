@@ -1494,7 +1494,7 @@ def _progress_snapshot(w: Worker, c: Candidate) -> Optional[dict]:
         if v is None or nc is None:
             return None
         return {"head": v.get("headRefOid", c.head), "ncomments": nc}
-    nums = _open_pr_numbers(w)                 # roadmap / bump: a new PR appearing = progress
+    nums = _open_pr_numbers(w)                 # roadmap / bump: a new marker-bearing PR = progress
     return {"prs": nums} if nums is not None else None
 
 
@@ -1510,7 +1510,21 @@ def _progressed(w: Worker, c: Candidate, pre: Optional[dict]) -> bool:
             return True
         return v.get("headRefOid", "") != pre["head"] or nc > pre["ncomments"]
     now = _open_pr_numbers(w)
-    return bool(now - pre["prs"]) if now is not None else True
+    if now is None:
+        return True
+    new = now - pre["prs"]
+    if not new:
+        return False
+    # A new PR appeared — but only one carrying a tauceti-target marker is THIS round's authoring work.
+    # An unrelated/human PR (or, under multi-worker, another worker's concurrent PR) that shows up
+    # mid-round must not mask this round's no-op. Conservative: if we can't read a body, assume ours.
+    for num in new:
+        v = w.gh.pr_view(num, ["body"])
+        if v is None:
+            return True
+        if TARGET_MARKER_RE.search(v.get("body") or ""):
+            return True
+    return False
 
 
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> Optional[int]:
