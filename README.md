@@ -8,10 +8,10 @@ From there you launch whatever you want. Pin a worker to one kind of work with
 `--only` (a reviewer, an author, a fixer), or hand the whole thing to `--loop`
 and let it pick the most useful job each round until you stop it.
 
-It runs as your authenticated `gh` account: you set up `gh auth`, and the worker
-acts as that account (and treats `kim-em`'s PRs as "ours"). The repo is hardwired
-to `FormalFrontier/TauCeti`. This is an operator's tool for that project, not a
-general framework.
+It runs as your authenticated `gh` account: you set up `gh auth`, the worker acts
+as that account, and it treats that account's own PRs as the ones it tends. The
+repo is hardwired to `FormalFrontier/TauCeti`. This is an operator's tool for that
+project, not a general framework.
 
 ## Quickstart
 

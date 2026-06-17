@@ -30,7 +30,7 @@ spec.loader.exec_module(tc)
 
 FIELDS = ["number", "headRefOid", "headRefName", "headRepositoryOwner", "headRepository",
           "isDraft", "statusCheckRollup", "author", "mergeable"]
-ME = tc.ME
+ME = tc.me()
 TAUCETI = tc.TAUCETI
 
 

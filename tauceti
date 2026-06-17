@@ -8,9 +8,10 @@
 Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the work
 (one round, or the driver loop); `tauceti status` prints the read-only survey.
 
-The worker acts on FormalFrontier/TauCeti as the authenticated `gh` account (and
-treats `kim-em`'s PRs as ours). Each round does exactly ONE unit of work, chosen in
-priority order: rebase → review → fix-ci → fix → bump → roadmap. The `bump` step
+The worker acts on FormalFrontier/TauCeti as the authenticated `gh` account, and
+treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
+of work, chosen in priority order: rebase → review → fix-ci → fix → bump → roadmap.
+The `bump` step
 adapts a red hopscotch/lkg-bump PR (the review bot opens those; the worker never
 authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI, not
 the worker.
@@ -25,6 +26,7 @@ import argparse
 import atexit
 import dataclasses
 import fcntl
+import functools
 import json
 import os
 import re
@@ -45,7 +47,17 @@ HERE = Path(__file__).resolve().parent
 TAUCETI = "FormalFrontier/TauCeti"
 ROADMAP = "FormalFrontier/TauCetiRoadmap"
 REVIEW = "FormalFrontier/TauCetiReview"
-ME = "kim-em"
+
+
+@functools.lru_cache(maxsize=1)
+def me() -> str:
+    """The GitHub login the worker is authenticated as (gh). Its PRs are the ones the worker tends
+    (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
+    r = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True)
+    login = (r.stdout or "").strip()
+    if not login:
+        raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")
+    return login
 
 # Per-PR budgets (a PR can never churn forever). Names match round.sh.
 MAX_FIX_ATTEMPTS = 3        # per-head: stop fixing the same head after this many tries
@@ -808,7 +820,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     prs = [PRInfo.from_json(d) for d in raw]
     sv.open_prs = prs
     nondraft = [p for p in prs if not p.is_draft]
-    mine = [p for p in nondraft if p.author == ME]
+    mine = [p for p in nondraft if p.author == me()]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)
@@ -1181,7 +1193,7 @@ def _shq(s: str) -> str:
 
 # ===== Bubble authoring path (default for model modes; --host opts out) =======
 # The checkout, lake build, and every git/gh call happen IN a repo-scoped bubble
-# container. GitHub goes through bubble's auth proxy (the host kim-em token never
+# container. GitHub goes through bubble's auth proxy (the host gh token never
 # enters); only the one credential the work model needs is seeded; no host config
 # crosses the boundary. Byte-for-byte the same agent invocation as round.sh.
 
@@ -2056,7 +2068,7 @@ def cmd_doctor(args) -> int:
     rows.append(("uv/uvx", _have("uvx"), "required (runs tauceti, fetches bubble + review engine)"))
     rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
-    rows.append(("gh auth", gh_auth, f"the worker acts as this account (and treats {ME}'s PRs as ours)"))
+    rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
     rows.append(("bubble", _have("bubble"), "default sandbox (fetched on demand if absent)"))
     rows.append(("lake", _have("lake"), "only --host authoring builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
