@@ -292,3 +292,23 @@ sandbox's egress to PyPI + TauCetiReview + TauCetiRoadmap + Mathlib (which defea
 threat-model review later wants hard containment, implement it by pre-staging those inputs as read-only
 mounts (as roadmap rounds already do) and baking `tauceti-review` + deps into the image (zero runtime
 fetch) — not by widening egress.
+
+### §3 review-in-bubble — IMPLEMENTED + validated end-to-end (2026-06-17, supersedes the deferral above)
+review-in-bubble now runs the engine fully OFFLINE inside the container, so a tool-using reviewer of
+untrusted PR content is contained by the bubble. Approach (no bubble change needed):
+- tauceti `review_in_bubble` pre-stages the engine + roadmap as read-only mounts and the persistent
+  review store as a read-WRITE mount, and runs the zero-dep engine with the image's `python3 -m runner.cli`
+  (no uvx/uv/PyPI). `--no-archive` drops the TauCetiData sync. Only the code clone + PR API + scoreboard
+  post cross the repo-scoped proxy (all scoped to the target).
+- engine (TauCetiReview PR #58): `--roadmap-dir`/`--mathlib-dir` consume pre-staged trees instead of
+  cloning; `gh auth token` falls back to the ambient `GH_TOKEN` (the bubble proxy token).
+- E2E on PR #183 (`--codex`): engine ran from `/opt/engine` (mount, no TauCetiReview clone), rubrics-sha
+  from the mount's `.git` (no cross-repo `gh api`), store at `/opt/review-store` (RW mount), no
+  roadmap/Mathlib fetch; codex reviewed both rubrics and **posted the scoreboard** (`scoreboard
+  id=4726387145; 0 failures; posted`); container popped clean. The RW store round-tripped to the host
+  (`ledger.json` has the scoreboard comment id) — so a re-review edits in place, no duplicate scoreboard.
+- Landed: tauceti `feat/tauceti-cli` @ 97ddd91. **Requires TauCetiReview#58 merged to engine `main`**
+  before production bubble review works without `TAUCETI_REVIEW_ENGINE_DIR` (until then tauceti's
+  `fetch_ref` pulls engine `main`, which lacks the flags).
+- Refinement: wire `--mathlib-dir` at the bubble's vendored `.lake/packages/mathlib` for the `reuse`
+  rubric (currently `--no-mathlib`). Egress-invariant + explicit twice-PATCH test remain as quick checks.
