@@ -281,3 +281,14 @@ review target — and the proxy is repo-scoped to FormalFrontier/TauCeti, so the
 checklist anticipated. Fix is design-level (allow the engine repo through the proxy, mount/pre-stage the
 engine, or bake `tauceti-review` into the bubble image). Until then, **`--host` review is the fallback**
 (the engine runs on the host with its own clean-room isolation).
+
+### §3 decision: review runs on `--host` (validated); review-in-bubble deferred
+`--host` review is validated end-to-end: it reviewed #185 with `codex/gpt-5.5`, returned a real
+proof-quality `request_changes`, and posted the scoreboard + thread to the PR (ledger updated, archive
+synced). Recommendation: **make `--host` the supported review path.** review-in-bubble is deferred — the
+engine only reads/greps and already isolates each reviewer model (its own credential, no host config,
+read-only tools, throwaway HOME), so a container is marginal defense-in-depth bought by widening the
+sandbox's egress to PyPI + TauCetiReview + TauCetiRoadmap + Mathlib (which defeats the sandbox). If a
+threat-model review later wants hard containment, implement it by pre-staging those inputs as read-only
+mounts (as roadmap rounds already do) and baking `tauceti-review` + deps into the image (zero runtime
+fetch) — not by widening egress.
