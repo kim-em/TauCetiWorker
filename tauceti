@@ -1485,16 +1485,44 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
 
 
 def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "RoundOpts") -> int:
-    """Run the tauceti-review engine INSIDE bubble — defense in depth over the engine's own read-only-
-    tool clean room. UNTESTED: needs an Incus-capable host (see docs/BUBBLE_TESTING.md). Integration
-    unknowns to validate there: (1) the bubble image must have `uvx` (uv); (2) reviewing a community
-    FORK PR must work through the repo-scoped proxy (base-repo PR API); (3) the reviewer model's
-    credential is seeded via agent_cred_flags(reviewers). The store is container-local + ephemeral
-    (the GitHub scoreboard is the source of truth, re-read via gh_meta next round)."""
-    inner = (f"uvx --from git+https://github.com/{REVIEW} tauceti-review {pr} "
-             f"--store /tmp/tauceti-review-store --post --reviewer {reviewers} --expect-head {head}")
+    """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
+    reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
+    model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
+    engine would otherwise fetch and run it OFFLINE: the engine itself, the roadmap, and the review
+    store are host→container mounts; `--no-archive` drops the TauCetiData sync. The only traffic that
+    crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
+    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
+    Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
+
+    The store is mounted READ-WRITE from the worker's persistent store_dir (not /tmp): it holds the
+    scoreboard/thread comment ids the next round edits in place — an ephemeral store would post a
+    duplicate scoreboard. The engine mount keeps its `.git` so the engine never falls back to a
+    cross-repo `gh api` for its own rev. TAUCETI_REVIEW_ENGINE_DIR pins a local engine checkout
+    (operator override / pre-merge testing); otherwise a shallow REVIEW clone is staged."""
+    cfg = w.cfg
+    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
+    engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
+    if not eng and not fetch_ref(REVIEW, engine_dir):       # keeps .git (no cross-repo rev fallback)
+        raise Die(f"fetch {REVIEW} failed")
+    roadmap_dir = cfg.state / "refs" / "roadmap"
+    if not fetch_ref(ROADMAP, roadmap_dir):
+        raise Die(f"fetch {ROADMAP} failed")
+    store = cfg.store_dir
+    store.mkdir(parents=True, exist_ok=True)
+    mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro",
+              f"{store}:/opt/review-store:rw"]
+    # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
+    # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
+    # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
+    # `cd` shell builtin — carry the engine on PYTHONPATH instead of cwd (cwd is irrelevant: the engine
+    # uses --repo-dir for its files and an absolute temp workdir).
+    inner = ("env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
+             f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
+             f"--no-mathlib --no-archive --store /opt/review-store --post "
+             f"--reviewer {reviewers} --expect-head {head}")
     # target is the PR so bubble checks it out; prompt unused by the engine.
-    return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, inner_cmd=inner, cred_model=reviewers)
+    return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts,
+                         inner_cmd=inner, cred_model=reviewers)
 
 
 # ============================================================================
@@ -2322,8 +2350,9 @@ def preflight(cfg: Config, opts: "RoundOpts") -> None:
     for t in ("gh", "git"):
         if not _have(t):
             raise Die(f"preflight: missing '{t}' on PATH")
-    if want(opts.only, "review") and not _have("uvx"):
-        raise Die("preflight: review needs 'uvx' on PATH (the tauceti-review engine)")
+    if want(opts.only, "review") and not _bubble("review", opts) and not _have("uvx"):
+        raise Die("preflight: --host review needs 'uvx' on PATH (the tauceti-review engine; "
+                  "bubble review runs the engine with the image's python3)")
     needs_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s))
     if needs_bubble and not _have("bubble"):
