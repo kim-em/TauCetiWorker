@@ -1328,12 +1328,31 @@ def agent_cred_flags(work_model: str) -> list[str]:
     return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
 
 
+def _codex_model() -> str:
+    """The codex model to run in the bubble. $TAUCETI_CODEX_MODEL wins; else the host's configured
+    model from ~/.codex/config.toml (what host rounds use); else a safe default."""
+    m = os.environ.get("TAUCETI_CODEX_MODEL")
+    if m:
+        return m
+    try:
+        for ln in (Path.home() / ".codex" / "config.toml").read_text().splitlines():
+            s = ln.strip()
+            if s.startswith("model") and "=" in s:
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "gpt-5"
+
+
 def agent_inner_cmd(work_model: str) -> str:
     """The command bubble runs INSIDE the container (bash -lc). Byte-for-byte round.sh's agent_inner_cmd:
     the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force subscription auth."""
     if work_model == "codex":
-        return ('env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --sandbox danger-full-access '
-                '--skip-git-repo-check "$(cat /opt/round/prompt.txt)"')
+        # Pin the model explicitly: the bubble seeds codex *credentials* but NOT host config
+        # (--no-codex-config, for isolation), so in-container codex would otherwise fall back to its
+        # built-in default (e.g. gpt-5.3-codex), which a ChatGPT-subscription account may not support.
+        return (f'env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {_codex_model()} '
+                '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"')
     if work_model in OPENROUTER_MODELS:
         return ('env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY="$(cat /opt/round/openrouter.key)" '
                 f'pi --provider openrouter --model {OPENROUTER_MODELS[work_model]} --print '
@@ -1438,7 +1457,7 @@ class RoundOpts:
     work_model: str       # the concrete model to run (codex|claude|deepseek|minimax), or 'auto' for dry-run
     sandbox_host: bool    # True = --host (opt out of bubble)
     dry_run: bool
-    no_pace: bool = False
+    ignore_quota: bool = False
     quota_cmd: Optional[str] = None
 
     @property
@@ -1500,6 +1519,47 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                      f"(housekeeping pre-passes ran)")
 
 
+# Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a
+# contested fix — a comment). `review` is excluded: it posts a scoreboard and its rc is the engine's.
+PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
+
+
+def _open_pr_numbers(w: Worker) -> Optional[set[int]]:
+    try:
+        return {p["number"] for p in w.gh.pr_list(["number"], state="open")}
+    except GitHubError:
+        return None
+
+
+def _progress_snapshot(w: Worker, c: Candidate) -> Optional[dict]:
+    """Capture just enough GitHub state to tell, after the round, whether the agent actually changed
+    anything. Returns None if we can't snapshot — then the guard is skipped (never block a real
+    success on a flaky query)."""
+    if c.pr:
+        v = w.gh.pr_view(c.pr, ["headRefOid"])
+        cs = w.gh.issue_comments(c.pr)
+        if v is None or cs is None:
+            return None
+        return {"head": v.get("headRefOid", c.head), "ncomments": len(cs)}
+    nums = _open_pr_numbers(w)                 # roadmap / bump: a new PR appearing = progress
+    return {"prs": nums} if nums is not None else None
+
+
+def _progressed(w: Worker, c: Candidate, pre: Optional[dict]) -> bool:
+    """True if the round left an observable mark (push / new PR / new comment). Conservative: any
+    query failure or ambiguity returns True, so we never falsely discard genuine work."""
+    if pre is None:
+        return True
+    if c.pr:
+        v = w.gh.pr_view(c.pr, ["headRefOid"])
+        cs = w.gh.issue_comments(c.pr)
+        if v is None or cs is None:
+            return True
+        return v.get("headRefOid", "") != pre["head"] or len(cs) > pre["ncomments"]
+    now = _open_pr_numbers(w)
+    return bool(now - pre["prs"]) if now is not None else True
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> Optional[int]:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
@@ -1511,7 +1571,15 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         return 0
     fn = {"review": do_review, "fix": do_fix, "fix-ci": do_fix_ci, "rebase": do_rebase,
           "bump": do_bump, "roadmap": do_roadmap}[stage]
-    return fn(w, sv, c, opts, bubble)
+    pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
+    rc = fn(w, sv, c, opts, bubble)
+    # A model round that exits 0 but leaves no mark on GitHub did no real work (e.g. a sandboxed
+    # agent that never started or was cut off before producing output). Don't report it as success —
+    # surface it as no-progress so the loop backs off instead of looping on a silent no-op.
+    if rc == 0 and stage in PROGRESS_GUARDED and not _progressed(w, c, pre):
+        raise NoProgress(f"{stage}{' #' + str(c.pr) if c.pr else ''} exited 0 but left no mark on "
+                         "GitHub (no push, new PR, or comment) — no-progress, not a false success")
+    return rc
 
 
 # --- the work units (host path here; bubble path lands in M9) ---------------
@@ -1611,12 +1679,12 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     if bubble:
         return run_in_bubble(w, TAUCETI, fill_prompt(
             HERE / "prompts" / "roadmap.md", FOCUS=focus, AGENT=opts.agent_name,
-            ROADMAP_DIR="/opt/roadmap", REVIEW_DIR="/opt/review"), opts,
+            ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap", REVIEW_DIR="/opt/review"), opts,
             mounts=[f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"])  # M9
     if not prepare_checkout(w.cfg):
         raise Die("checkout failed")
     prompt = fill_prompt(HERE / "prompts" / "roadmap.md", FOCUS=focus, AGENT=opts.agent_name,
-                         ROADMAP_DIR=str(refs / "roadmap"), REVIEW_DIR=str(refs / "review"))
+                         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"), REVIEW_DIR=str(refs / "review"))
     return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
 
 
@@ -1699,7 +1767,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         g.add_argument(f"--{a}", dest="agent_alias", action="store_const", const=a, help=argparse.SUPPRESS)
     p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble for model modes)")
     p.add_argument("--bubble", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op (now default)
-    p.add_argument("--no-pace", dest="no_pace", action="store_true", help="disable the quota pacer")
+    p.add_argument("--ignore-quota", dest="ignore_quota", action="store_true",
+                   help="ignore the quota pacer; run the requested --agent regardless of pace "
+                        "(needs an explicit --codex/--claude — 'auto' can't choose without the pacer)")
     p.add_argument("--quota-cmd", default=os.environ.get("TAUCETI_QUOTA_CMD"),
                    help="external command that decides agent availability (overrides the built-in pacer)")
     p.add_argument("--worker-id", dest="worker_id", default=None, help="stable worker id (else 'default')")
@@ -1871,7 +1941,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     if getattr(args, "loop", False) and not one_round:
         return cmd_loop(args, cfg, only=only, agent=agent)
     dry = getattr(args, "dry_run", False)
-    no_pace = getattr(args, "no_pace", False)
+    ignore_quota = getattr(args, "ignore_quota", False)
 
     with RoundContext(cfg) as ctx:   # one round per worker; cleanup + SIGTERM/SIGINT handling
         # Lifecycle test hooks (no GitHub, no model, no mutation) — exercise lock / fd-leak / timeout.
@@ -1894,12 +1964,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
 
         # Housekeeping-only (--only merge, no work task): drives no model, so don't resolve/pace one.
         housekeeping_only = bool(only) and not any(t in WORK_TASKS for t in only)
-        work_model = "none" if housekeeping_only else resolve_work_model(cfg, agent, dry=dry, no_pace=no_pace)
+        work_model = "none" if housekeeping_only else resolve_work_model(cfg, agent, dry=dry, ignore_quota=ignore_quota)
         gh = GitHub()
         w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
         opts = RoundOpts(only=only, agent=agent, work_model=work_model,
                          sandbox_host=getattr(args, "host", False), dry_run=dry,
-                         no_pace=no_pace, quota_cmd=getattr(args, "quota_cmd", None))
+                         ignore_quota=ignore_quota, quota_cmd=getattr(args, "quota_cmd", None))
         if not dry:
             preflight(cfg, opts)
         return run_round(w, opts)   # NoProgress/Die propagate to main()'s handler
@@ -1912,7 +1982,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     a rate-limited GitHub."""
     openrouter = agent in OPENROUTER_MODELS
     housekeeping = bool(only) and not any(t in WORK_TASKS for t in only)
-    no_pace = getattr(args, "no_pace", False)
+    ignore_quota = getattr(args, "ignore_quota", False)
     host = getattr(args, "host", False)
     log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}"
         f"{' [housekeeping]' if housekeeping else ''}{' [host]' if host else ''}")
@@ -1924,9 +1994,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 model = None                       # no model; run every cycle (loop.sh HOUSEKEEPING_ONLY)
             elif openrouter:
                 model = agent                      # pay-per-token; no quota wait
-            elif no_pace:
+            elif ignore_quota:
                 if agent == "auto":
-                    raise SystemExit("--no-pace --loop needs an explicit --agent (codex/claude)")
+                    raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
                 model = agent
             else:
                 model, snap = Quota(cfg).choose(None if agent == "auto" else agent)
@@ -1940,7 +2010,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             if only:
                 tail += ["--only", ",".join(only)]
             if model:
-                tail += [f"--agent", model, "--no-pace"]   # loop already paced; child must not re-pace
+                tail += [f"--agent", model, "--ignore-quota"]   # loop already paced; child must not re-pace
             if host:
                 tail.append("--host")
             rc = run_round_subprocess(tail)
@@ -1960,16 +2030,16 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
         return 130
 
 
-def resolve_work_model(cfg: Config, agent: str, *, dry: bool, no_pace: bool) -> str:
+def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool) -> str:
     """Turn the --agent dial into the concrete model to run. 'auto' consults the pacer (codex preferred,
     opus fallback). OpenRouter agents are pay-per-token (no pacing). Dry-run leaves it symbolic."""
     if dry:
         return agent
     if agent in OPENROUTER_MODELS:
         return agent
-    if no_pace:
+    if ignore_quota:
         if agent == "auto":
-            raise SystemExit("--no-pace needs an explicit --agent (codex/claude); 'auto' can't choose without the pacer")
+            raise SystemExit("--ignore-quota needs an explicit --agent (codex/claude); 'auto' can't choose without the pacer")
         return agent
     chosen, _snap = Quota(cfg).choose(None if agent == "auto" else agent)
     if chosen is None:

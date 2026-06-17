@@ -149,3 +149,107 @@ clobber).
 Bubble validation passes when sections 2, 3, and 5 are green for both `--codex` and `--claude`,
 review-in-bubble works for a fork PR (or the gap is documented and `--host` review is the agreed
 fallback), and no container leaks. Then M14 (delete `loop.sh`/`round.sh`, final README) can proceed.
+
+## Results log (2026-06-16, macOS dev host + Colima/Incus)
+
+This host *does* have a Colima/Incus runtime (contrary to the doc's premise), so validation was
+attempted here. Status so far:
+
+- **§1 no-container sanity — PASS.** `status` renders; `parity_selectors.py` 0 mismatches;
+  `agent_cmds.py` 0 mismatches; `work --dry-run` prints `sandbox=bubble`; the `AGENT_ECHO` round emits
+  the correct `bubble open … allowlist-write-graphql …` argv (repo-scoped, three RO mounts, only the
+  work-model credential seeded, API keys cleared) and opens no container.
+  - `lifecycle.sh` was non-portable: it shelled out to `setsid` (util-linux, absent on macOS), so test 3
+    was a *false pass* and 4/5 failed. tauceti's actual signal handling is correct (SIGTERM→143,
+    SIGINT→130, verified directly). Fixed the test to create the session via an inline `os.setsid()`
+    launcher (+ a guard that can never group-kill the harness). **Now 5/5.**
+- **Quota pacer / `--ignore-quota`.** Codex/Opus were only *paced* (over-pace), not exhausted. Renamed
+  the old `--no-pace` flag to **`--ignore-quota`**; with an explicit `--codex`/`--claude` it runs the
+  model regardless of pace (single-round and `--loop`).
+- **§4 OpenRouter — doc is stale.** bubble#299 (pi + openrouter.ai egress) merged 2026-06-05, so the
+  "expected to fail" note is outdated. The pre-flight `Die` still fires without
+  `TAUCETI_ALLOW_OPENROUTER_BUBBLE=1` (confirmed). Real bubble OpenRouter rounds are *not yet validated*
+  — blocked by the runtime bug below.
+- **Bubble runtime bugs — found, filed, FIXED (bubble 0.7.21).** Three bugs blocked the private-
+  `BUBBLE_HOME` path tauceti uses (none in tauceti itself):
+  [#300](https://github.com/kim-em/bubble/issues/300) (`incus list <remote>:<name>` as one token →
+  base-image rebuild failed), [#301](https://github.com/kim-em/bubble/issues/301) (cosmetic
+  `Addr`/`Addrs` warning), [#304](https://github.com/kim-em/bubble/issues/304) (the host-singleton
+  auth-proxy resolved its endpoint/token files against the caller's `BUBBLE_HOME`, not the daemon's, so
+  a private home couldn't use the proxy). All fixed + merged. After upgrade, a private-`BUBBLE_HOME`
+  `bubble open` works end-to-end: container launches, **auth proxy configured (repo-scoped, allowlisted
+  GraphQL)**, repo cloned via shared objects, 9/9 Lake deps pre-populated, container popped clean.
+- **In-container environment confirmed.** `pi` (0.73.1), `codex`, `claude`, `git`, `gh`, `lake`
+  (`~/.elan/bin/lake`) all present; **OpenRouter egress works (HTTP 200)** and the allowlist blocks
+  other hosts; `pi --provider openrouter` returns output (verified `PONG`). `uv`/`uvx` is **off by
+  default** (`bubble tools` setting `no`) — Phase 3 review-in-bubble needs `bubble tools set uv yes`
+  (a one-time image rebuild); not a bug.
+  - **`jq` is missing from the bubble image** and is *not* a `bubble tools` option. `claim.sh` needs it,
+    so in-container target-claiming fails (`jq: command not found`, exit 1). Cooperative/non-fatal for a
+    single worker, but it breaks roadmap target de-dup and would bite multi-worker (Phase 7). Fix
+    options: add `jq` to the image (request to kim-em/bubble), or make `claim.sh` jq-free (it could use
+    the `python3` already in the image). TBD.
+
+- **tauceti bugs found while validating the agent rounds (fixes staged, awaiting commit):**
+  - **Roadmap prompt path.** The prompt sent the agent to `__ROADMAP_DIR__/<FOCUS>` = `/opt/roadmap/
+    <FOCUS>`, but the roadmap repo nests areas under `TauCetiRoadmap/`, so the real path is
+    `/opt/roadmap/TauCetiRoadmap/<FOCUS>`. Affected host **and** bubble. Fixed `ROADMAP_DIR` in both.
+  - **Bubble codex used an unsupported model + the baked codex is stale.** The bubble seeds codex
+    credentials but not host config (`--no-codex-config`), so in-container `codex exec` fell back to its
+    built-in default (`gpt-5.3-codex`), which this ChatGPT-subscription account rejects. tauceti now
+    pins `--model`. BUT validation then exposed a deeper, **bubble-image** problem: its codex CLI is too
+    old — `gpt-5.5` (what the host uses successfully) returns "requires a newer version of Codex", and
+    with the old CLI the account also rejects plain `gpt-5` and `gpt-5.3-codex`. So **codex-in-bubble is
+    blocked until the bubble image ships a current codex** (report to kim-em/bubble). The `--model` pin
+    is still correct for when the image is current. Pivoted Phase 3 to `--claude`/opus to validate the
+    subscription authoring path meanwhile.
+  - **False-success guard.** A model round that exits 0 but leaves no mark on GitHub (no push, new PR,
+    or comment) is now surfaced as no-progress, not success — caught the original silent OpenRouter
+    no-op. (`pi --print` is silent until the very end, so a round that bails mid-flight produces zero
+    stdout; the guard checks the GitHub mutation, not stdout.)
+  - Renamed `--no-pace` → **`--ignore-quota`**; fixed `lifecycle.sh` `setsid` portability (see §1).
+
+- **HARD BLOCKER for all bubble authoring — shared-cache overlay is unwritable on macOS/Colima.**
+  `bubble security set shared-cache overlay` mounts `/shared/mathlib-cache` as overlayfs
+  (lowerdir on read-only virtiofs, `userxattr`). On macOS/Colima/virtiofs the container user **cannot
+  write through the overlay** (`touch /shared/mathlib-cache/x` → Permission denied) even though the raw
+  `upperdir` is writable — the classic overlayfs-over-virtiofs limitation. So `lake exe cache get` dies
+  (`permission denied … /shared/mathlib-cache/curl.cfg`) and the container compiles **Mathlib from
+  source**, which never finishes in a round. Confirmed by watching a `pi` round sit at 24 lean procs
+  building `Mathlib/*` with no `Init.olean` after 15 min, never authoring. Filed
+  [kim-em/bubble#306](https://github.com/kim-em/bubble/issues/306). **Until this is fixed (or shared-
+  cache uses a writable per-bubble dir on macOS), no bubble authoring/fixing round can build in time.**
+- **§3 OpenRouter (DeepSeek) authoring — agent path works up to the build.** With the roadmap path fixed,
+  `pi` picks a real target and starts authoring (watched live via its session JSONL); it then blocks on
+  the from-source Mathlib build (the #306 cache blocker). pi + OpenRouter themselves are fine.
+- **Killing a round mid-build pops its container cleanly** (no leftover) — incidentally confirms the §2
+  teardown checklist item.
+
+### Bottom line (2026-06-16)
+Bubble *infrastructure* works after #300/#301/#304. Bubble *authoring* is **not yet runnable end-to-end**
+on this macOS/Colima host, blocked by:
+1. **[#306](https://github.com/kim-em/bubble/issues/306)** shared-cache overlay unwritable → from-source
+   Mathlib build (blocks pi/codex/claude alike). **The critical one.**
+2. **Stale codex CLI in the image** → no account-supported model works (`gpt-5.5` needs newer CLI;
+   `gpt-5`/`gpt-5.3-codex` rejected; bubble codex `0.114.0` vs host `0.136.0`). [kim-em/bubble#308](https://github.com/kim-em/bubble/issues/308).
+3. **`jq` missing** → in-container `claim.sh` fails (roadmap dedup; matters for multi-worker). [kim-em/bubble#309](https://github.com/kim-em/bubble/issues/309).
+4. **`uv` off by default** → `bubble tools set uv yes` before review-in-bubble (§3 review).
+tauceti-side fixes (staged, uncommitted): roadmap path, codex `--model` pin, false-success guard,
+`--ignore-quota`, `lifecycle.sh` portability. Resume Phase 3/4/5/6/7 once #306 (and the codex image) land.
+- **§3 review-in-bubble — fork case is the documented gap.** No forks of TauCeti exist and only one
+  GitHub account (kim-em) is available, so a community-fork PR can't be manufactured here; per the doc,
+  treat fork review as the known gap and use `--host` review for forks. Same-repo review still testable
+  (needs `uv` enabled).
+
+
+### Bubble authoring VALIDATED end-to-end (2026-06-17, --codex)
+After building `lean-v4.31.0` + refreshing the stale mirror, a real `--codex` fix round on PR #185
+ran fully in-bubble: codex (gpt-5.5) read the blocking review, fixed it, `lake build` 3836 jobs green,
+`lake exe axioms` clean, and `git-safe-push` pushed through the repo-scoped proxy (#185 head 62dd2cc8 ->
+889e074). rc=0, container popped clean, no host token in container. A follow-up message-amend push was
+correctly REJECTED by branch-CAS ("branch moved since checkout") and codex stopped — validating the
+[HARD] push arbiter. So §2 (authoring/fixing in bubble) is GREEN for --codex.
+- `--claude` §2: blocked only by Anthropic provider rate-limit (opus), not by tauceti/bubble — retry when quota recovers.
+- Operational note: bubble's per-home git mirror must be refreshed and the project's exact `lean-vX.Y.Z`
+  toolchain image must exist, else bubble selects a near-match toolchain image and elan's blocked
+  download hangs the build. tauceti should `git fetch` the mirror + ensure the toolchain image before rounds.
