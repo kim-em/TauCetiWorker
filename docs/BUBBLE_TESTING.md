@@ -253,3 +253,21 @@ correctly REJECTED by branch-CAS ("branch moved since checkout") and codex stopp
 - Operational note: bubble's per-home git mirror must be refreshed and the project's exact `lean-vX.Y.Z`
   toolchain image must exist, else bubble selects a near-match toolchain image and elan's blocked
   download hangs the build. tauceti should `git fetch` the mirror + ensure the toolchain image before rounds.
+
+### §2 `--claude` validated + false-success guard proven (2026-06-17)
+A `--claude` fix round on PR #153 ran in-bubble (opus, no rate-limit this time): claude **contested**
+the `scope` block by replying on the review thread through the proxy (visible as a kim-em review comment
+at 03:42Z) — a legitimate non-code fix outcome. This exposed and fixed a gap in the false-success guard:
+it only counted *issue* comments, so it wrongly flagged the contest as "no mark on GitHub". Now it counts
+issue **and** review-thread comments (`pulls/{pr}/comments`). Net: §2 is green for both `--codex`
+(code push, #185) and `--claude` (contest reply, #153); the guard correctly refuses to trust an agent's
+self-reported success and keys off the actual GitHub mutation.
+
+### Status summary for sign-off
+- §1 sanity: GREEN. §2 authoring/fixing in bubble: GREEN (--codex push + --claude contest).
+- §5 loop driver: GREEN (back-off escalation to cap; clean SIGINT exit; child-spawn; group-teardown).
+- Branch-CAS [HARD] push arbiter: validated (stale 2nd push rejected on #185).
+- §4 OpenRouter (pi) authoring: in progress (build env now works; round running).
+- §3 review-in-bubble + §6 multi-worker: pending (need `uv` in the review image + a reviewer model).
+- Bubble: all blockers fixed (#300/#301/#304/#306-307/#308/#309/#312). tauceti fixes committed
+  (d962c41, eafd788).
