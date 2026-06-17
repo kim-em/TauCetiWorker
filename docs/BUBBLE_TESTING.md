@@ -271,3 +271,13 @@ self-reported success and keys off the actual GitHub mutation.
 - §3 review-in-bubble + §6 multi-worker: pending (need `uv` in the review image + a reviewer model).
 - Bubble: all blockers fixed (#300/#301/#304/#306-307/#308/#309/#312). tauceti fixes committed
   (d962c41, eafd788).
+
+### §3 review-in-bubble — blocked by engine fetch through the repo-scoped proxy (2026-06-17)
+With `uv` enabled, review-in-bubble gets all the way to launching the engine: container opens, auth proxy
+configured, PR checked out, `uvx` runs. It then fails because `uvx --from git+https://github.com/
+FormalFrontier/TauCetiReview tauceti-review …` must clone **TauCetiReview** — a different repo from the
+review target — and the proxy is repo-scoped to FormalFrontier/TauCeti, so the engine clone is rejected
+(`Failed to resolve --with requirement: Git operation failed`). This is the §3 integration risk the
+checklist anticipated. Fix is design-level (allow the engine repo through the proxy, mount/pre-stage the
+engine, or bake `tauceti-review` into the bubble image). Until then, **`--host` review is the fallback**
+(the engine runs on the host with its own clean-room isolation).
