@@ -287,16 +287,16 @@ class Provider:
 
 def _classify_window(name: str, used: Optional[float], elapsed: Optional[float],
                      resets_at: Optional[float], limit_reached: bool) -> Window:
-    # Normalize: clamp elapsed to [0,100]; null used → fresh (0); null elapsed → permissive (100).
+    # Fail CLOSED on missing data. These endpoints are reverse-engineered: a schema drift that drops
+    # `used` or the reset clock must read as 'unknown' (⇒ provider unavailable), NEVER as fresh /
+    # under-pace, so it can't silently unlock spending. Clamp both percentages to [0,100].
     e = None if elapsed is None else max(0.0, min(100.0, elapsed))
-    u = 0.0 if used is None else used
-    if limit_reached or u >= 100:
-        st = "exhausted"
-    elif used is None and elapsed is None:
-        st = "unknown"
-    else:
-        eff_e = 100.0 if e is None else e
-        st = "under-pace" if u <= eff_e else "over-pace"
+    if limit_reached:
+        return Window(name, used, e, resets_at, "exhausted")
+    if used is None or e is None:
+        return Window(name, used, e, resets_at, "unknown")
+    u = max(0.0, min(100.0, used))
+    st = "exhausted" if u >= 100 else ("under-pace" if u <= e else "over-pace")
     return Window(name, used, e, resets_at, st)
 
 
@@ -332,13 +332,30 @@ def _read_json_file(path: Path) -> Optional[dict]:
         return None
 
 
-def _write_json_atomic(path: Path, data: dict, mode: int = 0o600) -> None:
-    """Write JSON preserving the file's other contents; atomic rename, restrictive perms.
-    (Residual: no cross-process file lock yet — the official CLIs may also rewrite these. Noted in plan.)"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Non-corrupting credential-file write: a UNIQUE temp file in the same dir (a concurrent writer
+    can't consume ours), preserve the existing mode (else 0600), fsync, then atomic rename. Raises on
+    failure so the caller treats it as 'unavailable' rather than crashing. (Cross-process serialization
+    vs the official CLIs is handled by --isolate-home giving each worker its own credential copy.)"""
+    import tempfile
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    fd, tmpname = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmpname, mode)
+        os.replace(tmpname, path)
+    except OSError:
+        try:
+            os.unlink(tmpname)
+        except OSError:
+            pass
+        raise
 
 
 class Quota:
@@ -418,14 +435,21 @@ class Quota:
             "grant_type": "refresh_token", "client_id": CODEX_CLIENT_ID, "refresh_token": rt})
         if code != 200 or not resp.get("access_token"):
             return None
-        tok = auth.setdefault("tokens", {})
+        # Re-read the file just before writing so we update only the rotated token fields on top of
+        # whatever the official CLI may have written meanwhile (minimize the clobber window).
+        path = self.cfg.home / ".codex" / "auth.json"
+        fresh = _read_json_file(path) or auth
+        tok = fresh.setdefault("tokens", {})
         tok["access_token"] = resp["access_token"]
         if resp.get("refresh_token"):
             tok["refresh_token"] = resp["refresh_token"]
         if resp.get("id_token"):
             tok["id_token"] = resp["id_token"]
-        auth["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _write_json_atomic(self.cfg.home / ".codex" / "auth.json", auth)
+        fresh["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            _write_json_atomic(path, fresh)
+        except OSError:
+            return None   # couldn't persist → treat as unavailable, don't crash quota checking
         return resp["access_token"]
 
     def _codex_from_payload(self, payload: dict) -> Provider:
@@ -490,14 +514,17 @@ class Quota:
         if code != 200 or not resp.get("access_token"):
             return None
         path = self.cfg.home / ".claude" / ".credentials.json"
-        full = _read_json_file(path) or {}
+        full = _read_json_file(path) or {}    # re-read just before writing (minimize the clobber window)
         block = full.setdefault("claudeAiOauth", {})
         block["accessToken"] = resp["access_token"]
         if resp.get("refresh_token"):
             block["refreshToken"] = resp["refresh_token"]
         if resp.get("expires_in"):
             block["expiresAt"] = int(time.time() * 1000) + int(resp["expires_in"]) * 1000
-        _write_json_atomic(path, full)
+        try:
+            _write_json_atomic(path, full)
+        except OSError:
+            return None   # couldn't persist → treat as unavailable, don't crash quota checking
         return resp["access_token"]
 
     def _claude_from_payload(self, payload: dict) -> Provider:
@@ -948,6 +975,46 @@ def _bump_is_forward(gh: GitHub, head: str) -> bool:
         return run(["bash", str(root / "check-bump.sh"), str(base), str(pr)]).returncode == 0
 
 
+def _merge_decision(rs: "ReviewState", d: dict) -> Optional[tuple]:
+    """Is this PR auto-mergeable RIGHT NOW at its current head? Returns (reason, touches_pins,
+    provenance) or None. A pure predicate over a PR's JSON so survey() (bulk list) and prepass_merge
+    (a fresh act-time `pr view`) apply IDENTICAL gates — the act-time call is what closes the TOCTOU
+    before the privileged `gh pr merge --admin`.
+
+    Gates: ours, not draft, MERGEABLE, the trusted pr-build check green at head, and only
+    auto-mergeable paths changed — TauCeti/ math (+ the root aggregator) and/or the Lake pins. A
+    pins-only diff on a recognized bump branch (bump-mathlib*/hopscotch/*) is a pure forward bump:
+    check-bump (run in prepass_merge) plus the sandboxed build ARE its review, so it skips rubrics.
+    Anything else needs all rubrics green at head. The lakefile and every other human-owned path stay
+    out of scope. (Follow-up, pre-existing: `files` from gh can truncate a >100-file diff; a bump PR
+    is tiny so the skip-review path is unaffected, but a paginated count-verified fetch would close it.)"""
+    if d.get("isDraft") or (d.get("author") or {}).get("login") != ME:
+        return None
+    if d.get("mergeable") != "MERGEABLE":
+        return None
+    pr, head = d["number"], d.get("headRefOid", "")
+    files = [f["path"] for f in (d.get("files") or [])]
+    rollup = d.get("statusCheckRollup") or []
+    build_green = any(c.get("name") == "build" and c.get("workflowName") == "pr-build"
+                      and c.get("conclusion") == "SUCCESS" for c in rollup)
+    in_scope = bool(files) and all(
+        p.startswith("TauCeti/") or p == "TauCeti.lean" or p in PIN_FILES for p in files)
+    if not (build_green and in_scope):
+        return None
+    ref = d.get("headRefName", "")
+    is_bump_branch = ref.startswith(BUMP_BRANCH_PREFIX) or ref.startswith("hopscotch/")
+    touches_pins = any(p in PIN_FILES for p in files)
+    pins_only = bool(files) and all(p in PIN_FILES for p in files)
+    skip_review = pins_only and is_bump_branch   # only a real bump branch may merge unreviewed
+    green_meta = rs.review_all_green(pr, head)
+    if not (skip_review or green_meta.data.get("_all_green", False)):
+        return None
+    reason = ("forward Lake-pin bump (check-bump @ merge), pins only" if skip_review
+              else "rubrics green @ head + forward Lake-pin bump" if touches_pins
+              else "all rubrics green @ head, TauCeti/ only")
+    return reason, touches_pins, green_meta.provenance
+
+
 def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
     try:
         mine = gh.pr_list(["number", "headRefOid", "headRefName", "isDraft", "mergeable",
@@ -960,36 +1027,15 @@ def _classify_housekeeping(cfg, gh, rs, counters, sv: Survey) -> None:
         if d.get("isDraft"):
             continue
         pr, head = d["number"], d.get("headRefOid", "")
-        files = [f["path"] for f in (d.get("files") or [])]
-        rollup = d.get("statusCheckRollup") or []
-        # Bind "build green" to the trusted pr-build workflow's check run, not just any check named
-        # "build" — so a look-alike status/check can't satisfy the gate (esp. the no-rubric pins path).
-        build_green = any(c.get("name") == "build" and c.get("workflowName") == "pr-build"
-                          and c.get("conclusion") == "SUCCESS" for c in rollup)
         green_meta = rs.review_all_green(pr, head)
         all_green = green_meta.data.get("_all_green", False)
-        # merge: MERGEABLE, build green, and only auto-mergeable paths changed — TauCeti/ math
-        # (+ the root aggregator) and/or the Lake pins. A pins-only diff *on a recognized bump
-        # branch* is a pure forward bump: check-bump plus the sandboxed build ARE its review, so it
-        # skips rubrics. Any TauCeti/ content — a real bump that also carries adaptation fixes, or a
-        # plain content PR — still needs all rubrics green, as does a pins-only diff on any other
-        # branch. The lakefile and every other human-owned path stay out of scope. A pin change is
-        # re-validated by check-bump at merge time (prepass_merge), not here, so the authoritative
-        # check runs once against current main right before the privileged merge.
-        ref = d.get("headRefName", "")
-        is_bump_branch = ref.startswith(BUMP_BRANCH_PREFIX) or ref.startswith("hopscotch/")
-        in_scope = bool(files) and all(
-            p.startswith("TauCeti/") or p == "TauCeti.lean" or p in PIN_FILES for p in files)
-        touches_pins = any(p in PIN_FILES for p in files)
-        pins_only = bool(files) and all(p in PIN_FILES for p in files)
-        skip_review = pins_only and is_bump_branch   # only a real bump branch may merge unreviewed
-        if (d.get("mergeable") == "MERGEABLE" and build_green and in_scope
-                and (skip_review or all_green)):
-            reason = ("forward Lake-pin bump (check-bump @ merge), pins only" if skip_review
-                      else "rubrics green @ head + forward Lake-pin bump" if touches_pins
-                      else "all rubrics green @ head, TauCeti/ only")
-            sv.mergeable_now.append(Candidate(pr, head, reason, provenance=green_meta.provenance,
-                                              touches_pins=touches_pins))
+        # merge: the same predicate prepass_merge re-applies on a fresh fetch at act time (one source
+        # of truth for the privileged gate). A pin change is additionally re-validated by check-bump in
+        # prepass_merge against current main right before the merge.
+        dec = _merge_decision(rs, d)
+        if dec:
+            reason, touches_pins, prov = dec
+            sv.mergeable_now.append(Candidate(pr, head, reason, provenance=prov, touches_pins=touches_pins))
         # abandon: not green, head IS the reviewed head, past budget, (human-activity checked lazily).
         elif (not all_green and rs.ledger_head(pr) == head
               and rs.review_rounds(pr, counters) >= MAX_REVIEW_ROUNDS):
@@ -1733,14 +1779,33 @@ def prepass_merge(w: Worker, sv: Survey, dry: bool) -> None:
             extra = " (pending check-bump)" if c.touches_pins else ""
             log(f"[dry-run] would merge #{c.pr} ({c.reason}){extra}")
             continue
-        # A Lake-pin change is re-validated here, at act time, against current main — so a bump that
-        # has fallen behind a newer pin since classification cannot slip through.
-        if c.touches_pins and not _bump_is_forward(w.gh, c.head):
+        # ACT-TIME REVALIDATION before the privileged --admin merge. Checks can rerun, mergeability and
+        # the file scope can change, and the scoreboard can move after survey() — and --admin bypasses
+        # branch protection — so re-fetch the PR and a FRESH scoreboard and re-apply the exact same
+        # gates at the same head right before merging. Bust the meta cache first so the scoreboard read
+        # is current, not a TTL-stale copy.
+        w.rs.bust(c.pr)
+        fresh = w.gh.pr_view(c.pr, ["number", "headRefOid", "headRefName", "isDraft", "mergeable",
+                                    "statusCheckRollup", "files", "author"])
+        if fresh is None:
+            log(f"merge: skip #{c.pr} — could not re-fetch at act time")
+            continue
+        if fresh.get("headRefOid") != c.head:
+            log(f"merge: skip #{c.pr} — head moved since classification")
+            continue
+        dec = _merge_decision(w.rs, fresh)
+        if dec is None:
+            log(f"merge: skip #{c.pr} — no longer meets the merge gates at act time")
+            continue
+        _reason, touches_pins, _prov = dec
+        # A Lake-pin change is re-validated against current main — a bump that has fallen behind a newer
+        # pin since classification cannot slip through.
+        if touches_pins and not _bump_is_forward(w.gh, c.head):
             log(f"merge: skip #{c.pr} — check-bump did not validate the pin move @ {c.head[:12]}")
             continue
-        log(f"merging PR #{c.pr} ({c.reason} @ {c.head[:12]})")
-        # --match-head-commit binds the privileged merge to the exact head we validated: if the
-        # branch was updated after classification, the merge fails closed instead of landing an
+        log(f"merging PR #{c.pr} ({_reason} @ {c.head[:12]})")
+        # --match-head-commit binds the privileged merge to the exact head we just validated: if the
+        # branch is updated in the remaining window, the merge fails closed instead of landing an
         # unvalidated head.
         r = subprocess.run(["gh", "pr", "merge", str(c.pr), "--repo", TAUCETI,
                             "--squash", "--delete-branch", "--admin", "--match-head-commit", c.head])
@@ -1753,6 +1818,11 @@ def prepass_dedup(w: Worker, sv: Survey, dry: bool) -> None:
         for pr in prs[1:]:
             if dry:
                 log(f"[dry-run] would close duplicate #{pr} (target '{tid}', keep #{kept})")
+                continue
+            # Fail-safe (as round.sh): never auto-close a PR a human has engaged (keep-label or a
+            # non-bot comment/review) — re-checked at act time, not at classification.
+            if has_human_activity(w.gh, pr):
+                log(f"dup-sweep: PR #{pr} duplicates #{kept} (target '{tid}') but has human activity — leaving")
                 continue
             log(f"dup-sweep: closing PR #{pr} — duplicate target '{tid}' (older open #{kept} kept)")
             subprocess.run(["gh", "pr", "close", str(pr), "--repo", TAUCETI,
@@ -1958,11 +2028,17 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
+    # --isolate-home must set $HOME BEFORE Config.resolve (so cfg.home + credential paths point at the
+    # per-worker copy). Children spawned by the loop inherit $HOME and don't re-isolate.
+    if getattr(args, "isolate_home", False):
+        isolate_home(sanitize_wid(getattr(args, "worker_id", None)
+                                  or os.environ.get("TAUCETI_WORKER_ID", "default") or "default"))
     cfg = Config.resolve(getattr(args, "worker_id", None))
     if getattr(args, "loop", False) and not one_round:
         return cmd_loop(args, cfg, only=only, agent=agent)
     dry = getattr(args, "dry_run", False)
     ignore_quota = getattr(args, "ignore_quota", False)
+    quota_cmd = getattr(args, "quota_cmd", None)
 
     with RoundContext(cfg) as ctx:   # one round per worker; cleanup + SIGTERM/SIGINT handling
         # Lifecycle test hooks (no GitHub, no model, no mutation) — exercise lock / fd-leak / timeout.
@@ -1985,12 +2061,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
 
         # Housekeeping-only (--only merge, no work task): drives no model, so don't resolve/pace one.
         housekeeping_only = bool(only) and not any(t in WORK_TASKS for t in only)
-        work_model = "none" if housekeeping_only else resolve_work_model(cfg, agent, dry=dry, ignore_quota=ignore_quota)
+        work_model = "none" if housekeeping_only else resolve_work_model(
+            cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd)
         gh = GitHub()
         w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
         opts = RoundOpts(only=only, agent=agent, work_model=work_model,
                          sandbox_host=getattr(args, "host", False), dry_run=dry,
-                         ignore_quota=ignore_quota, quota_cmd=getattr(args, "quota_cmd", None))
+                         ignore_quota=ignore_quota, quota_cmd=quota_cmd)
         if not dry:
             preflight(cfg, opts)
         return run_round(w, opts)   # NoProgress/Die propagate to main()'s handler
@@ -2005,6 +2082,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     housekeeping = bool(only) and not any(t in WORK_TASKS for t in only)
     ignore_quota = getattr(args, "ignore_quota", False)
     host = getattr(args, "host", False)
+    quota_cmd = getattr(args, "quota_cmd", None)
     log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}"
         f"{' [housekeeping]' if housekeeping else ''}{' [host]' if host else ''}")
     streak = 0
@@ -2015,12 +2093,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 model = None                       # no model; run every cycle (loop.sh HOUSEKEEPING_ONLY)
             elif openrouter:
                 model = agent                      # pay-per-token; no quota wait
-            elif ignore_quota:
+            elif ignore_quota and not quota_cmd:
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
                 model = agent
             else:
-                model, snap = Quota(cfg).choose(None if agent == "auto" else agent)
+                model, snap = choose_model(cfg, agent, quota_cmd)
                 if model is None:
                     log(f"quota: {quota_line(snap)} — sleeping {POLL}s")
                     time.sleep(POLL)
@@ -2051,18 +2129,62 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
         return 130
 
 
-def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool) -> str:
-    """Turn the --agent dial into the concrete model to run. 'auto' consults the pacer (codex preferred,
-    opus fallback). OpenRouter agents are pay-per-token (no pacing). Dry-run leaves it symbolic."""
+def isolate_home(wid: str) -> Path:
+    """Give this worker its OWN $HOME so its credential refreshes can't race other workers or the
+    operator (Codex review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface
+    from the real home; copies the mutable Claude/Codex auth files in ONCE (thereafter the worker
+    refreshes within its own copy). Returns the worker home and sets $HOME. Child rounds inherit it."""
+    import shutil
+    real = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    home = HERE / "state" / wid / "home"
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
+        src, dst = real / ".claude" / item, home / ".claude" / item
+        if src.exists() and not dst.exists():
+            try:
+                dst.symlink_to(src)
+            except OSError:
+                pass
+    for f in (".credentials.json", ".gist-id", ".gist-encryption-key"):
+        src, dst = real / ".claude" / f, home / ".claude" / f
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+    src, dst = real / ".codex" / "auth.json", home / ".codex" / "auth.json"
+    if src.exists() and not dst.exists():
+        shutil.copy2(src, dst)
+    os.environ["HOME"] = str(home)
+    log(f"isolated HOME={home} (worker '{wid}')")
+    return home
+
+
+def choose_model(cfg: Config, agent: str, quota_cmd: Optional[str]) -> tuple[Optional[str], dict]:
+    """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
+    command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
+    `<quota_cmd> <agent>`; its first stdout token is the model to run (codex/claude/deepseek/minimax)
+    or empty = none available. Otherwise use the self-contained pacer."""
+    if quota_cmd:
+        import shlex
+        r = subprocess.run(shlex.split(quota_cmd) + [agent], capture_output=True, text=True)
+        out = (r.stdout or "").split()
+        model = out[0] if (r.returncode == 0 and out) else None
+        return (model or None), {"quota-cmd": Provider("quota-cmd", bool(model), model)}
+    return Quota(cfg).choose(None if agent == "auto" else agent)
+
+
+def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool,
+                       quota_cmd: Optional[str] = None) -> str:
+    """Turn the --agent dial into the concrete model to run. 'auto' consults the pacer (or --quota-cmd);
+    codex preferred, opus fallback. OpenRouter agents are pay-per-token (no pacing). Dry-run symbolic."""
     if dry:
         return agent
     if agent in OPENROUTER_MODELS:
         return agent
-    if ignore_quota:
+    if ignore_quota and not quota_cmd:
         if agent == "auto":
             raise SystemExit("--ignore-quota needs an explicit --agent (codex/claude); 'auto' can't choose without the pacer")
         return agent
-    chosen, _snap = Quota(cfg).choose(None if agent == "auto" else agent)
+    chosen, _snap = choose_model(cfg, agent, quota_cmd)
     if chosen is None:
         raise NoProgress(f"no model under pace right now (agent={agent}) — nothing to run this round")
     return chosen
