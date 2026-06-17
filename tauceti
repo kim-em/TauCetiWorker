@@ -2084,14 +2084,32 @@ def preflight(cfg: Config, opts: "RoundOpts") -> None:
         raise Die("preflight: --host authoring needs an elan/lake toolchain on PATH (or drop --host)")
 
 
-if __name__ == "__main__":
+def cli_main() -> int:
+    """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
+    _ensure_scripts_executable()
     try:
-        sys.exit(main())
+        return main() or 0
     except Die as e:
         log(str(e))
-        sys.exit(1)
+        return 1
     except NoProgress as e:
         log(str(e))
-        sys.exit(EX_NOPROGRESS)
+        return EX_NOPROGRESS
     except KeyboardInterrupt:
-        sys.exit(130)
+        return 130
+
+
+def _ensure_scripts_executable() -> None:
+    """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
+    can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create"):
+        p = HERE / "scripts" / f
+        try:
+            if p.exists() and not os.access(p, os.X_OK):
+                p.chmod(0o755)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(cli_main())
