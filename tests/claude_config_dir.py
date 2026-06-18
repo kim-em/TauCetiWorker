@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Honor $CLAUDE_CONFIG_DIR: the pacer reads Claude creds from it, isolation copies from there and
-repoints it at the per-worker copy, and the bubble path fails fast when it can't reach it."""
+repoints it at the per-worker copy, and the bubble path does not block a non-default value
+(bubble honors the var itself)."""
 import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, types
 from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
@@ -47,31 +48,37 @@ finally:
     shutil.rmtree(tc.HERE / "state" / wid, ignore_errors=True)
     shutil.rmtree(tmp, ignore_errors=True)
 
-# Bubble fail-fast: with a non-default $CLAUDE_CONFIG_DIR, run_in_bubble must Die before staging because
-# bubble seeds Claude creds from <home>/.claude, not the config dir. (--isolate-home repoints the var TO
-# <home>/.claude, so that case must pass the check — verified via the ensure_bubble_home sentinel below.)
-sentinel = RuntimeError("reached ensure_bubble_home")
-tc.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(sentinel)   # passing the check lands here
+# The env handed to the bubble subprocess must carry $CLAUDE_CONFIG_DIR (that's how bubble, which now
+# honors the var per kim-em/bubble#317, seeds the matching creds). ensure_bubble_home returns early once
+# the home is initialized, so point TAUCETI_BUBBLE_HOME at a pre-initialized dir and check the env it returns.
+bhome = Path(tempfile.mkdtemp())
+try:
+    (bhome / ".worker-init").touch()
+    os.environ["TAUCETI_BUBBLE_HOME"] = str(bhome)
+    os.environ["CLAUDE_CONFIG_DIR"] = "/custom/work-claude"
+    benv = tc.ensure_bubble_home(types.SimpleNamespace(home=bhome, wid="w"))
+    check("bubble subprocess env carries $CLAUDE_CONFIG_DIR", benv.get("CLAUDE_CONFIG_DIR"), "/custom/work-claude")
+finally:
+    os.environ.pop("TAUCETI_BUBBLE_HOME", None)
+    shutil.rmtree(bhome, ignore_errors=True)
+
+# Bubble must NOT block a non-default $CLAUDE_CONFIG_DIR: bubble honors the var itself, so run_in_bubble
+# proceeds straight to staging. A sentinel in place of ensure_bubble_home proves we reach staging (not a
+# Die) for both the non-default and default cases.
+class ReachedStaging(Exception): pass
+tc.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(ReachedStaging())   # past the (removed) guard
 w = types.SimpleNamespace(cfg=types.SimpleNamespace(home=Path("/home/example"), state=Path("/tmp"), wid="w"))
 opts = types.SimpleNamespace(work_model="claude")
 
-os.environ["CLAUDE_CONFIG_DIR"] = "/custom/work-claude"
-try:
-    tc.run_in_bubble(w, "review", "PROMPT", opts)
-    check("bubble + non-default config dir raises", "no raise", "tc.Die")
-except tc.Die as e:
-    check("bubble + non-default config dir raises Die", "/custom/work-claude" in str(e), True)
-except RuntimeError:
-    check("bubble + non-default config dir raises (got sentinel instead)", "sentinel", "tc.Die")
-
-os.environ["CLAUDE_CONFIG_DIR"] = str(Path("/home/example") / ".claude")   # what --isolate-home sets
-try:
-    tc.run_in_bubble(w, "review", "PROMPT", opts)
-    check("bubble + matching config dir passes the check", "no raise/sentinel", "sentinel")
-except tc.Die:
-    check("bubble + matching config dir must NOT Die", "raised Die", "sentinel")
-except RuntimeError:
-    check("bubble + matching config dir passes the check", True, True)
+for label, cfgdir in (("non-default", "/custom/work-claude"), ("default", str(Path("/home/example") / ".claude"))):
+    os.environ["CLAUDE_CONFIG_DIR"] = cfgdir
+    try:
+        tc.run_in_bubble(w, "review", "PROMPT", opts)
+        check(f"bubble + {label} config dir reaches staging", "no raise", "ReachedStaging")
+    except tc.Die:
+        check(f"bubble + {label} config dir must NOT Die", "raised Die", "ReachedStaging")
+    except ReachedStaging:
+        check(f"bubble + {label} config dir reaches staging (no Die)", True, True)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

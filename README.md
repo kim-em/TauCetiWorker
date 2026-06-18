@@ -137,8 +137,8 @@ exits non-zero). Pass `--stream` to watch it live on the terminal instead.
 credential files the official CLIs already maintain (`~/.claude/.credentials.json`,
 `~/.codex/auth.json`) and queries each provider's usage endpoint. It honors
 `$CLAUDE_CONFIG_DIR` for the Claude credentials, so personal/work account switching
-is paced correctly (a bubble can't see that var, so `tauceti` says so and points you
-at `--host`). The rule is
+is paced correctly; bubble honors the same var, so it seeds the matching credentials
+into the sandbox too. The rule is
 "keep usage under elapsed time": a provider is available while `used% ≤ elapsed%`
 on both its 5-hour and its weekly window. Auto mode prefers Codex (to spare the
 scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it

@@ -1371,13 +1371,9 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         # at `pi: command not found`. Fail early with a clear pointer rather than after staging.
         raise Die(f"--agent {cred_model} requires --host until kim-em/bubble#299 lands pi in the bubble "
                   f"image (set TAUCETI_ALLOW_OPENROUTER_BUBBLE=1 to override once it has)")
-    if cred_model == "claude" and claude_dir(cfg.home) != cfg.home / ".claude":
-        # bubble seeds Claude creds from <home>/.claude, not $CLAUDE_CONFIG_DIR, so the pacer would
-        # measure one account while the in-bubble claude runs another. --isolate-home avoids this (it
-        # copies the creds into the worker's <home>/.claude and repoints $CLAUDE_CONFIG_DIR there).
-        raise Die(f"$CLAUDE_CONFIG_DIR={claude_dir(cfg.home)} can't reach the bubble (it seeds Claude "
-                  f"creds from {cfg.home / '.claude'}). Re-run with --host, or with --isolate-home to "
-                  f"copy those creds into the worker home.")
+    # bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317), reading it
+    # from this subprocess's inherited env, so the in-bubble claude and the pacer agree on the account
+    # with no extra plumbing here.
     env = ensure_bubble_home(cfg)
     rounddir = cfg.state / "bubble-round"
     import shutil
