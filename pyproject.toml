@@ -7,7 +7,7 @@ name = "tauceti"
 version = "0.1.0"
 description = "Autonomous worker for the FormalFrontier/TauCeti Lean library"
 requires-python = ">=3.11"
-dependencies = ["rich>=13"]
+dependencies = ["rich>=13", "textual>=0.60"]
 
 [project.scripts]
 tauceti = "tauceti_worker.__main__:cli_main"

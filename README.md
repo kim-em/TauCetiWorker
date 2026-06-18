@@ -34,20 +34,29 @@ you what's missing.
 
 ### The dashboard
 
-Bare `tauceti` opens an interactive dashboard. The table lists each kind of work
-with a number, how many PRs are ready, and a sample; a cursor highlights one row.
-It reacts to single keypresses (no Enter):
+Bare `tauceti` opens an interactive dashboard ([Textual](https://textual.textualize.io/)).
+The table lists each kind of work with a number, how many PRs are ready, and a
+sample; a cursor highlights one row. The survey is fetched once in the background
+and refreshed on `r` (or every 90s), so moving the cursor is instant — it never
+re-queries GitHub. It reacts to single keypresses (no Enter):
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | move the cursor between kinds |
+| `↑` / `↓` (or `k` / `j`) | move the cursor between kinds |
 | `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the focus areas) |
 | `Enter` | run one round of the selected kind |
 | `1`–`6` | run one round of that numbered kind directly |
 | `l` / `L` | loop the auto cascade / loop just the selected kind |
 | `f` | pick the roadmap focus from the available areas |
 | `m` / `s` | cycle the agent / toggle the sandbox (bubble ↔ host) |
-| `r` / `c` / `q` | refresh / copy the launch command / quit |
+| `r` / `c` / `q` | refresh / copy the launch command to the clipboard / quit |
+
+The agent, sandbox, and roadmap focus you pick are remembered between runs in
+`$XDG_CONFIG_HOME/tauceti/dashboard.json` (default `~/.config/tauceti/`), so the
+dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_FOCUS` in
+the environment still overrides the saved focus. The file is a user config dir, not
+the per-worker `state/`, so it is shared whether you run `./tauceti` from a clone or
+the `uv tool install`ed `tauceti`, and survives upgrades.
 
 Over a pipe or with no TTY it prints a one-shot snapshot instead (use `tauceti
 status` in scripts).
@@ -223,7 +232,7 @@ isolation on macOS applies to Codex only.
 ## What's in the repo
 
 - `tauceti`: the worker, one Python file ([PEP 723](https://peps.python.org/pep-0723/);
-  `uv` resolves its one dependency, `rich`).
+  `uv` resolves its dependencies, `rich` and `textual`, both used only by the dashboard).
 - `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
   these on `PATH` inside a round, so they stay shell.
 - `prompts/*.md`: the per-task agent prompts.
