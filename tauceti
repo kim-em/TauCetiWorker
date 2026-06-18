@@ -398,8 +398,15 @@ def _claude_keychain_creds() -> Optional[dict]:
     attempts.append(["security", "find-generic-password", "-s", service, "-w"])
     for cmd in attempts:
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True)
+            # Bound the read: an unattended GUI ACL prompt would otherwise block the pacer indefinitely
+            # (headless/SSH returns 36 right away instead). On timeout, treat Claude as unavailable.
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         except OSError:
+            return None
+        except subprocess.TimeoutExpired:
+            log("claude creds: reading the login Keychain timed out (a Keychain access prompt may be "
+                "waiting unanswered); grant access once, or run `security unlock-keychain`. Treating "
+                "Claude as unavailable.")
             return None
         if p.returncode == 0:
             try:
@@ -567,8 +574,11 @@ class Quota:
         login Keychain rather than a file — from the Keychain. from_keychain marks creds we must NOT
         refresh/persist (see _claude_keychain_creds)."""
         d = _read_json_file(claude_dir(self.cfg.home) / ".credentials.json")
-        if d:
-            return d.get("claudeAiOauth"), False
+        block = d.get("claudeAiOauth") if d else None
+        if block:
+            return block, False
+        # No usable on-disk block (file absent, or present but missing/empty claudeAiOauth). On macOS the
+        # creds live in the login Keychain instead, so fall back to a read-only Keychain lookup there.
         if sys.platform == "darwin":
             kc = _claude_keychain_creds()
             if kc:

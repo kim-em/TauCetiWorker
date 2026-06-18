@@ -70,6 +70,13 @@ try:
     check("file creds win over keychain", oauth, {"accessToken": "FILE"})
     check("file creds are not from_keychain", from_kc, False)
     check("file present → no security call", fr.calls, [])
+
+    # 7. A file present but missing claudeAiOauth (partial/legacy) must NOT shadow the Keychain.
+    (tmp / ".claude" / ".credentials.json").write_text(json.dumps({"other": 1}))
+    tc.subprocess.run = FakeRun([(0, json.dumps(OAUTH))])
+    oauth, from_kc = q._claude_creds()
+    check("file without claudeAiOauth falls back to keychain", oauth, OAUTH["claudeAiOauth"])
+    check("fallback creds are from_keychain", from_kc, True)
 finally:
     tc.subprocess.run, tc.sys.platform = orig_run, orig_platform
     if orig_user is None:
