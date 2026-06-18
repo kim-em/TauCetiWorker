@@ -1775,14 +1775,16 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
     the PR title. Pass None for both (e.g. from `tauceti status`) for the plain table."""
     from rich.table import Table
     from rich.panel import Panel
+    from rich.markup import escape   # PR titles / focus / errors are external text — escape before markup
 
     if sv.github_failed:
         console.print(Panel("[bold red]GitHub fetch failed[/] — survey unavailable.\n"
-                            + "\n".join(sv.errors), title="tauceti"))
+                            + escape("\n".join(sv.errors)), title="tauceti"))
         return
 
     expanded = expanded or set()
     titles = {p.number: p.title for p in sv.open_prs}
+    focus = escape(sv.roadmap_focus)
 
     header = (f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   "
               f"open: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
@@ -1801,9 +1803,9 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
         kind_cell = ("▸ " if is_sel else "  ") + name   # marker survives even without color
         if name == "roadmap":
             if sv.roadmap_backpressure:
-                t.add_row(num, kind_cell, "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})", style=style)
+                t.add_row(num, kind_cell, "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {focus})", style=style)
             else:
-                t.add_row(num, kind_cell, "∞", f"focus: {sv.roadmap_focus}", style=style)
+                t.add_row(num, kind_cell, "∞", f"focus: {focus}", style=style)
             continue
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
@@ -1819,7 +1821,7 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
             for c, supp in rows:
                 title = titles.get(c.pr) or c.reason or ""
                 tag = " [dim](past-budget)[/]" if supp else ""
-                t.add_row("", f"    └ #{c.pr}", "", f"[dim]{title}[/]" + tag)
+                t.add_row("", f"    └ #{c.pr}", "", f"[dim]{escape(title)}[/]" + tag)
     console.print(t)
 
     nxt = sv.next_auto_stage
