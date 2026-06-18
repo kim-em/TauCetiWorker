@@ -371,6 +371,14 @@ def _read_json_file(path: Path) -> Optional[dict]:
         return None
 
 
+def claude_dir(home: Path) -> Path:
+    """Where Claude Code keeps its config + credentials. $CLAUDE_CONFIG_DIR wins (the same var Claude
+    Code itself honors for a non-default config location, e.g. switching personal/work accounts); else
+    the conventional <home>/.claude. Isolation repoints $CLAUDE_CONFIG_DIR at the per-worker copy."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(d) if d else home / ".claude"
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     """Non-corrupting credential-file write: a UNIQUE temp file in the same dir (a concurrent writer
     can't consume ours), preserve the existing mode (else 0600), fsync, then atomic rename. Raises on
@@ -511,13 +519,14 @@ class Quota:
 
     # --- Claude ------------------------------------------------------------
     def _claude_creds(self) -> Optional[dict]:
-        d = _read_json_file(self.cfg.home / ".claude" / ".credentials.json")
+        d = _read_json_file(claude_dir(self.cfg.home) / ".credentials.json")
         return (d or {}).get("claudeAiOauth") if d else None
 
     def claude(self) -> Provider:
         oauth = self._claude_creds()
         if not oauth:
-            return Provider("claude", False, None, error="no ~/.claude/.credentials.json")
+            return Provider("claude", False, None,
+                            error=f"no {claude_dir(self.cfg.home) / '.credentials.json'}")
         payload = self._cached_raw("claude")
         if payload is None:
             tok = oauth.get("accessToken")
@@ -552,7 +561,7 @@ class Quota:
             "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers"})
         if code != 200 or not resp.get("access_token"):
             return None
-        path = self.cfg.home / ".claude" / ".credentials.json"
+        path = claude_dir(self.cfg.home) / ".credentials.json"
         full = _read_json_file(path) or {}    # re-read just before writing (minimize the clobber window)
         block = full.setdefault("claudeAiOauth", {})
         block["accessToken"] = resp["access_token"]
@@ -1356,6 +1365,13 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         # at `pi: command not found`. Fail early with a clear pointer rather than after staging.
         raise Die(f"--agent {cred_model} requires --host until kim-em/bubble#299 lands pi in the bubble "
                   f"image (set TAUCETI_ALLOW_OPENROUTER_BUBBLE=1 to override once it has)")
+    if cred_model == "claude" and claude_dir(cfg.home) != cfg.home / ".claude":
+        # bubble seeds Claude creds from <home>/.claude, not $CLAUDE_CONFIG_DIR, so the pacer would
+        # measure one account while the in-bubble claude runs another. --isolate-home avoids this (it
+        # copies the creds into the worker's <home>/.claude and repoints $CLAUDE_CONFIG_DIR there).
+        raise Die(f"$CLAUDE_CONFIG_DIR={claude_dir(cfg.home)} can't reach the bubble (it seeds Claude "
+                  f"creds from {cfg.home / '.claude'}). Re-run with --host, or with --isolate-home to "
+                  f"copy those creds into the worker home.")
     env = ensure_bubble_home(cfg)
     rounddir = cfg.state / "bubble-round"
     import shutil
@@ -2055,28 +2071,43 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credential refreshes can't race other workers or the
     operator (Codex review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface
-    from the real home; copies the mutable Claude/Codex auth files in ONCE (thereafter the worker
-    refreshes within its own copy). Returns the worker home and sets $HOME. Child rounds inherit it."""
+    from the real config dir; copies the mutable Claude/Codex auth files in ONCE (thereafter the worker
+    refreshes within its own copy). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is
+    repointed there, so both the pacer and the spawned claude read the isolated creds even when the
+    operator's real config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit."""
     import shutil
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    real_claude = claude_dir(real)   # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
     home = HERE / "state" / wid / "home"
-    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    iso_claude = home / ".claude"
+    iso_claude.mkdir(parents=True, exist_ok=True)
     (home / ".codex").mkdir(parents=True, exist_ok=True)
     for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
-        src, dst = real / ".claude" / item, home / ".claude" / item
+        src, dst = real_claude / item, iso_claude / item
         if src.exists() and not dst.exists():
             try:
                 dst.symlink_to(src)
             except OSError:
                 pass
     for f in (".credentials.json", ".gist-id", ".gist-encryption-key"):
-        src, dst = real / ".claude" / f, home / ".claude" / f
+        src, dst = real_claude / f, iso_claude / f
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
+    # The copies are once-only (thereafter the worker refreshes its own tokens), so a reused --worker-id
+    # stays pinned to whatever account it was first seeded from. Record the source and warn if it changes,
+    # rather than silently pacing/running the stale account.
+    marker = iso_claude / ".tauceti-creds-source"
+    if marker.exists():
+        if marker.read_text().strip() != str(real_claude):
+            log(f"WARNING: worker '{wid}' keeps Claude creds first copied from {marker.read_text().strip()} "
+                f"(not {real_claude}); use a fresh --worker-id to switch accounts.")
+    else:
+        marker.write_text(str(real_claude))
     src, dst = real / ".codex" / "auth.json", home / ".codex" / "auth.json"
     if src.exists() and not dst.exists():
         shutil.copy2(src, dst)
     os.environ["HOME"] = str(home)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)   # so claude_dir() + the spawned claude agree
     log(f"isolated HOME={home} (worker '{wid}')")
     return home
 
@@ -2334,8 +2365,8 @@ def cmd_doctor(args) -> int:
     rows.append(("lake", _have("lake"), "only --host authoring builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("codex creds", (cfg.home / ".codex" / "auth.json").exists(), "~/.codex/auth.json"))
-    rows.append(("claude creds", (cfg.home / ".claude" / ".credentials.json").exists(),
-                 "~/.claude/.credentials.json"))
+    claude_creds = claude_dir(cfg.home) / ".credentials.json"
+    rows.append(("claude creds", claude_creds.exists(), str(claude_creds)))
     bad = 0
     print(f"tauceti doctor — worker '{cfg.wid}'")
     for name, ok, note in rows:

@@ -133,7 +133,10 @@ exits non-zero). Pass `--stream` to watch it live on the terminal instead.
 
 `tauceti` paces itself against your subscription quota with no setup. It reads the
 credential files the official CLIs already maintain (`~/.claude/.credentials.json`,
-`~/.codex/auth.json`) and queries each provider's usage endpoint. The rule is
+`~/.codex/auth.json`) and queries each provider's usage endpoint. It honors
+`$CLAUDE_CONFIG_DIR` for the Claude credentials, so personal/work account switching
+is paced correctly (a bubble can't see that var, so `tauceti` says so and points you
+at `--host`). The rule is
 "keep usage under elapsed time": a provider is available while `used% ≤ elapsed%`
 on both its 5-hour and its weekly window. Auto mode prefers Codex (to spare the
 scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
@@ -205,5 +208,5 @@ up.
 - `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
   these on `PATH` inside a round, so they stay shell.
 - `prompts/*.md`: the per-task agent prompts.
-- `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`.
+- `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`, `claude_config_dir.py`.
 - `checkouts/`, `state/`, `logs/`: runtime only, git-ignored.
