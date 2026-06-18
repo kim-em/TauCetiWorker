@@ -1821,6 +1821,17 @@ def _sync_review_outbox(w: "Worker", pr: int) -> int:
     outbox = w.cfg.store_dir / "outbox"
     if not outbox.is_dir() or not any(p.is_file() for p in outbox.rglob("*")):
         return 0
+    # A contributor without write access to TauCetiData (anyone but the maintainer/worker identity)
+    # cannot push records there. Don't fail their round over it: the review IS posted and the records
+    # are kept in the local outbox — an external review will count once contributor-publishing lands.
+    # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
+    # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
+    perm = subprocess.run(["gh", "api", "repos/FormalFrontier/TauCetiData", "--jq", ".permissions.push"],
+                          capture_output=True, text=True)
+    if perm.returncode == 0 and perm.stdout.strip() == "false":
+        log(f"  review #{pr}: no write access to TauCetiData — review posted, records kept in "
+            f"{outbox} (they won't count for auto-merge until contributor-publishing lands)")
+        return 0
     eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")   # a local engine checkout, for pre-merge tests
     if eng:
         return subprocess.run([sys.executable, str(Path(eng) / "runner" / "cli.py"),
