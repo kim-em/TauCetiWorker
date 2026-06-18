@@ -2451,6 +2451,16 @@ def isolate_home(wid: str) -> Path:
     src, dst = real / ".codex" / "auth.json", home / ".codex" / "auth.json"
     if src.exists() and not dst.exists():
         shutil.copy2(src, dst)
+    # Keep host-side gh and git working under the isolated $HOME: the survey's `gh pr list` and host
+    # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
+    # point them back at the operator's real config rather than an empty isolated one. Respect a value
+    # the operator already exported. Children inherit these, so the early-return path above is covered.
+    gh_cfg = real / ".config" / "gh"
+    if gh_cfg.is_dir():
+        os.environ.setdefault("GH_CONFIG_DIR", str(gh_cfg))
+    git_cfg = real / ".gitconfig"
+    if git_cfg.exists():
+        os.environ.setdefault("GIT_CONFIG_GLOBAL", str(git_cfg))
     os.environ["HOME"] = str(home)
     os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)   # so claude_dir() + the spawned claude agree
     log(f"isolated HOME={home} (worker '{wid}')")

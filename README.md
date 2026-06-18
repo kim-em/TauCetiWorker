@@ -201,7 +201,9 @@ tauceti work --loop --worker-id bob   --only roadmap
 `--worker-id` pins a stable name and is the only knob you need: any id other than
 `default` also gives that worker its own `$HOME` (symlinking your read-only Claude
 tool surface, copying the mutable auth in once) so their credential refreshes don't
-race. (`--isolate-home` still exists, but only to force that same isolation for the
+race. Your `gh` and `git` config stays shared, not isolated (it doesn't refresh-race,
+and the host survey and pushes need it), so the worker still authenticates as you.
+(`--isolate-home` still exists, but only to force that same isolation for the
 `default` id; a distinct id already implies it.) The workers coordinate through
 GitHub, not through each other: the per-PR scoreboard comment is the shared review
 state, `git-safe-push` / `gh-safe-pr-create` compare-and-swap so no one clobbers
