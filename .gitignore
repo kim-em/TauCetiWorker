@@ -11,3 +11,6 @@ __pycache__/
 # Build artifacts
 /dist/
 *.egg-info/
+
+# uv lockfile — generated for the single-file script, not source.
+/uv.lock
