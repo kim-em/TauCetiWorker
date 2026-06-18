@@ -1593,14 +1593,27 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         return 0
     fn = {"review": do_review, "fix": do_fix, "fix-ci": do_fix_ci, "rebase": do_rebase,
           "bump": do_bump, "roadmap": do_roadmap}[stage]
+    # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
+    # with which agent and sandbox — the same line for every stage.
+    where = "bubble" if bubble else "host"
+    if c.pr:
+        what = f"PR #{c.pr}  https://github.com/{TAUCETI}/pull/{c.pr}"
+    elif stage == "roadmap":
+        what = f"new PR (focus: {c.reason or 'any'})"
+    else:
+        what = c.reason or (c.head[:12] if c.head else "")
+    log(f"→ {stage.upper()}: {what}   [agent={opts.work_model}, sandbox={where}]")
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     rc = fn(w, sv, c, opts, bubble)
-    # A model round that exits 0 but leaves no mark on GitHub did no real work (e.g. a sandboxed
-    # agent that never started or was cut off before producing output). Don't report it as success —
-    # surface it as no-progress so the loop backs off instead of looping on a silent no-op.
+    # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
+    # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
+    # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
     if rc == 0 and stage in PROGRESS_GUARDED and not _progressed(w, c, pre):
-        raise NoProgress(f"{stage}{' #' + str(c.pr) if c.pr else ''} exited 0 but left no mark on "
-                         "GitHub (no push, new PR, or comment) — no-progress, not a false success")
+        tgt = f" #{c.pr}" if c.pr else ""
+        raise NoProgress(
+            f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
+            f"comment). Most often another worker pushed the branch first (safe-push declines rather "
+            f"than clobber) or the agent declined to act — not a failure. Transcript: {w.cfg.logdir}")
     return rc
 
 
@@ -1613,7 +1626,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
     nrnd = w.rs.review_rounds(pr, w.counters)
-    log(f"reviewing PR #{pr} @ {head[:12]} (review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget, reviewers={reviewers})")
+    log(f"  review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget @ {head[:12]}, reviewers={reviewers}")
     if bubble:
         rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
     else:
@@ -1693,7 +1706,6 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     if not fetch_ref(REVIEW, refs / "review"):
         raise Die(f"fetch {REVIEW} failed")
     os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
-    log(f"roadmap round with {opts.agent_name} ({'bubble' if bubble else 'host'}; focus: {focus})")
     if bubble:
         return run_in_bubble(w, TAUCETI, fill_prompt(
             HERE / "prompts" / "roadmap.md", FOCUS=focus, AGENT=opts.agent_name,
