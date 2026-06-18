@@ -123,7 +123,9 @@ agent has your full credentials and network, so keep it for trusted or local
 runs. Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime;
 if you don't have one, `tauceti doctor` says so and you run with `--host`. You
 don't have to install bubble yourself, `tauceti` fetches it with `uvx` when it
-isn't already on your `PATH`.
+isn't already on your `PATH`. On `--host` you can point at a non-default `claude`
+with `TAUCETI_CLAUDE_CMD` (a sandbox wrapper, a differently-named build, ...); it's
+split as a shell word list and the usual flags are appended.
 
 The agent's conversation transcript is noisy, so by default a round redirects it
 to a timestamped file under `logs/` and prints the path (tailing it if the agent

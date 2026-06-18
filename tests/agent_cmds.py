@@ -29,6 +29,17 @@ check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"],
 # PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
+
+# $TAUCETI_CLAUDE_CMD wraps/replaces the host claude executable; the standard flags are still appended,
+# and an empty / whitespace-only value falls back to bare `claude` rather than a broken argv.
+_saved = tc.CLAUDE_CMD
+tc.CLAUDE_CMD = "my-wrapper --flag claude"
+a, _ = tc.host_agent_argv(P, "claude")
+check("claude override", a, ["my-wrapper", "--flag", "claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
+tc.CLAUDE_CMD = "   "
+a, _ = tc.host_agent_argv(P, "claude")
+check("claude override blank falls back", a, ["claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
+tc.CLAUDE_CMD = _saved
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
 

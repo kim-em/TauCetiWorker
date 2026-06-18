@@ -113,6 +113,11 @@ OPENROUTER_MODELS = {
 }
 AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek", "minimax": "MiniMax"}
 PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
+# $TAUCETI_CLAUDE_CMD overrides the `claude` executable for host rounds (a sandbox wrapper, a
+# differently-named build, ...); it's split as a shell word list and the standard
+# -p/--model/--permission flags are still appended. Matches PI_RUN / $TAUCETI_BUBBLE /
+# $TAUCETI_CODEX_MODEL. (Bubble rounds run claude inside the container, so this is --host only.)
+CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "roadmap"]
@@ -1202,7 +1207,8 @@ def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
         argv = [PI_RUN, "openrouter", OPENROUTER_MODELS[work_model], "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
         env.pop("ANTHROPIC_API_KEY", None)
-        argv = ["claude", "-p", prompt, "--model", "opus", "--dangerously-skip-permissions"]
+        base = shlex_split(CLAUDE_CMD) or ["claude"]   # empty / whitespace-only falls back, not a broken argv
+        argv = [*base, "-p", prompt, "--model", "opus", "--dangerously-skip-permissions"]
     return argv, env
 
 
