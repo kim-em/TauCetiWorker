@@ -2041,22 +2041,25 @@ def _read_key() -> str:
     old = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":   # ESC: maybe a bare Escape, maybe an arrow (ESC [ A / ESC O A). The rest of
-            seq = ""       # the sequence arrives together, so a short poll distinguishes the two.
+        # Read the raw fd, NOT sys.stdin: a buffered TextIOWrapper slurps the whole arrow sequence on
+        # the first read, leaving the "[A" tail in its private buffer where select() can't see it — so
+        # after ESC the fd looks empty and arrows get misread as a bare ESC then stray '[' / 'A' keys.
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":   # ESC: bare Escape, or an arrow (ESC [ A / ESC O A). The tail arrives
+            seq = b""       # together, so a short poll on the fd distinguishes the two.
             while len(seq) < 2 and select.select([fd], [], [], 0.05)[0]:
-                seq += sys.stdin.read(1)
-            return {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT",
-                    "OA": "UP", "OB": "DOWN", "OC": "RIGHT", "OD": "LEFT"}.get(seq, "ESC")
+                seq += os.read(fd, 1)
+            return {b"[A": "UP", b"[B": "DOWN", b"[C": "RIGHT", b"[D": "LEFT",
+                    b"OA": "UP", b"OB": "DOWN", b"OC": "RIGHT", b"OD": "LEFT"}.get(seq, "ESC")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)   # back to cooked mode for any input() that follows
-    if ch in ("\r", "\n"):
+    if ch in (b"\r", b"\n"):
         return "\n"
-    if ch == "\x03":
+    if ch == b"\x03":
         raise KeyboardInterrupt
-    if ch == "" or ch == "\x04":
+    if ch in (b"", b"\x04"):
         raise EOFError
-    return ch
+    return ch.decode("utf-8", "replace")
 
 
 def cmd_tui(args) -> int:
