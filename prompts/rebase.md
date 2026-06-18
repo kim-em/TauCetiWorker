@@ -7,12 +7,12 @@ You are resolving merge conflicts on pull request #__PR__ of FormalFrontier/TauC
   git merge origin/main      # (or: git rebase origin/main — either is fine; merge is simpler to resolve)
   ```
 - Resolve every conflict on its merits:
-  - **`TauCeti.lean` (the root import list)** is the usual culprit: several PRs each add an `import TauCeti.…` line, so they collide. Resolve by taking the UNION of both sides' imports — keep every import from `main` AND your PR's new one — and keep the list alphabetically ordered. Never drop an existing import.
+  - **`TauCeti.lean` (the root import list)** is now auto-managed — it is regenerated and committed automatically on `main` after each merge, and PRs no longer hand-edit it, so it should NOT appear among your conflicts. If it somehow does, do not hand-merge the import lines: take `main`'s version (or regenerate it) rather than reconstructing it by hand.
   - **A source file under `TauCeti/`**: resolve so both the upstream change and your PR's intent are preserved. If `main` now provides something your PR duplicated, prefer the upstream version and drop the duplicate.
 - Do NOT discard upstream work to "win" a conflict, and do NOT weaken or delete your PR's real content to dodge one. If a conflict is genuinely irreconcilable (your PR's target no longer makes sense because `main` subsumed it), stop and say so in your report rather than forcing a merge.
 
 ## Rules of the repo (hard constraints)
-- Code goes under `TauCeti/`. You MAY edit the root `TauCeti.lean` (that is expected here). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
+- Code goes under `TauCeti/`. Do NOT hand-edit the root `TauCeti.lean` — it is auto-managed (see above). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
@@ -34,4 +34,4 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which files conflicted, how you resolved each (for `TauCeti.lean`, confirm you unioned the imports), and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: which files conflicted, how you resolved each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.

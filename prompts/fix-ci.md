@@ -17,7 +17,7 @@ You are fixing FAILING CI on pull request #__PR__ of FormalFrontier/TauCeti, an 
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if almost nothing survives, stop and report that rather than pushing an empty shell.
 
 ## Rules of the repo (hard constraints)
-- Code goes under `TauCeti/`. You MAY also edit the root `TauCeti.lean` to add a missing `import TauCeti.Your.Module` (keep the import list alphabetically ordered). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
+- Code goes under `TauCeti/`. Do NOT edit the root `TauCeti.lean`: it is regenerated and committed automatically on `main` after merge, so there is no need to touch it. Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 

@@ -38,7 +38,7 @@ A round does exactly one unit of work: the first of these that applies.
 
 | Step | What it does |
 |------|--------------|
-| **Rebase** | Resolve one of our conflicting PRs (usually the root `TauCeti.lean` import line, after a sibling merged first). |
+| **Rebase** | Resolve one of our conflicting PRs — a genuine content conflict under `TauCeti/` after a sibling merged first (the root `TauCeti.lean` is auto-synced on `main`, so it no longer collides). |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. |
 | **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
