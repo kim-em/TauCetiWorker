@@ -1766,7 +1766,10 @@ def quota_line(snap: dict) -> str:
     return "   ".join(parts) if parts else "quota: (not checked)"
 
 
-def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None) -> None:
+def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
+                  selected: Optional[str] = None) -> None:
+    """Render the survey table. `selected` (a kind name) is highlighted as the arrow-key cursor; pass
+    None (the default, e.g. from `tauceti status`) for no cursor."""
     from rich.table import Table
     from rich.panel import Panel
 
@@ -1787,11 +1790,14 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None) -> Non
     t.add_column("READY", justify="right"); t.add_column("SAMPLE / NOTE")
     for name in ALLOWED_TASKS:
         num = KIND_BY_NAME[name]
+        is_sel = name == selected
+        style = "reverse" if is_sel else None          # the arrow-key cursor
+        kind_cell = ("▸ " if is_sel else "  ") + name   # marker survives even without color
         if name == "roadmap":
             if sv.roadmap_backpressure:
-                t.add_row(num, "roadmap", "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})")
+                t.add_row(num, kind_cell, "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})", style=style)
             else:
-                t.add_row(num, "roadmap", "∞", f"focus: {sv.roadmap_focus}")
+                t.add_row(num, kind_cell, "∞", f"focus: {sv.roadmap_focus}", style=style)
             continue
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
@@ -1799,7 +1805,7 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None) -> Non
         note = (_sample(wk.actionable) or "") + extra
         if name == "bump" and not wk.actionable and not wk.suppressed:
             note = "no broken hopscotch bump"
-        t.add_row(num, name, ready, note)
+        t.add_row(num, kind_cell, ready, note, style=style)
     console.print(t)
 
     nxt = sv.next_auto_stage
@@ -2028,13 +2034,20 @@ def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool,
 
 def _read_key() -> str:
     """Read a single keypress from the tty WITHOUT waiting for Enter (cbreak mode), so the dashboard
-    reacts live. Returns '\\n' for Enter; raises EOFError on Ctrl-D and KeyboardInterrupt on Ctrl-C."""
-    import termios, tty
+    reacts live. Returns '\\n' for Enter, 'UP'/'DOWN'/'LEFT'/'RIGHT' for arrow keys, 'ESC' for a bare
+    Escape; raises EOFError on Ctrl-D/EOF and KeyboardInterrupt on Ctrl-C."""
+    import termios, tty, select
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
         ch = sys.stdin.read(1)
+        if ch == "\x1b":   # ESC: maybe a bare Escape, maybe an arrow (ESC [ A / ESC O A). The rest of
+            seq = ""       # the sequence arrives together, so a short poll distinguishes the two.
+            while len(seq) < 2 and select.select([fd], [], [], 0.05)[0]:
+                seq += sys.stdin.read(1)
+            return {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT",
+                    "OA": "UP", "OB": "DOWN", "OC": "RIGHT", "OD": "LEFT"}.get(seq, "ESC")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)   # back to cooked mode for any input() that follows
     if ch in ("\r", "\n"):
@@ -2053,22 +2066,26 @@ def cmd_tui(args) -> int:
     console = Console()
     cfg = Config.resolve(None)
 
-    def snapshot() -> "Survey":
+    def compute():
         gh = GitHub()
         sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
         _, q = Quota(cfg).choose(None)
-        render_survey(sv, console, q)
-        return sv
+        return sv, q
 
     if not sys.stdin.isatty():
-        snapshot()
+        sv, q = compute()
+        render_survey(sv, console, q)
         console.print("[dim](not a TTY — snapshot only; use `tauceti status [--json]` in scripts)[/]")
         return 0
 
-    model_dial, host = "auto", False
+    model_dial, host, sel = "auto", False, None
     while True:
         console.clear()
-        sv = snapshot()
+        sv, q = compute()
+        if sel is None:                    # default the cursor to the kind auto would run next
+            nxt = sv.next_auto_stage
+            sel = ALLOWED_TASKS.index(nxt) if nxt in ALLOWED_TASKS else 0
+        render_survey(sv, console, q, selected=ALLOWED_TASKS[sel])
         sandbox = "host" if host else "bubble"
         # Brackets in the key hints are escaped (\\[) so Rich renders them literally instead of
         # parsing [s]/[r]/etc. as style markup. Single keypress, no Enter — the view updates in place.
@@ -2076,18 +2093,22 @@ def cmd_tui(args) -> int:
             f"\n  [bold]model[/]={model_dial}   [bold]sandbox[/]={sandbox}   "
             f"[bold]roadmap focus[/]={roadmap_focus() or 'all areas'}"
             "   [dim](press a key — no Enter needed)[/]\n"
-            "  [bold cyan]\\[Enter][/] one auto round        [bold cyan]\\[1-6][/]  one round of that KIND (the # column above)\n"
-            "  [bold cyan]\\[l][/]     loop (auto)           [bold cyan]\\[L][/]    focused loop of one KIND\n"
-            "  [bold cyan]\\[m][/]     cycle model           [bold cyan]\\[s][/]    toggle sandbox (bubble/host)\n"
-            "  [bold cyan]\\[f][/]     set roadmap focus     [bold cyan]\\[r][/]    refresh\n"
-            "  [bold cyan]\\[c][/]     copy launch command   [bold cyan]\\[q][/]    quit")
+            "  [bold cyan]\\[↑/↓][/]  move cursor           [bold cyan]\\[Enter][/] one round of selected kind\n"
+            "  [bold cyan]\\[1-6][/]  run that kind now      [bold cyan]\\[l][/] loop (auto)   [bold cyan]\\[L][/] loop selected kind\n"
+            "  [bold cyan]\\[m][/]    cycle model           [bold cyan]\\[s][/]     toggle sandbox (bubble/host)\n"
+            "  [bold cyan]\\[f][/]    set roadmap focus     [bold cyan]\\[r][/]     refresh\n"
+            "  [bold cyan]\\[c][/]    copy launch command   [bold cyan]\\[q][/]     quit")
         try:
             choice = _read_key()
         except (EOFError, KeyboardInterrupt):
             return 0
         if choice == "q":
             return 0
-        if choice == "r":
+        if choice == "UP":
+            sel = (sel - 1) % len(ALLOWED_TASKS); continue
+        if choice == "DOWN":
+            sel = (sel + 1) % len(ALLOWED_TASKS); continue
+        if choice in ("r", "ESC"):
             continue                       # redraw with fresh survey
         if choice == "m":                  # cycle model in place
             order = ["auto", "codex", "claude", "deepseek", "minimax"]
@@ -2113,25 +2134,13 @@ def cmd_tui(args) -> int:
             except (EOFError, KeyboardInterrupt):
                 return 0
             continue
-        if choice in ("\n", "l") or choice in KIND_KEYS or choice == "L":
-            loop = choice in ("l", "L")
-            only = None
+        if choice in ("\n", "l", "L") or choice in KIND_KEYS:
+            # Enter / L / a digit all act on the cursor; a digit moves the cursor there first.
+            # 'l' loops the auto cascade; 'L' loops just the selected kind; Enter/digit run one round.
             if choice in KIND_KEYS:
-                only = KIND_KEYS[choice]
-            elif choice == "L":
-                console.print("  loop which KIND? (rebase/review/fix/fix-ci/bump/roadmap) > ", end="")
-                try:
-                    k = input().strip()
-                except (EOFError, KeyboardInterrupt):
-                    continue
-                if k not in ALLOWED_TASKS:
-                    console.print(f"[red]unknown kind '{k}'[/] (press any key)")
-                    try:
-                        _read_key()
-                    except (EOFError, KeyboardInterrupt):
-                        return 0
-                    continue
-                only = k
+                sel = ALLOWED_TASKS.index(KIND_KEYS[choice])
+            loop = choice in ("l", "L")
+            only = None if choice == "l" else ALLOWED_TASKS[sel]
             cmd = launch_cmd(only, model_dial, host, loop, roadmap_focus())
             if loop:
                 _launch_detached(cfg, cmd, console)
