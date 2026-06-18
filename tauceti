@@ -376,6 +376,51 @@ def _read_json_file(path: Path) -> Optional[dict]:
         return None
 
 
+def _claude_keychain_creds() -> Optional[dict]:
+    """macOS only: read Claude Code's OAuth blob from the login Keychain, where the CLI keeps creds
+    instead of <config>/.credentials.json. Returns the same {"claudeAiOauth": {…}} dict as the file,
+    or None when absent / locked / malformed.
+
+    READ-ONLY on purpose — never writes the Keychain. The Keychain is one per-login-user store shared
+    with the operator's interactive claude, and its single-use OAuth refresh token rotates on refresh.
+    If the pacer refreshed and wrote it back, it would rotate the token out from under the operator's
+    claude and log it out. So on token expiry the pacer just reports Claude unavailable for the cycle;
+    the spawned claude refreshes the Keychain on its own runs.
+
+    The item's service name is "Claude Code-credentials" with the login user as the account; older CLI
+    builds stored it without an account, so fall back to a service-only search
+    (https://github.com/anthropics/claude-code/issues/9403)."""
+    service = "Claude Code-credentials"
+    user = os.environ.get("USER") or ""
+    attempts = []
+    if user:
+        attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
+    attempts.append(["security", "find-generic-password", "-s", service, "-w"])
+    for cmd in attempts:
+        try:
+            # Bound the read: an unattended GUI ACL prompt would otherwise block the pacer indefinitely
+            # (headless/SSH returns 36 right away instead). On timeout, treat Claude as unavailable.
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        except OSError:
+            return None
+        except subprocess.TimeoutExpired:
+            log("claude creds: reading the login Keychain timed out (a Keychain access prompt may be "
+                "waiting unanswered); grant access once, or run `security unlock-keychain`. Treating "
+                "Claude as unavailable.")
+            return None
+        if p.returncode == 0:
+            try:
+                return json.loads(p.stdout.strip())
+            except json.JSONDecodeError:
+                return None
+        if p.returncode == 36:   # errSecInteractionNotAllowed — Keychain locked (typical under SSH/headless)
+            log("claude creds: the login Keychain is locked (errSecInteractionNotAllowed); run "
+                "`security unlock-keychain` to let the pacer read them. Treating Claude as unavailable.")
+            return None
+        # else (e.g. 44 = errSecItemNotFound for this service/account) → try the next attempt
+    return None
+
+
 def claude_dir(home: Path) -> Path:
     """Where Claude Code keeps its config + credentials. $CLAUDE_CONFIG_DIR wins (the same var Claude
     Code itself honors for a non-default config location, e.g. switching personal/work accounts); else
@@ -523,15 +568,30 @@ class Quota:
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 
     # --- Claude ------------------------------------------------------------
-    def _claude_creds(self) -> Optional[dict]:
+    def _claude_creds(self) -> tuple[Optional[dict], bool]:
+        """Returns (oauth_block, from_keychain). The block is Claude Code's {accessToken, refreshToken,
+        expiresAt, …}, from <config>/.credentials.json or — on macOS, where the CLI keeps creds in the
+        login Keychain rather than a file — from the Keychain. from_keychain marks creds we must NOT
+        refresh/persist (see _claude_keychain_creds)."""
         d = _read_json_file(claude_dir(self.cfg.home) / ".credentials.json")
-        return (d or {}).get("claudeAiOauth") if d else None
+        block = d.get("claudeAiOauth") if d else None
+        if block:
+            return block, False
+        # No usable on-disk block (file absent, or present but missing/empty claudeAiOauth). On macOS the
+        # creds live in the login Keychain instead, so fall back to a read-only Keychain lookup there.
+        if sys.platform == "darwin":
+            kc = _claude_keychain_creds()
+            if kc:
+                return kc.get("claudeAiOauth"), True
+        return None, False
 
     def claude(self) -> Provider:
-        oauth = self._claude_creds()
+        oauth, from_keychain = self._claude_creds()
         if not oauth:
-            return Provider("claude", False, None,
-                            error=f"no {claude_dir(self.cfg.home) / '.credentials.json'}")
+            err = f"no {claude_dir(self.cfg.home) / '.credentials.json'}"
+            if sys.platform == "darwin":
+                err += ' (and no "Claude Code-credentials" Keychain entry)'
+            return Provider("claude", False, None, error=err)
         payload = self._cached_raw("claude")
         if payload is None:
             tok = oauth.get("accessToken")
@@ -544,6 +604,12 @@ class Quota:
             except GitHubError as e:
                 return Provider("claude", False, None, error=str(e))
             if code == 401:
+                if from_keychain:
+                    # Keychain creds are read-only on purpose: a refresh rotates the single-use refresh
+                    # token and writes the Keychain first, which would log out the operator's interactive
+                    # claude. Sit out this cycle; the spawned claude refreshes the Keychain on its own runs.
+                    return Provider("claude", False, None,
+                                    error="claude token expired (Keychain; refresh left to claude)")
                 tok = self._refresh_claude(oauth)
                 if not tok:
                     return Provider("claude", False, None, error="claude 401 (refresh failed)")
@@ -2076,7 +2142,12 @@ def isolate_home(wid: str) -> Path:
     from the real config dir; copies the mutable Claude/Codex auth files in ONCE (thereafter the worker
     refreshes within its own copy). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is
     repointed there, so both the pacer and the spawned claude read the isolated creds even when the
-    operator's real config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit."""
+    operator's real config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
+
+    macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
+    Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
+    repointing is a no-op there: the spawned claude reads the shared Keychain regardless, and the pacer's
+    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature."""
     import shutil
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
     real_claude = claude_dir(real)   # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
@@ -2368,7 +2439,12 @@ def cmd_doctor(args) -> int:
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("codex creds", (cfg.home / ".codex" / "auth.json").exists(), "~/.codex/auth.json"))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
-    rows.append(("claude creds", claude_creds.exists(), str(claude_creds)))
+    if claude_creds.exists() or sys.platform != "darwin":
+        rows.append(("claude creds", claude_creds.exists(), str(claude_creds)))
+    else:
+        # macOS keeps Claude creds in the login Keychain, not a file; the pacer reads them there.
+        rows.append(("claude creds", _claude_keychain_creds() is not None,
+                     'macOS login Keychain ("Claude Code-credentials")'))
     bad = 0
     print(f"tauceti doctor — worker '{cfg.wid}'")
     for name, ok, note in rows:

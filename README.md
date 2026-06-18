@@ -138,7 +138,13 @@ credential files the official CLIs already maintain (`~/.claude/.credentials.jso
 `~/.codex/auth.json`) and queries each provider's usage endpoint. It honors
 `$CLAUDE_CONFIG_DIR` for the Claude credentials, so personal/work account switching
 is paced correctly; bubble honors the same var, so it seeds the matching credentials
-into the sandbox too. The rule is
+into the sandbox too. On macOS, where Claude Code keeps its creds in the login Keychain
+rather than a file, the pacer reads them from the Keychain instead (read-only — it
+never refreshes the Keychain, since that would log out your interactive `claude`; on
+token expiry it just reports Claude unavailable for the cycle, and your next `claude`
+run — interactive, or one `--ignore-quota --agent claude` round — refreshes the
+Keychain so the pacer can read it again). A locked Keychain (headless/SSH) reports
+unavailable with a hint to `security unlock-keychain` first. The rule is
 "keep usage under elapsed time": a provider is available while `used% ≤ elapsed%`
 on both its 5-hour and its weekly window. Auto mode prefers Codex (to spare the
 scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
@@ -191,6 +197,11 @@ state, `git-safe-push` / `gh-safe-pr-create` compare-and-swap so no one clobbers
 another's push, and `claim.sh` hands out branches. Add workers and throughput goes
 up.
 
+On macOS, `--isolate-home` can't isolate Claude's creds: the Keychain is a single
+per-login-user store, not `$HOME`-scoped, so every worker's spawned `claude` reads
+the same shared account regardless. macOS is host-only and single-Claude-account by
+nature; multi-worker isolation there applies to Codex only.
+
 ## What you need
 
 - Always: `gh` (logged in as the account the worker should act as), `git`, `uv`,
@@ -210,5 +221,6 @@ up.
 - `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
   these on `PATH` inside a round, so they stay shell.
 - `prompts/*.md`: the per-task agent prompts.
-- `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`, `claude_config_dir.py`.
+- `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`, `claude_config_dir.py`,
+  `claude_keychain.py`.
 - `checkouts/`, `state/`, `logs/`: runtime only, git-ignored.
