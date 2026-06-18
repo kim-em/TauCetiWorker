@@ -1569,7 +1569,9 @@ def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "Rou
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
     engine would otherwise fetch and run it OFFLINE: the engine itself, the roadmap, and the review
-    store are host→container mounts; `--no-archive` drops the TauCetiData sync. The only traffic that
+    store are host→container mounts; `--no-sync` makes the engine archive review records to the mounted
+    outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
+    TauCetiData host-side afterwards. The only traffic that
     crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
     TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
     Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
@@ -1598,8 +1600,8 @@ def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "Rou
     # uses --repo-dir for its files and an absolute temp workdir).
     inner = ("env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
              f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-             f"--no-mathlib --no-archive --store /opt/review-store --post "
-             f"--reviewer {reviewers} --expect-head {head}")
+             f"--no-mathlib --no-sync --store /opt/review-store --post "
+             f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}")
     # target is the PR so bubble checks it out; prompt unused by the engine.
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts,
                          inner_cmd=inner, cred_model=reviewers)
@@ -1789,14 +1791,42 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
     else:
         rc = subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
-                             str(pr), "--store", str(w.cfg.store_dir), "--post",
-                             "--reviewer", reviewers, "--expect-head", head]).returncode
+                             str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
+                             "--reviewer", reviewers, "--expect-head", head,
+                             "--submitted-by", me()]).returncode
     if rc == 0:
+        # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
+        # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
+        # outbox mean the merge gate can't see this round, so don't report the round as a success.
+        srv = _sync_review_outbox(w, pr)
+        if srv != 0:
+            log(f"  review #{pr}: archived but the TauCetiData sync FAILED — records remain in "
+                f"{w.cfg.store_dir / 'outbox'} (the merge gate can't see this round until they "
+                f"land); a later round retries the drain")
+            w.counters.incr(errkey)
+            return srv
         w.counters.write(errkey, 0)
         w.rs.bust(pr)
     else:
         w.counters.incr(errkey)
     return rc
+
+
+def _sync_review_outbox(w: "Worker", pr: int) -> int:
+    """Drain the worker's review outbox into TauCetiData using the host's gh/git creds. Reviews run
+    with --no-sync (a bubble can't push to TauCetiData), so the host publishes here. Returns the
+    engine rc: nonzero means the push failed after archive.sync's retries (the outbox is preserved
+    write-if-absent, so a later round re-drains it). An empty outbox is a no-op — a round that
+    produced no new records is not a publish failure."""
+    outbox = w.cfg.store_dir / "outbox"
+    if not outbox.is_dir() or not any(p.is_file() for p in outbox.rglob("*")):
+        return 0
+    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")   # a local engine checkout, for pre-merge tests
+    if eng:
+        return subprocess.run([sys.executable, str(Path(eng) / "runner" / "cli.py"),
+                               str(pr), "--sync-only", "--store", str(w.cfg.store_dir)]).returncode
+    return subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
+                           str(pr), "--sync-only", "--store", str(w.cfg.store_dir)]).returncode
 
 
 def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool,
