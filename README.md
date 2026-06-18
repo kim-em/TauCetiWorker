@@ -198,10 +198,13 @@ another's push, and `claim.sh` hands out branches. Add workers and throughput go
 up.
 
 On macOS, Claude Code keeps its creds in the login Keychain rather than a file.
-Bubble rounds still work: the credentials are materialized from the Keychain into
-the sandbox (read-only, so the Keychain is never written; the first round unlocks it
-interactively if it's locked), so each bubble round runs against its own copy. Host
-rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
+Bubble rounds still work: bubble seeds the in-container `claude` from a
+`.credentials.json`, so when one isn't present `tauceti` writes the credential into
+your `$CLAUDE_CONFIG_DIR` (or `~/.claude`) from the Keychain, refreshing it when it's
+missing or expired (read-only on the Keychain, which is never written; the first
+round unlocks it interactively if it's locked). The pacer reads the Keychain
+directly, so it never refreshes that file and never rotates the shared login token.
+Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
 can't give a host worker its own Claude account there; host-mode multi-worker
 isolation on macOS applies to Codex only.
 
