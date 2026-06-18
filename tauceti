@@ -1200,12 +1200,37 @@ def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
     return argv, env
 
 
-def run_agent_host(cwd: Path, prompt: str, work_model: str) -> int:
+def run_agent_host(cwd: Path, prompt: str, work_model: str, logdir: Path) -> int:
     argv, env = host_agent_argv(prompt, work_model)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return subprocess.run(argv, cwd=str(cwd), env=env).returncode
+    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{work_model}")
+
+
+def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str,
+                   cwd: Optional[Path] = None) -> int:
+    """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
+    by default we redirect it to a timestamped file under logdir and print only the path, so the round
+    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
+    On a non-zero exit we always tail the log so failures aren't silent."""
+    cwds = str(cwd) if cwd is not None else None
+    if os.environ.get("TAUCETI_STREAM"):
+        return subprocess.run(argv, cwd=cwds, env=env).returncode
+    logdir.mkdir(parents=True, exist_ok=True)
+    logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    log(f"{label}: output → {logf}  (run with --stream to watch live)")
+    with open(logf, "ab") as f:
+        rc = subprocess.run(argv, cwd=cwds, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
+    if rc != 0:
+        log(f"{label}: exited {rc}; last lines of {logf.name}:")
+        try:
+            tail = logf.read_text(errors="replace").splitlines()[-20:]
+            for line in tail:
+                print("    " + line)
+        except OSError:
+            pass
+    return rc
 
 
 def _shq(s: str) -> str:
@@ -1368,7 +1393,10 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         return 0
 
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))   # pop if we're killed mid-run
-    rc = subprocess.run(argv, env=env).returncode
+    if inner_cmd is None:                             # the work agent — quiet/log it like the host path
+        rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+    else:                                             # review engine / probe — leave its output inline
+        rc = subprocess.run(argv, env=env).returncode
     _bubble_pop(cfg, env)   # don't rely on --ephemeral alone
     return rc
 
@@ -1618,7 +1646,7 @@ def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bo
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         os.environ["TAUCETI_PUSH_EXPECT"] = (rev.stdout.strip() or head)   # CAS against what we checked out
-        rc = run_agent_host(co, prompt, opts.work_model)
+        rc = run_agent_host(co, prompt, opts.work_model, w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
     return rc
@@ -1670,7 +1698,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         raise Die("checkout failed")
     prompt = fill_prompt(HERE / "prompts" / "roadmap.md", FOCUS=focus, AGENT=opts.agent_name,
                          ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"), REVIEW_DIR=str(refs / "review"))
-    return run_agent_host(w.cfg.checkout, prompt, opts.work_model)
+    return run_agent_host(w.cfg.checkout, prompt, opts.work_model, w.cfg.logdir)
 
 
 
@@ -1686,6 +1714,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--agent", choices=AGENTS, default=None,
                    help="which agent to run (default: $TAUCETI_AGENT or auto)")
     p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble)")
+    p.add_argument("--stream", action="store_true",
+                   help="stream the agent's (noisy) conversation log to the terminal; "
+                        "default redirects it to a file under logs/ and prints the path")
     p.add_argument("--roadmap-focus", dest="roadmap_focus", default=None, metavar="AREA",
                    help="roadmap area to steer toward (empty string = all areas); "
                         "overrides $TAUCETI_ROADMAP_FOCUS for this run")
@@ -1884,6 +1915,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # live via roadmap_focus()). Empty string is a meaningful value: "all areas".
     if getattr(args, "roadmap_focus", None) is not None:
         os.environ["TAUCETI_ROADMAP_FOCUS"] = args.roadmap_focus
+    # --stream restores live agent output (default redirects it to a log file). Set in the env so loop
+    # children inherit it.
+    if getattr(args, "stream", False):
+        os.environ["TAUCETI_STREAM"] = "1"
     # --isolate-home must set $HOME BEFORE Config.resolve (so cfg.home + credential paths point at the
     # per-worker copy). Children spawned by the loop inherit $HOME and don't re-isolate.
     if getattr(args, "isolate_home", False):
