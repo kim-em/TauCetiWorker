@@ -183,10 +183,10 @@ the container:
   and the container is ephemeral.
 
 The sandbox itself lives at [kim-em/bubble](https://github.com/kim-em/bubble).
-
-> OpenRouter agents under bubble need `pi` and openrouter.ai egress in the bubble
-> image ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)). Until
-> that lands, run `--agent deepseek|minimax` with `--host`.
+The OpenRouter agents (`--agent deepseek|minimax`) run in the bubble too: the
+image ships [`pi`](https://github.com/badlogic/pi-mono) and allows openrouter.ai
+egress ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)), and the
+key is staged read-only into the container.
 
 ## Many workers at once
 
@@ -194,13 +194,15 @@ Each worker namespaces its state, checkout, review store, and logs by id, so
 several can share a host:
 
 ```bash
-tauceti work --loop --worker-id alice --isolate-home --only review
-tauceti work --loop --worker-id bob   --isolate-home --only roadmap
+tauceti work --loop --worker-id alice --only review
+tauceti work --loop --worker-id bob   --only roadmap
 ```
 
-`--worker-id` pins a stable name. `--isolate-home` gives each worker its own
-`$HOME` (symlinking your read-only Claude tool surface, copying the mutable auth
-in once) so their credential refreshes don't race. The workers coordinate through
+`--worker-id` pins a stable name and is the only knob you need: any id other than
+`default` also gives that worker its own `$HOME` (symlinking your read-only Claude
+tool surface, copying the mutable auth in once) so their credential refreshes don't
+race. (`--isolate-home` still exists, but only to force that same isolation for the
+`default` id; a distinct id already implies it.) The workers coordinate through
 GitHub, not through each other: the per-PR scoreboard comment is the shared review
 state, `git-safe-push` / `gh-safe-pr-create` compare-and-swap so no one clobbers
 another's push, and `claim.sh` hands out branches. Add workers and throughput goes
@@ -217,6 +219,52 @@ Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-h
 can't give a host worker its own Claude account there; host-mode multi-worker
 isolation on macOS applies to Codex only.
 
+## `tauceti work` reference
+
+`tauceti work` does one round and exits; `--loop` runs the driver. The same list
+is in `tauceti work -h`.
+
+| Flag | What it does |
+| --- | --- |
+| `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
+| `--only TASKS` | Restrict the round to a comma list of `rebase,review,fix-ci,fix,bump,roadmap` (default: the whole cascade). |
+| `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax` — see the agent table above. |
+| `--host` | Opt out of the bubble sandbox and run the agent directly on the host. |
+| `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
+| `--roadmap-focus AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
+| `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
+| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its `$HOME`. |
+| `--isolate-home` | Force the per-worker `$HOME` even for the `default` id (a distinct id already implies it). |
+| `--dry-run` | Survey and print the picker's decision; act on nothing. |
+
+### Environment variables
+
+Flags win over these. Most are tuning knobs with sane defaults; you rarely set them.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
+| `TAUCETI_WORKER_ID` | `default` | Default for `--worker-id`. |
+| `TAUCETI_ROADMAP_FOCUS` | `ReductiveGroups` | Default for `--roadmap-focus` (`""` = all areas). |
+| `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
+| `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
+| `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for `--host` rounds; split as a shell word list, the usual flags appended. |
+| `TAUCETI_CODEX_MODEL` | host's configured model | The Codex model to run in the bubble. |
+| `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
+| `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
+| `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on `--host`. |
+| `TAUCETI_BUBBLE` | `bubble` (else `uvx`-fetched) | Override the bubble executable. |
+| `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
+| `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
+| `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
+| `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
+| `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
+| `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
+| `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
+
 ## What you need
 
 - Always: `gh` (logged in as the account the worker should act as), `git`, `uv`,
@@ -225,7 +273,8 @@ isolation on macOS applies to Codex only.
   bubble CLI itself.
 - `--host` authoring: an `elan`/`lake` toolchain on the host.
 - The agents you want: `codex` and/or `claude` logged in, and for
-  `--agent deepseek|minimax`, `pi` plus an exported `OPENROUTER_API_KEY`.
+  `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
+  bubble image; you only need it on the host for `--host` rounds).
 
 `tauceti doctor` checks all of this.
 
