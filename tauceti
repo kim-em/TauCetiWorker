@@ -2173,6 +2173,7 @@ def cmd_doctor(args) -> int:
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
     rows.append(("bubble", _have("bubble"), "default sandbox (fetched on demand if absent)"))
+    rows.append(("incus", _have("incus"), "bubble's container runtime — install it, or use --host"))
     rows.append(("lake", _have("lake"), "only --host authoring builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("codex creds", (cfg.home / ".codex" / "auth.json").exists(), "~/.codex/auth.json"))
@@ -2197,6 +2198,18 @@ def preflight(cfg: Config, opts: "RoundOpts") -> None:
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s))
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die("preflight: --host authoring needs an elan/lake toolchain on PATH (or drop --host)")
+    # bubble (the default sandbox) runs each model on untrusted PR content inside an Incus container.
+    # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";
+    # catch it here with a pointer to the two ways out.
+    uses_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
+    if uses_bubble and not opts.dry_run and not _have("incus"):
+        raise Die(
+            "preflight: the bubble sandbox needs a working Incus runtime, but `incus` is not on PATH.\n"
+            "  bubble runs each model on untrusted PR content inside an Incus container. Either:\n"
+            "    - install Incus (https://linuxcontainers.org/incus/), then re-run; or\n"
+            "    - re-run with --host to skip the sandbox and run on this host directly (the agent then\n"
+            "      has your full gh credentials and network, so use it only on trusted/disposable machines).\n"
+            "  `tauceti doctor` reports this too.")
 
 
 def cli_main() -> int:
