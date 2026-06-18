@@ -32,6 +32,26 @@ script), and every command above works the same. Either way, Ctrl-C stops the
 current round and exits, and `tauceti doctor` checks your environment and tells
 you what's missing.
 
+### The dashboard
+
+Bare `tauceti` opens an interactive dashboard. The table lists each kind of work
+with a number, how many PRs are ready, and a sample; a cursor highlights one row.
+It reacts to single keypresses (no Enter):
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | move the cursor between kinds |
+| `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the focus areas) |
+| `Enter` | run one round of the selected kind |
+| `1`–`6` | run one round of that numbered kind directly |
+| `l` / `L` | loop the auto cascade / loop just the selected kind |
+| `f` | pick the roadmap focus from the available areas |
+| `m` / `s` | cycle the agent / toggle the sandbox (bubble ↔ host) |
+| `r` / `c` / `q` | refresh / copy the launch command / quit |
+
+Over a pipe or with no TTY it prints a one-shot snapshot instead (use `tauceti
+status` in scripts).
+
 ## What a round does
 
 A round does exactly one unit of work: the first of these that applies.
@@ -68,6 +88,11 @@ tauceti work --loop --only bump       # only adapt broken hopscotch bump PRs
 
 The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
 
+Roadmap rounds steer toward one focus area (a subdirectory of the
+[roadmap](https://github.com/FormalFrontier/TauCetiRoadmap)). Set it with
+`--roadmap-focus <area>` (or `TAUCETI_ROADMAP_FOCUS`, or the dashboard's `f`
+key); an empty value means "all areas".
+
 ### Which agent: `--agent`
 
 `--agent` is independent of `--only`, so any kind of work can run on any agent:
@@ -99,6 +124,10 @@ runs. Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime
 if you don't have one, `tauceti doctor` says so and you run with `--host`. You
 don't have to install bubble yourself, `tauceti` fetches it with `uvx` when it
 isn't already on your `PATH`.
+
+The agent's conversation transcript is noisy, so by default a round redirects it
+to a timestamped file under `logs/` and prints the path (tailing it if the agent
+exits non-zero). Pass `--stream` to watch it live on the terminal instead.
 
 ## Pacing against quota
 
