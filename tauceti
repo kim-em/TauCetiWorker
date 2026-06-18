@@ -80,6 +80,15 @@ def roadmap_focus() -> str:
     (children inherit TAUCETI_ROADMAP_FOCUS). Empty string means "all areas"."""
     return os.environ.get("TAUCETI_ROADMAP_FOCUS", ROADMAP_FOCUS)
 
+
+def roadmap_areas(gh) -> list[str]:
+    """The roadmap focus areas a user can steer toward: the subdirectories of the roadmap repo (each
+    holds a README.md + Targets.lean). Listed over the API so the TUI can offer a picker. Returns []
+    if it can't be fetched (the picker then falls back to free-text entry)."""
+    out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap",
+                    '.[] | select(.type=="dir") | .name')
+    return sorted(out.splitlines()) if out else []
+
 # Loop timing (loop.sh). Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))            # seconds between quota checks while waiting
 ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
@@ -1783,10 +1792,12 @@ def quota_line(snap: dict) -> str:
 
 
 def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
-                  selected: Optional[str] = None, expanded: Optional[set] = None) -> None:
+                  selected: Optional[str] = None, expanded: Optional[set] = None,
+                  areas: Optional[list] = None) -> None:
     """Render the survey table. `selected` (a kind name) is highlighted as the arrow-key cursor;
     `expanded` (a set of kind names) get their candidate PRs listed beneath them, one per row, with
-    the PR title. Pass None for both (e.g. from `tauceti status`) for the plain table."""
+    the PR title — and an expanded `roadmap` lists the focus `areas` instead. Pass None for all
+    (e.g. from `tauceti status`) for the plain table."""
     from rich.table import Table
     from rich.panel import Panel
     from rich.markup import escape   # PR titles / focus / errors are external text — escape before markup
@@ -1820,6 +1831,13 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
                 t.add_row(num, kind_cell, "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {focus})", style=style)
             else:
                 t.add_row(num, kind_cell, "∞", f"focus: {focus}", style=style)
+            if name in expanded:                            # list the focus areas, marking the active one
+                if not areas:
+                    t.add_row("", "    └ (areas unavailable)", "", "", style="dim")
+                else:
+                    for a in ["(all areas)"] + areas:
+                        active = a == sv.roadmap_focus or (a == "(all areas)" and sv.roadmap_focus in ("", "any"))
+                        t.add_row("", f"    └ {escape(a)}", "", "[dim]← focus[/]" if active else "")
             continue
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
@@ -2092,6 +2110,34 @@ def _read_key() -> str:
     return ch.decode("utf-8", "replace")
 
 
+def _pick_from_list(console, title: str, options: list[str], current: Optional[str] = None) -> Optional[str]:
+    """Modal arrow-key picker, the same ↑/↓ + Enter feel as the dashboard cursor. Returns the chosen
+    option, or None if cancelled (Esc / q / Ctrl-C)."""
+    from rich.panel import Panel
+    from rich.markup import escape
+    idx = options.index(current) if current in options else 0
+    while True:
+        console.clear()
+        lines = []
+        for i, opt in enumerate(options):
+            row = ("▸ " if i == idx else "  ") + escape(opt) + (" [dim](current)[/]" if opt == current else "")
+            lines.append(f"[reverse]{row}[/]" if i == idx else row)
+        console.print(Panel("\n".join(lines), title=title,
+                            subtitle="↑/↓ move · Enter select · Esc cancel"))
+        try:
+            k = _read_key()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if k == "UP":
+            idx = (idx - 1) % len(options)
+        elif k == "DOWN":
+            idx = (idx + 1) % len(options)
+        elif k == "\n":
+            return options[idx]
+        elif k in ("ESC", "q"):
+            return None
+
+
 def cmd_tui(args) -> int:
     """Default view: a dashboard of available work + a launcher. NOT a supervisor — launching a loop
     detaches it (coordination lives in GitHub, not here). Over a pipe / no TTY it prints a snapshot."""
@@ -2111,14 +2157,14 @@ def cmd_tui(args) -> int:
         console.print("[dim](not a TTY — snapshot only; use `tauceti status [--json]` in scripts)[/]")
         return 0
 
-    model_dial, host, sel, expanded = "auto", False, None, set()
+    model_dial, host, sel, expanded, areas = "auto", False, None, set(), None
     while True:
         console.clear()
         sv, q = compute()
         if sel is None:                    # default the cursor to the kind auto would run next
             nxt = sv.next_auto_stage
             sel = ALLOWED_TASKS.index(nxt) if nxt in ALLOWED_TASKS else 0
-        render_survey(sv, console, q, selected=ALLOWED_TASKS[sel], expanded=expanded)
+        render_survey(sv, console, q, selected=ALLOWED_TASKS[sel], expanded=expanded, areas=areas)
         sandbox = "host" if host else "bubble"
         # Brackets in the key hints are escaped (\\[) so Rich renders them literally instead of
         # parsing [s]/[r]/etc. as style markup. Single keypress, no Enter — the view updates in place.
@@ -2126,7 +2172,7 @@ def cmd_tui(args) -> int:
             f"\n  [bold]model[/]={model_dial}   [bold]sandbox[/]={sandbox}   "
             f"[bold]roadmap focus[/]={roadmap_focus() or 'all areas'}"
             "   [dim](press a key — no Enter needed)[/]\n"
-            "  [bold cyan]\\[↑/↓][/]  move cursor           [bold cyan]\\[→/←][/] expand / collapse (list PRs)\n"
+            "  [bold cyan]\\[↑/↓][/]  move cursor           [bold cyan]\\[→/←][/] expand / collapse (PRs, or roadmap areas)\n"
             "  [bold cyan]\\[Enter][/] one round of selected [bold cyan]\\[1-6][/] run a kind now   [bold cyan]\\[l][/] loop (auto)   [bold cyan]\\[L][/] loop selected\n"
             "  [bold cyan]\\[m][/]    cycle model           [bold cyan]\\[s][/]     toggle sandbox (bubble/host)\n"
             "  [bold cyan]\\[f][/]    set roadmap focus     [bold cyan]\\[r][/]     refresh\n"
@@ -2142,7 +2188,10 @@ def cmd_tui(args) -> int:
         if choice == "DOWN":
             sel = (sel + 1) % len(ALLOWED_TASKS); continue
         if choice == "RIGHT":
-            expanded.add(ALLOWED_TASKS[sel]); continue       # list this kind's PRs
+            kind = ALLOWED_TASKS[sel]
+            if kind == "roadmap" and not areas:              # fetch lazily; retry while empty so a
+                areas = roadmap_areas(GitHub())              # transient failure ([]) isn't cached forever
+            expanded.add(kind); continue                     # list this kind's PRs (or roadmap areas)
         if choice == "LEFT":
             expanded.discard(ALLOWED_TASKS[sel]); continue   # collapse
         if choice in ("r", "ESC"):
@@ -2154,13 +2203,23 @@ def cmd_tui(args) -> int:
         if choice == "s":                  # toggle sandbox in place
             host = not host
             continue
-        if choice == "f":                  # set roadmap focus (text input; affects display + launched rounds)
-            console.print("  [bold]roadmap focus[/] (blank = all areas) > ", end="")
-            try:
-                val = input().strip()
-            except (EOFError, KeyboardInterrupt):
-                continue
-            os.environ["TAUCETI_ROADMAP_FOCUS"] = val
+        if choice == "f":                  # pick the roadmap focus (affects display + launched rounds)
+            console.print("[dim]  fetching roadmap areas…[/]")
+            if not areas:                                    # retry while empty (transient failure → [])
+                areas = roadmap_areas(GitHub())
+            cur = roadmap_focus()
+            if areas:                      # arrow-key picker over the real areas + "all areas"
+                opts = ["(all areas)"] + areas
+                pick = _pick_from_list(console, "roadmap focus", opts,
+                                       cur if cur else "(all areas)")
+                if pick is not None:
+                    os.environ["TAUCETI_ROADMAP_FOCUS"] = "" if pick == "(all areas)" else pick
+            else:                          # area list unavailable — fall back to typing
+                console.print("  [bold]roadmap focus[/] (blank = all areas) > ", end="")
+                try:
+                    os.environ["TAUCETI_ROADMAP_FOCUS"] = input().strip()
+                except (EOFError, KeyboardInterrupt):
+                    pass
             continue
         if choice == "c":                  # show the launch command, then any key to return
             for loop in (False, True):
