@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["rich", "textual"]  # used ONLY by the TUI/status render; every other path is stdlib.
+# dependencies = ["rich", "textual>=8,<9"]  # used ONLY by the TUI/status render; every other path is stdlib.
 # ///
 """tauceti — the Tau Ceti worker, one self-contained tool.
 
@@ -2527,6 +2527,9 @@ def _dashboard_app(cfg, loader=None):
             self.loading = True
             self._sel_init = False
             self._hdr_row = {}
+            self._load_seq = 0            # guards against a slow refresh landing after a newer one
+            self._saved_focus = prefs.get("roadmap_focus") if isinstance(prefs.get("roadmap_focus"), str) else None
+            self._focus_set_by_user = False   # only a focus chosen via [f] is persisted (not an env override)
             self.followup = None          # ("exec", cmd) read by cmd_tui once the alt-screen is gone
 
         def compose(self) -> ComposeResult:
@@ -2539,19 +2542,25 @@ def _dashboard_app(cfg, loader=None):
             t = self.query_one(DataTable)
             t.add_columns("#", "KIND", "READY", "SAMPLE / NOTE")
             self._render()
-            self._load()                  # first survey fetch (background thread)
-            self.set_interval(90, lambda: self._load())   # keep it live without per-keypress refetches
+            self._refresh()               # first survey fetch (background thread)
+            self.set_interval(90, self._refresh)   # keep it live without per-keypress refetches
 
         # ---- survey load: a background thread, because gh shells out (this was the old lag) ----------
+        def _refresh(self) -> None:
+            self._load_seq += 1           # stamp on the main thread, then hand the token to the worker
+            self._load(self._load_seq)
+
         @work(thread=True, exclusive=True, group="survey")
-        def _load(self) -> None:
+        def _load(self, seq: int) -> None:
             try:
                 sv, q, areas = load()
-                self.call_from_thread(self._loaded, sv, q, areas, None)
+                self.call_from_thread(self._loaded, seq, sv, q, areas, None)
             except Exception as e:        # a fetch error must never tear the UI down
-                self.call_from_thread(self._loaded, None, None, None, repr(e))
+                self.call_from_thread(self._loaded, seq, None, None, None, repr(e))
 
-        def _loaded(self, sv, q, areas, err) -> None:
+        def _loaded(self, seq, sv, q, areas, err) -> None:
+            if seq != self._load_seq:     # a newer refresh superseded this one — ignore the stale result
+                return
             self.loading = False
             self.err = err
             if sv is not None:
@@ -2661,17 +2670,19 @@ def _dashboard_app(cfg, loader=None):
 
         # ---- cursor + expansion (instant, local) ----------------------------------------------------
         def action_cursor_up(self) -> None:
+            self._sel_init = True         # a deliberate move; don't let the first survey snap it back
             self.sel = (self.sel - 1) % len(ALLOWED_TASKS)
             self._render_table()
 
         def action_cursor_down(self) -> None:
+            self._sel_init = True
             self.sel = (self.sel + 1) % len(ALLOWED_TASKS)
             self._render_table()
 
         def action_expand(self) -> None:
             name = ALLOWED_TASKS[self.sel]
             if name == "roadmap" and not self.areas:
-                self._load()              # the area list arrives with the next survey
+                self._refresh()           # the area list arrives with the next survey
             self.expanded.add(name)
             self._render_table()
 
@@ -2691,12 +2702,26 @@ def _dashboard_app(cfg, loader=None):
             self._save_prefs()
 
         def _save_prefs(self) -> None:
-            save_dashboard_prefs(self.cfg, {"model": self.model_dial, "host": self.host,
-                                            "roadmap_focus": roadmap_focus()})
+            # Persist focus only when the operator picked it via [f]; a transient TAUCETI_ROADMAP_FOCUS
+            # override must not become sticky across future runs. Otherwise leave the saved focus as-is.
+            data = {"model": self.model_dial, "host": self.host}
+            if self._focus_set_by_user:
+                self._saved_focus = roadmap_focus()
+            if self._saved_focus is not None:
+                data["roadmap_focus"] = self._saved_focus
+            save_dashboard_prefs(self.cfg, data)
 
         def action_refresh(self) -> None:
             self.notify("refreshing…", timeout=2)
-            self._load()
+            self._refresh()
+
+        def _apply_focus(self, value: str) -> None:
+            os.environ["TAUCETI_ROADMAP_FOCUS"] = value
+            self._focus_set_by_user = True
+            if self.sv is not None:       # keep the roadmap row in step with the status bar immediately
+                self.sv.roadmap_focus = roadmap_focus() or "any"
+            self._save_prefs()
+            self._render()
 
         def action_set_focus(self) -> None:
             cur = roadmap_focus()
@@ -2705,16 +2730,12 @@ def _dashboard_app(cfg, loader=None):
 
                 def done(pick):
                     if pick is not None:
-                        os.environ["TAUCETI_ROADMAP_FOCUS"] = "" if pick == "(all areas)" else pick
-                        self._save_prefs()
-                        self._render()
+                        self._apply_focus("" if pick == "(all areas)" else pick)
                 self.push_screen(FocusPicker(opts, cur if cur else "(all areas)"), done)
             else:
                 def done(val):
                     if val is not None:
-                        os.environ["TAUCETI_ROADMAP_FOCUS"] = val.strip()
-                        self._save_prefs()
-                        self._render()
+                        self._apply_focus(val.strip())
                 self.push_screen(TextPrompt("roadmap focus (blank = all areas)", cur), done)
 
         # ---- launch ---------------------------------------------------------------------------------
