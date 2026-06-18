@@ -1661,6 +1661,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--agent", choices=AGENTS, default=None,
                    help="which agent to run (default: $TAUCETI_AGENT or auto)")
     p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble)")
+    p.add_argument("--roadmap-focus", dest="roadmap_focus", default=None, metavar="AREA",
+                   help="roadmap area to steer toward (empty string = all areas); "
+                        "overrides $TAUCETI_ROADMAP_FOCUS for this run")
     p.add_argument("--ignore-quota", dest="ignore_quota", action="store_true",
                    help="ignore the quota pacer; run the requested --agent regardless of pace "
                         "(needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)")
@@ -1823,6 +1826,10 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
+    # --roadmap-focus overrides the env for this run (and is inherited by loop children, which read it
+    # live via roadmap_focus()). Empty string is a meaningful value: "all areas".
+    if getattr(args, "roadmap_focus", None) is not None:
+        os.environ["TAUCETI_ROADMAP_FOCUS"] = args.roadmap_focus
     # --isolate-home must set $HOME BEFORE Config.resolve (so cfg.home + credential paths point at the
     # per-worker copy). Children spawned by the loop inherit $HOME and don't re-isolate.
     if getattr(args, "isolate_home", False):
@@ -2000,8 +2007,11 @@ def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool
     return chosen
 
 
-def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool) -> list[str]:
-    """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command')."""
+def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool,
+               focus: Optional[str] = None) -> list[str]:
+    """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
+    `focus` (the current roadmap focus) is embedded as --roadmap-focus so the copied/logged command
+    reproduces the focus set with [f] instead of silently reverting to the shell default."""
     cmd = [str(Path(__file__).resolve()), "work"]
     if loop:
         cmd.append("--loop")
@@ -2011,6 +2021,8 @@ def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool) -> 
         cmd += ["--agent", model_dial]
     if host:
         cmd.append("--host")
+    if focus is not None:
+        cmd += ["--roadmap-focus", focus]
     return cmd
 
 
@@ -2094,7 +2106,7 @@ def cmd_tui(args) -> int:
             continue
         if choice == "c":                  # show the launch command, then any key to return
             for loop in (False, True):
-                console.print("  " + " ".join(_shq(a) for a in launch_cmd(None, model_dial, host, loop)))
+                console.print("  " + " ".join(_shq(a) for a in launch_cmd(None, model_dial, host, loop, roadmap_focus())))
             console.print("[dim]  (press any key)[/]")
             try:
                 _read_key()
@@ -2113,9 +2125,14 @@ def cmd_tui(args) -> int:
                 except (EOFError, KeyboardInterrupt):
                     continue
                 if k not in ALLOWED_TASKS:
-                    console.print(f"[red]unknown kind '{k}'[/] (press any key)"); _read_key(); continue
+                    console.print(f"[red]unknown kind '{k}'[/] (press any key)")
+                    try:
+                        _read_key()
+                    except (EOFError, KeyboardInterrupt):
+                        return 0
+                    continue
                 only = k
-            cmd = launch_cmd(only, model_dial, host, loop)
+            cmd = launch_cmd(only, model_dial, host, loop, roadmap_focus())
             if loop:
                 _launch_detached(cfg, cmd, console)
                 console.print("[dim]  (press any key to return)[/]")
