@@ -77,6 +77,57 @@ try:
     oauth, from_kc = q._claude_creds()
     check("file without claudeAiOauth falls back to keychain", oauth, OAUTH["claudeAiOauth"])
     check("fallback creds are from_keychain", from_kc, True)
+
+    # 8. Interactive read (for bubble seeding): a locked Keychain runs `security unlock-keychain`, then
+    #    the retry succeeds. (-a→36, service-only→36, unlock, -a→blob.)
+    fr = FakeRun([(36, ""), (36, ""), (0, ""), (0, json.dumps(OAUTH))]); tc.subprocess.run = fr
+    check("interactive read unlocks then reads", tc._claude_keychain_creds_interactive(), OAUTH)
+    check("interactive read runs unlock-keychain", fr.calls[2], ["security", "unlock-keychain"])
+
+    # 9. Bubble seeding on macOS with no on-disk file: materialize the Keychain blob into a private
+    #    .credentials.json and point this run's $CLAUDE_CONFIG_DIR at it.
+    seed_home, seed_state = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())   # empty home: no file
+    cfg2 = types.SimpleNamespace(home=seed_home, state=seed_state)
+    env = {}
+    tc.subprocess.run = FakeRun([(0, json.dumps(OAUTH))])
+    staged = tc._seed_claude_creds_for_bubble(cfg2, env)
+    check("seed returns the staged dir", staged, seed_state / "bubble-claude-creds")
+    check("staged file carries the keychain blob", json.loads((staged / ".credentials.json").read_text()), OAUTH)
+    check("seed points $CLAUDE_CONFIG_DIR at it", env.get("CLAUDE_CONFIG_DIR"), str(staged))
+    check("staged creds file is 0600", oct(os.stat(staged / ".credentials.json").st_mode & 0o777), "0o600")
+
+    # 10. A real on-disk file is used as-is — no Keychain read, env untouched.
+    (seed_home / ".claude").mkdir()
+    (seed_home / ".claude" / ".credentials.json").write_text(json.dumps(OAUTH))
+    fr = FakeRun([(0, json.dumps(OAUTH))]); tc.subprocess.run = fr; env2 = {}
+    check("seed is a no-op when the file exists", tc._seed_claude_creds_for_bubble(cfg2, env2), None)
+    check("seed makes no security call when file exists", fr.calls, [])
+    check("seed leaves env untouched when file exists", "CLAUDE_CONFIG_DIR" in env2, False)
+
+    # 10b. A file present but without claudeAiOauth (partial/legacy) falls through to the Keychain.
+    (seed_home / ".claude" / ".credentials.json").write_text(json.dumps({"other": 1}))
+    tc.subprocess.run = FakeRun([(0, json.dumps(OAUTH))]); env4 = {}
+    staged2 = tc._seed_claude_creds_for_bubble(cfg2, env4)
+    check("malformed file falls through to keychain", staged2 is not None, True)
+    check("fallthrough seeds the keychain blob", json.loads((staged2 / ".credentials.json").read_text()), OAUTH)
+
+    # 11. Off darwin with no file: a no-op (bubble seeds nothing, as before) — never reads a Keychain.
+    tc.sys.platform = "linux"
+    fr = FakeRun([(0, json.dumps(OAUTH))]); tc.subprocess.run = fr
+    cfg3 = types.SimpleNamespace(home=Path(tempfile.mkdtemp()), state=Path(tempfile.mkdtemp()))
+    check("seed is a no-op off darwin", tc._seed_claude_creds_for_bubble(cfg3, {}), None)
+    check("seed makes no security call off darwin", fr.calls, [])
+    tc.sys.platform = "darwin"
+
+    # 12. macOS, no file, and the Keychain has nothing → a clear Die rather than a silent empty seed.
+    cfg4 = types.SimpleNamespace(home=Path(tempfile.mkdtemp()), state=Path(tempfile.mkdtemp()))
+    tc.subprocess.run = FakeRun([(44, ""), (44, "")])
+    raised = False
+    try:
+        tc._seed_claude_creds_for_bubble(cfg4, {})
+    except tc.Die:
+        raised = True
+    check("seed raises Die when no creds anywhere", raised, True)
 finally:
     tc.subprocess.run, tc.sys.platform = orig_run, orig_platform
     if orig_user is None:

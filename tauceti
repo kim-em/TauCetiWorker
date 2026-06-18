@@ -376,6 +376,19 @@ def _read_json_file(path: Path) -> Optional[dict]:
         return None
 
 
+def _claude_keychain_attempts() -> list[list[str]]:
+    """The `security` reads that locate Claude Code's Keychain item: service "Claude Code-credentials"
+    keyed by the login user, then a service-only fallback for older CLI builds that stored it without an
+    account (https://github.com/anthropics/claude-code/issues/9403)."""
+    service = "Claude Code-credentials"
+    user = os.environ.get("USER") or ""
+    attempts = []
+    if user:
+        attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
+    attempts.append(["security", "find-generic-password", "-s", service, "-w"])
+    return attempts
+
+
 def _claude_keychain_creds() -> Optional[dict]:
     """macOS only: read Claude Code's OAuth blob from the login Keychain, where the CLI keeps creds
     instead of <config>/.credentials.json. Returns the same {"claudeAiOauth": {…}} dict as the file,
@@ -390,13 +403,7 @@ def _claude_keychain_creds() -> Optional[dict]:
     The item's service name is "Claude Code-credentials" with the login user as the account; older CLI
     builds stored it without an account, so fall back to a service-only search
     (https://github.com/anthropics/claude-code/issues/9403)."""
-    service = "Claude Code-credentials"
-    user = os.environ.get("USER") or ""
-    attempts = []
-    if user:
-        attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
-    attempts.append(["security", "find-generic-password", "-s", service, "-w"])
-    for cmd in attempts:
+    for cmd in _claude_keychain_attempts():
         try:
             # Bound the read: an unattended GUI ACL prompt would otherwise block the pacer indefinitely
             # (headless/SSH returns 36 right away instead). On timeout, treat Claude as unavailable.
@@ -418,6 +425,39 @@ def _claude_keychain_creds() -> Optional[dict]:
                 "`security unlock-keychain` to let the pacer read them. Treating Claude as unavailable.")
             return None
         # else (e.g. 44 = errSecItemNotFound for this service/account) → try the next attempt
+    return None
+
+
+def _claude_keychain_creds_interactive() -> Optional[dict]:
+    """macOS only: read the Claude OAuth blob from the login Keychain, INTERACTIVELY. Unlike the pacer's
+    read this allows the GUI access prompt (long timeout, not 15s) and, if the Keychain is locked
+    (errSecInteractionNotAllowed), runs `security unlock-keychain` once — which prompts for the login
+    password on the terminal — and retries. Used to seed the bubble, where the in-container claude can't
+    reach the host Keychain and needs a .credentials.json to be staged for it. Returns the
+    {"claudeAiOauth": {…}} dict or None."""
+    for unlocked in (False, True):
+        locked = False
+        for cmd in _claude_keychain_attempts():
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if p.returncode == 0:
+                try:
+                    return json.loads(p.stdout.strip())
+                except json.JSONDecodeError:
+                    return None
+            if p.returncode == 36:   # errSecInteractionNotAllowed — Keychain locked
+                locked = True
+        if locked and not unlocked:
+            log("claude creds: the login Keychain is locked; unlocking it (enter your login password "
+                "if prompted)…")
+            try:
+                subprocess.run(["security", "unlock-keychain"], timeout=120)   # interactive (inherits tty)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            continue
+        return None
     return None
 
 
@@ -1423,6 +1463,38 @@ def _bubble_pop(cfg: Config, env: dict) -> None:
     subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
 
 
+def _seed_claude_creds_for_bubble(cfg: Config, env: dict) -> Optional[Path]:
+    """bubble seeds the in-container claude from <config>/.credentials.json (it can't read the macOS
+    Keychain). When that file exists (Linux, or a macOS user who exported it) we use it as-is. Otherwise,
+    on macOS, materialize the Keychain blob — unlocking interactively if needed — into a private file and
+    point THIS bubble run's $CLAUDE_CONFIG_DIR at it (kim-em/bubble#317), so bubble seeds it. Returns the
+    staged dir for the caller to delete after the round, or None when nothing was staged. Raises Die when
+    macOS creds can't be read at all. (claude_dir reads $CLAUDE_CONFIG_DIR from os.environ, which env
+    mirrors here before we override it below.)"""
+    on_disk = _read_json_file(claude_dir(cfg.home) / ".credentials.json")
+    if on_disk and on_disk.get("claudeAiOauth"):
+        return None                       # usable file present — bubble seeds it directly (incl. Linux)
+    if sys.platform != "darwin":
+        return None                       # no usable file and not macOS — let bubble report "not logged in"
+    blob = _claude_keychain_creds_interactive()
+    if not blob or not blob.get("claudeAiOauth"):
+        raise Die('no Claude credentials to seed the bubble: none in '
+                  f'{claude_dir(cfg.home) / ".credentials.json"} and could not read the '
+                  '"Claude Code-credentials" login Keychain item. Unlock the Keychain and retry, or '
+                  'run with --host (the host claude reads the Keychain itself).')
+    import shutil
+    credsdir = cfg.state / "bubble-claude-creds"
+    shutil.rmtree(credsdir, ignore_errors=True)
+    credsdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(credsdir, 0o700)
+    # Create the file 0600 in the open() itself; a write_text()+chmod would leave a brief 0644 window.
+    fd = os.open(credsdir / ".credentials.json", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(blob, fh)
+    env["CLAUDE_CONFIG_DIR"] = str(credsdir)   # bubble (this subprocess) seeds creds from here
+    return credsdir
+
+
 def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
                   mounts: Optional[list[str]] = None, *,
                   inner_cmd: Optional[str] = None, cred_model: Optional[str] = None) -> int:
@@ -1482,12 +1554,25 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
         return 0
 
+    # On macOS with creds only in the Keychain, materialize them so bubble can seed the in-container
+    # claude (done after the echo path so a dry-run never prompts the Keychain). Register removal of the
+    # staging dir BEFORE writing the secret, against a kill mid-write; the path is deterministic. A
+    # SIGKILL/crash can still leave a 0600 file under worker state until the next round's pre-wipe.
+    creds_stage = None
+    if cred_model == "claude":
+        creds_dir = cfg.state / "bubble-claude-creds"
+        w.rc.add_cleanup(lambda: shutil.rmtree(creds_dir, ignore_errors=True))
+        creds_stage = _seed_claude_creds_for_bubble(cfg, env)
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))   # pop if we're killed mid-run
-    if inner_cmd is None:                             # the work agent — quiet/log it like the host path
-        rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
-    else:                                             # review engine / probe — leave its output inline
-        rc = subprocess.run(argv, env=env).returncode
-    _bubble_pop(cfg, env)   # don't rely on --ephemeral alone
+    try:
+        if inner_cmd is None:                         # the work agent — quiet/log it like the host path
+            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+        else:                                         # review engine / probe — leave its output inline
+            rc = subprocess.run(argv, env=env).returncode
+    finally:
+        _bubble_pop(cfg, env)   # don't rely on --ephemeral alone
+        if creds_stage is not None:
+            shutil.rmtree(creds_stage, ignore_errors=True)
     return rc
 
 
