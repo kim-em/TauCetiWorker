@@ -60,8 +60,10 @@ def me() -> str:
     return login
 
 # Per-PR budgets (a PR can never churn forever). Names match round.sh.
-MAX_FIX_ATTEMPTS = 3        # per-head: stop fixing the same head after this many tries
-MAX_FIX_PR_ATTEMPTS = 7     # per-PR lifetime backstop across all heads
+MAX_FIX_ATTEMPTS = 3        # per-head: stop re-running the fixer on a commit it can't change (the
+                            # one guard the 8-round review close can't supply, since a stuck head
+                            # never advances a review round). No per-PR lifetime cap: across moving
+                            # heads, review-budget-spent (8 rounds) is the convergence stop.
 MAX_REVIEW_ROUNDS = 8       # lifetime review budget per PR; past this we stop re-reviewing it
 MAX_REVIEW_ERRORS = 3       # give up re-trying a PR whose review keeps erroring (transient infra)
 MAX_CI_ATTEMPTS = 3         # per-head: stop trying to green a red-CI head
@@ -888,9 +890,8 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
                 continue
             c = Candidate(p.number, p.head_oid, "blocking review at head")
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
-            per_pr = counters.read(f"fix-pr-{p.number}")
             c.attempts, c.budget = per_head, MAX_FIX_ATTEMPTS
-            if per_head >= MAX_FIX_ATTEMPTS or per_pr >= MAX_FIX_PR_ATTEMPTS:
+            if per_head >= MAX_FIX_ATTEMPTS:
                 sv.needs_fix.suppressed.append(c)
             else:
                 sv.needs_fix.actionable.append(c)
@@ -1673,7 +1674,6 @@ def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bo
 def do_fix(w, sv, c, opts, bubble) -> Optional[int]:
     pr, head = c.pr, c.head
     w.counters.incr(f"fix-{pr}-{head[:12]}")   # count up front (an un-checkout-able PR mustn't loop)
-    w.counters.incr(f"fix-pr-{pr}")
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix")
 
 
