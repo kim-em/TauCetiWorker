@@ -376,6 +376,19 @@ def _read_json_file(path: Path) -> Optional[dict]:
         return None
 
 
+def _claude_keychain_attempts() -> list[list[str]]:
+    """The `security` reads that locate Claude Code's Keychain item: service "Claude Code-credentials"
+    keyed by the login user, then a service-only fallback for older CLI builds that stored it without an
+    account (https://github.com/anthropics/claude-code/issues/9403)."""
+    service = "Claude Code-credentials"
+    user = os.environ.get("USER") or ""
+    attempts = []
+    if user:
+        attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
+    attempts.append(["security", "find-generic-password", "-s", service, "-w"])
+    return attempts
+
+
 def _claude_keychain_creds() -> Optional[dict]:
     """macOS only: read Claude Code's OAuth blob from the login Keychain, where the CLI keeps creds
     instead of <config>/.credentials.json. Returns the same {"claudeAiOauth": {…}} dict as the file,
@@ -390,13 +403,7 @@ def _claude_keychain_creds() -> Optional[dict]:
     The item's service name is "Claude Code-credentials" with the login user as the account; older CLI
     builds stored it without an account, so fall back to a service-only search
     (https://github.com/anthropics/claude-code/issues/9403)."""
-    service = "Claude Code-credentials"
-    user = os.environ.get("USER") or ""
-    attempts = []
-    if user:
-        attempts.append(["security", "find-generic-password", "-s", service, "-a", user, "-w"])
-    attempts.append(["security", "find-generic-password", "-s", service, "-w"])
-    for cmd in attempts:
+    for cmd in _claude_keychain_attempts():
         try:
             # Bound the read: an unattended GUI ACL prompt would otherwise block the pacer indefinitely
             # (headless/SSH returns 36 right away instead). On timeout, treat Claude as unavailable.
@@ -418,6 +425,39 @@ def _claude_keychain_creds() -> Optional[dict]:
                 "`security unlock-keychain` to let the pacer read them. Treating Claude as unavailable.")
             return None
         # else (e.g. 44 = errSecItemNotFound for this service/account) → try the next attempt
+    return None
+
+
+def _claude_keychain_creds_interactive() -> Optional[dict]:
+    """macOS only: read the Claude OAuth blob from the login Keychain, INTERACTIVELY. Unlike the pacer's
+    read this allows the GUI access prompt (long timeout, not 15s) and, if the Keychain is locked
+    (errSecInteractionNotAllowed), runs `security unlock-keychain` once (it prompts for the login
+    password on the terminal) and retries. Used to seed the bubble, where the in-container claude can't
+    reach the host Keychain and needs a .credentials.json to be staged for it. Returns the
+    {"claudeAiOauth": {…}} dict or None."""
+    for unlocked in (False, True):
+        locked = False
+        for cmd in _claude_keychain_attempts():
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if p.returncode == 0:
+                try:
+                    return json.loads(p.stdout.strip())
+                except json.JSONDecodeError:
+                    return None
+            if p.returncode == 36:   # errSecInteractionNotAllowed (Keychain locked)
+                locked = True
+        if locked and not unlocked:
+            log("claude creds: the login Keychain is locked; unlocking it (enter your login password "
+                "if prompted)…")
+            try:
+                subprocess.run(["security", "unlock-keychain"], timeout=120)   # interactive (inherits tty)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            continue
+        return None
     return None
 
 
@@ -570,19 +610,21 @@ class Quota:
     # --- Claude ------------------------------------------------------------
     def _claude_creds(self) -> tuple[Optional[dict], bool]:
         """Returns (oauth_block, from_keychain). The block is Claude Code's {accessToken, refreshToken,
-        expiresAt, …}, from <config>/.credentials.json or — on macOS, where the CLI keeps creds in the
-        login Keychain rather than a file — from the Keychain. from_keychain marks creds we must NOT
-        refresh/persist (see _claude_keychain_creds)."""
+        expiresAt, ...}. On macOS the login Keychain is authoritative (the CLI stores creds there, not in
+        a file), so we read it FIRST and only fall back to a file; from_keychain marks creds we must NOT
+        refresh/persist, since rotating the shared token would log out the operator's claude. Reading the
+        Keychain first also means a credentials file we materialize for the bubble never shadows the live
+        Keychain here. On Linux the file is the store."""
+        if sys.platform == "darwin":
+            kc = _claude_keychain_creds()
+            if kc and kc.get("claudeAiOauth"):
+                return kc.get("claudeAiOauth"), True
         d = _read_json_file(claude_dir(self.cfg.home) / ".credentials.json")
         block = d.get("claudeAiOauth") if d else None
         if block:
-            return block, False
-        # No usable on-disk block (file absent, or present but missing/empty claudeAiOauth). On macOS the
-        # creds live in the login Keychain instead, so fall back to a read-only Keychain lookup there.
-        if sys.platform == "darwin":
-            kc = _claude_keychain_creds()
-            if kc:
-                return kc.get("claudeAiOauth"), True
+            # On macOS a file is only a Keychain mirror sharing the one refresh token, so it must never be
+            # refreshed even when the Keychain read failed; on Linux the file is the store and refreshable.
+            return block, sys.platform == "darwin"
         return None, False
 
     def claude(self) -> Provider:
@@ -1423,6 +1465,30 @@ def _bubble_pop(cfg: Config, env: dict) -> None:
     subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
 
 
+def _ensure_claude_creds_for_bubble(cfg: Config) -> None:
+    """bubble seeds the in-container claude from <CLAUDE_CONFIG_DIR>/.credentials.json (it can't read the
+    macOS Keychain). On Linux that file is the store, so leave it to bubble. On macOS, where Claude Code
+    keeps creds in the Keychain, write the credential INTO the configured dir from the Keychain, every
+    round: the Keychain is authoritative and may hold a token rotated by a host claude since we last
+    wrote, and re-mirroring it keeps both the access AND refresh token current (a stale refresh token in
+    an unexpired-looking mirror would fail mid-round). The read is interactive (unlock if locked). The
+    pacer reads the Keychain directly (keychain-first), so it never refreshes this mirror. If the Keychain
+    can't be read but a credentials file already exists, fall back to it; otherwise Die."""
+    if sys.platform != "darwin":
+        return                            # Linux/Windows: the file is the store; bubble seeds it (or reports none)
+    f = claude_dir(cfg.home) / ".credentials.json"
+    blob = _claude_keychain_creds_interactive()
+    if blob and blob.get("claudeAiOauth"):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(f, blob)       # 0600, temp + atomic rename (no partial-read or perms window)
+        return
+    if (_read_json_file(f) or {}).get("claudeAiOauth"):
+        return                            # Keychain unreadable but a credentials file exists; let bubble use it
+    raise Die('no Claude credentials to seed the bubble: none in '
+              f'{f} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
+              'the Keychain and retry, or run with --host (the host claude reads the Keychain itself).')
+
+
 def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
                   mounts: Optional[list[str]] = None, *,
                   inner_cmd: Optional[str] = None, cred_model: Optional[str] = None) -> int:
@@ -1482,12 +1548,19 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
         return 0
 
+    # On macOS, Claude Code keeps creds in the Keychain, not a file; make sure the configured
+    # CLAUDE_CONFIG_DIR holds a current credentials file so bubble can seed it (done after the echo path
+    # so a dry-run never prompts the Keychain).
+    if cred_model == "claude":
+        _ensure_claude_creds_for_bubble(cfg)
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))   # pop if we're killed mid-run
-    if inner_cmd is None:                             # the work agent — quiet/log it like the host path
-        rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
-    else:                                             # review engine / probe — leave its output inline
-        rc = subprocess.run(argv, env=env).returncode
-    _bubble_pop(cfg, env)   # don't rely on --ephemeral alone
+    try:
+        if inner_cmd is None:                         # the work agent — quiet/log it like the host path
+            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+        else:                                         # review engine / probe — leave its output inline
+            rc = subprocess.run(argv, env=env).returncode
+    finally:
+        _bubble_pop(cfg, env)   # don't rely on --ephemeral alone, and pop even on an exception
     return rc
 
 
