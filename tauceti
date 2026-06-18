@@ -750,6 +750,7 @@ class PRInfo:
     author: str
     build_success: bool
     build_failed: bool
+    title: str = ""
 
     @staticmethod
     def from_json(d: dict) -> "PRInfo":
@@ -757,6 +758,7 @@ class PRInfo:
         builds = [c for c in rollup if c.get("name") == "build"]
         return PRInfo(
             number=d["number"],
+            title=d.get("title", ""),
             head_oid=d.get("headRefOid", ""),
             head_ref=d.get("headRefName", ""),
             head_owner=(d.get("headRepositoryOwner") or {}).get("login", ""),
@@ -822,7 +824,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     """
     sv = Survey(worker_id=cfg.wid, roadmap_focus=roadmap_focus() or "any")
     try:
-        raw = gh.pr_list(["number", "headRefOid", "headRefName", "headRepositoryOwner",
+        raw = gh.pr_list(["number", "title", "headRefOid", "headRefName", "headRepositoryOwner",
                           "headRepository", "isDraft", "statusCheckRollup", "author", "mergeable"])
     except GitHubError as e:
         sv.github_failed = True
@@ -1781,16 +1783,22 @@ def quota_line(snap: dict) -> str:
 
 
 def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
-                  selected: Optional[str] = None) -> None:
-    """Render the survey table. `selected` (a kind name) is highlighted as the arrow-key cursor; pass
-    None (the default, e.g. from `tauceti status`) for no cursor."""
+                  selected: Optional[str] = None, expanded: Optional[set] = None) -> None:
+    """Render the survey table. `selected` (a kind name) is highlighted as the arrow-key cursor;
+    `expanded` (a set of kind names) get their candidate PRs listed beneath them, one per row, with
+    the PR title. Pass None for both (e.g. from `tauceti status`) for the plain table."""
     from rich.table import Table
     from rich.panel import Panel
+    from rich.markup import escape   # PR titles / focus / errors are external text — escape before markup
 
     if sv.github_failed:
         console.print(Panel("[bold red]GitHub fetch failed[/] — survey unavailable.\n"
-                            + "\n".join(sv.errors), title="tauceti"))
+                            + escape("\n".join(sv.errors)), title="tauceti"))
         return
+
+    expanded = expanded or set()
+    titles = {p.number: p.title for p in sv.open_prs}
+    focus = escape(sv.roadmap_focus)
 
     header = (f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   "
               f"open: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
@@ -1809,9 +1817,9 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
         kind_cell = ("▸ " if is_sel else "  ") + name   # marker survives even without color
         if name == "roadmap":
             if sv.roadmap_backpressure:
-                t.add_row(num, kind_cell, "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})", style=style)
+                t.add_row(num, kind_cell, "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {focus})", style=style)
             else:
-                t.add_row(num, kind_cell, "∞", f"focus: {sv.roadmap_focus}", style=style)
+                t.add_row(num, kind_cell, "∞", f"focus: {focus}", style=style)
             continue
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
@@ -1820,6 +1828,14 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
         if name == "bump" and not wk.actionable and not wk.suppressed:
             note = "no broken hopscotch bump"
         t.add_row(num, kind_cell, ready, note, style=style)
+        if name in expanded:                            # tree-style PR list under the expanded kind
+            rows = [(c, False) for c in wk.actionable] + [(c, True) for c in wk.suppressed]
+            if not rows:
+                t.add_row("", "    └ (none)", "", "", style="dim")
+            for c, supp in rows:
+                title = titles.get(c.pr) or c.reason or ""
+                tag = " [dim](past-budget)[/]" if supp else ""
+                t.add_row("", f"    └ #{c.pr}", "", f"[dim]{escape(title)}[/]" + tag)
     console.print(t)
 
     nxt = sv.next_auto_stage
@@ -2095,14 +2111,14 @@ def cmd_tui(args) -> int:
         console.print("[dim](not a TTY — snapshot only; use `tauceti status [--json]` in scripts)[/]")
         return 0
 
-    model_dial, host, sel = "auto", False, None
+    model_dial, host, sel, expanded = "auto", False, None, set()
     while True:
         console.clear()
         sv, q = compute()
         if sel is None:                    # default the cursor to the kind auto would run next
             nxt = sv.next_auto_stage
             sel = ALLOWED_TASKS.index(nxt) if nxt in ALLOWED_TASKS else 0
-        render_survey(sv, console, q, selected=ALLOWED_TASKS[sel])
+        render_survey(sv, console, q, selected=ALLOWED_TASKS[sel], expanded=expanded)
         sandbox = "host" if host else "bubble"
         # Brackets in the key hints are escaped (\\[) so Rich renders them literally instead of
         # parsing [s]/[r]/etc. as style markup. Single keypress, no Enter — the view updates in place.
@@ -2110,8 +2126,8 @@ def cmd_tui(args) -> int:
             f"\n  [bold]model[/]={model_dial}   [bold]sandbox[/]={sandbox}   "
             f"[bold]roadmap focus[/]={roadmap_focus() or 'all areas'}"
             "   [dim](press a key — no Enter needed)[/]\n"
-            "  [bold cyan]\\[↑/↓][/]  move cursor           [bold cyan]\\[Enter][/] one round of selected kind\n"
-            "  [bold cyan]\\[1-6][/]  run that kind now      [bold cyan]\\[l][/] loop (auto)   [bold cyan]\\[L][/] loop selected kind\n"
+            "  [bold cyan]\\[↑/↓][/]  move cursor           [bold cyan]\\[→/←][/] expand / collapse (list PRs)\n"
+            "  [bold cyan]\\[Enter][/] one round of selected [bold cyan]\\[1-6][/] run a kind now   [bold cyan]\\[l][/] loop (auto)   [bold cyan]\\[L][/] loop selected\n"
             "  [bold cyan]\\[m][/]    cycle model           [bold cyan]\\[s][/]     toggle sandbox (bubble/host)\n"
             "  [bold cyan]\\[f][/]    set roadmap focus     [bold cyan]\\[r][/]     refresh\n"
             "  [bold cyan]\\[c][/]    copy launch command   [bold cyan]\\[q][/]     quit")
@@ -2125,6 +2141,10 @@ def cmd_tui(args) -> int:
             sel = (sel - 1) % len(ALLOWED_TASKS); continue
         if choice == "DOWN":
             sel = (sel + 1) % len(ALLOWED_TASKS); continue
+        if choice == "RIGHT":
+            expanded.add(ALLOWED_TASKS[sel]); continue       # list this kind's PRs
+        if choice == "LEFT":
+            expanded.discard(ALLOWED_TASKS[sel]); continue   # collapse
         if choice in ("r", "ESC"):
             continue                       # redraw with fresh survey
         if choice == "m":                  # cycle model in place
