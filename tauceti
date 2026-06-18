@@ -71,7 +71,14 @@ MAX_BUMP_ATTEMPTS = 3       # per-head: stop trying to green a red hopscotch bum
 MAX_BUMP_PR_ATTEMPTS = 5    # per-PR lifetime backstop for bump fixing across heads
 MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
 
-ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # "" = all areas
+ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # default; "" = all areas
+
+
+def roadmap_focus() -> str:
+    """The roadmap area the worker steers toward. Read live from the env each call so the TUI's
+    [f] key can change it and have both the survey display and any launched round pick it up
+    (children inherit TAUCETI_ROADMAP_FOCUS). Empty string means "all areas"."""
+    return os.environ.get("TAUCETI_ROADMAP_FOCUS", ROADMAP_FOCUS)
 
 # Loop timing (loop.sh). Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))            # seconds between quota checks while waiting
@@ -99,6 +106,10 @@ PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/script
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
 ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "roadmap"]
 WORK_TASKS = list(ALLOWED_TASKS)
+# The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
+# Both derive from ALLOWED_TASKS so the table number, the row order, and the keybinding can never drift.
+KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...
+KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}          # "rebase" -> "1", ...
 # Every mode runs a MODEL on third-party content, so each defaults to bubble (opt out with --host).
 SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 
@@ -809,7 +820,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
     always uses deep=True.
     """
-    sv = Survey(worker_id=cfg.wid, roadmap_focus=ROADMAP_FOCUS or "any")
+    sv = Survey(worker_id=cfg.wid, roadmap_focus=roadmap_focus() or "any")
     try:
         raw = gh.pr_list(["number", "headRefOid", "headRefName", "headRepositoryOwner",
                           "headRepository", "isDraft", "statusCheckRollup", "author", "mergeable"])
@@ -1768,19 +1779,24 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None) -> Non
     console.print(Panel(header, title="tauceti"))
 
     t = Table(show_header=True, header_style="bold")
-    t.add_column("KIND"); t.add_column("READY", justify="right"); t.add_column("SAMPLE / NOTE")
-    for name in ("rebase", "review", "fix-ci", "fix", "bump"):
+    # The "#" is the key you press in the TUI to run one round of that kind (matches KIND_KEYS).
+    t.add_column("#", justify="right"); t.add_column("KIND")
+    t.add_column("READY", justify="right"); t.add_column("SAMPLE / NOTE")
+    for name in ALLOWED_TASKS:
+        num = KIND_BY_NAME[name]
+        if name == "roadmap":
+            if sv.roadmap_backpressure:
+                t.add_row(num, "roadmap", "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})")
+            else:
+                t.add_row(num, "roadmap", "∞", f"focus: {sv.roadmap_focus}")
+            continue
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
         extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
         note = (_sample(wk.actionable) or "") + extra
         if name == "bump" and not wk.actionable and not wk.suppressed:
             note = "no broken hopscotch bump"
-        t.add_row(name, ready, note)
-    if sv.roadmap_backpressure:
-        t.add_row("roadmap", "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (focus: {sv.roadmap_focus})")
-    else:
-        t.add_row("roadmap", "∞", f"focus: {sv.roadmap_focus}")
+        t.add_row(num, name, ready, note)
     console.print(t)
 
     nxt = sv.next_auto_stage
@@ -1984,9 +2000,6 @@ def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool
     return chosen
 
 
-KIND_KEYS = {"1": "rebase", "2": "review", "3": "fix", "4": "fix-ci", "5": "bump", "6": "roadmap"}
-
-
 def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command')."""
     cmd = [str(Path(__file__).resolve()), "work"]
@@ -1999,6 +2012,26 @@ def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool) -> 
     if host:
         cmd.append("--host")
     return cmd
+
+
+def _read_key() -> str:
+    """Read a single keypress from the tty WITHOUT waiting for Enter (cbreak mode), so the dashboard
+    reacts live. Returns '\\n' for Enter; raises EOFError on Ctrl-D and KeyboardInterrupt on Ctrl-C."""
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)   # back to cooked mode for any input() that follows
+    if ch in ("\r", "\n"):
+        return "\n"
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    if ch == "" or ch == "\x04":
+        raise EOFError
+    return ch
 
 
 def cmd_tui(args) -> int:
@@ -2025,47 +2058,75 @@ def cmd_tui(args) -> int:
         console.clear()
         sv = snapshot()
         sandbox = "host" if host else "bubble"
+        # Brackets in the key hints are escaped (\\[) so Rich renders them literally instead of
+        # parsing [s]/[r]/etc. as style markup. Single keypress, no Enter — the view updates in place.
         console.print(
-            f"\n  [bold]model[/]={model_dial}  [bold]sandbox[/]={sandbox}\n"
-            "  [enter] one auto round   [1..6] one round of KIND   [l] loop (auto)   "
-            "[L] focused loop of KIND\n  [m] cycle model   [s] toggle sandbox   [r] refresh   "
-            "[c] copy command   [q] quit")
+            f"\n  [bold]model[/]={model_dial}   [bold]sandbox[/]={sandbox}   "
+            f"[bold]roadmap focus[/]={roadmap_focus() or 'all areas'}"
+            "   [dim](press a key — no Enter needed)[/]\n"
+            "  [bold cyan]\\[Enter][/] one auto round        [bold cyan]\\[1-6][/]  one round of that KIND (the # column above)\n"
+            "  [bold cyan]\\[l][/]     loop (auto)           [bold cyan]\\[L][/]    focused loop of one KIND\n"
+            "  [bold cyan]\\[m][/]     cycle model           [bold cyan]\\[s][/]    toggle sandbox (bubble/host)\n"
+            "  [bold cyan]\\[f][/]     set roadmap focus     [bold cyan]\\[r][/]    refresh\n"
+            "  [bold cyan]\\[c][/]     copy launch command   [bold cyan]\\[q][/]    quit")
         try:
-            choice = input("  > ").strip()
-        except EOFError:
+            choice = _read_key()
+        except (EOFError, KeyboardInterrupt):
             return 0
         if choice == "q":
             return 0
         if choice == "r":
-            continue
-        if choice == "m":
+            continue                       # redraw with fresh survey
+        if choice == "m":                  # cycle model in place
             order = ["auto", "codex", "claude", "deepseek", "minimax"]
             model_dial = order[(order.index(model_dial) + 1) % len(order)]
             continue
-        if choice == "s":
+        if choice == "s":                  # toggle sandbox in place
             host = not host
             continue
-        if choice in ("", "l") or choice in KIND_KEYS or choice == "L":
+        if choice == "f":                  # set roadmap focus (text input; affects display + launched rounds)
+            console.print("  [bold]roadmap focus[/] (blank = all areas) > ", end="")
+            try:
+                val = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            os.environ["TAUCETI_ROADMAP_FOCUS"] = val
+            continue
+        if choice == "c":                  # show the launch command, then any key to return
+            for loop in (False, True):
+                console.print("  " + " ".join(_shq(a) for a in launch_cmd(None, model_dial, host, loop)))
+            console.print("[dim]  (press any key)[/]")
+            try:
+                _read_key()
+            except (EOFError, KeyboardInterrupt):
+                return 0
+            continue
+        if choice in ("\n", "l") or choice in KIND_KEYS or choice == "L":
             loop = choice in ("l", "L")
             only = None
             if choice in KIND_KEYS:
                 only = KIND_KEYS[choice]
             elif choice == "L":
-                k = input("  loop which KIND? (rebase/review/fix/fix-ci/bump/roadmap) > ").strip()
+                console.print("  loop which KIND? (rebase/review/fix/fix-ci/bump/roadmap) > ", end="")
+                try:
+                    k = input().strip()
+                except (EOFError, KeyboardInterrupt):
+                    continue
                 if k not in ALLOWED_TASKS:
-                    console.print(f"[red]unknown kind '{k}'[/]"); input("  enter…"); continue
+                    console.print(f"[red]unknown kind '{k}'[/] (press any key)"); _read_key(); continue
                 only = k
             cmd = launch_cmd(only, model_dial, host, loop)
             if loop:
                 _launch_detached(cfg, cmd, console)
-                input("  enter to return…")
+                console.print("[dim]  (press any key to return)[/]")
+                try:
+                    _read_key()
+                except (EOFError, KeyboardInterrupt):
+                    return 0
             else:
                 console.print(f"\n  running: {' '.join(_shq(a) for a in cmd)}\n")
                 os.execvp(cmd[0], cmd)   # replace this process; the round owns the tty
-        if choice == "c":
-            for loop in (False, True):
-                console.print("  " + " ".join(_shq(a) for a in launch_cmd(None, model_dial, host, loop)))
-            input("  enter…")
+            continue
 
 
 def _launch_detached(cfg: Config, cmd: list[str], console) -> None:
