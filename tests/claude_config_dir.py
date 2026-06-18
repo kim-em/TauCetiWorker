@@ -63,10 +63,10 @@ finally:
     shutil.rmtree(bhome, ignore_errors=True)
 
 # Bubble must NOT block a non-default $CLAUDE_CONFIG_DIR: bubble honors the var itself, so run_in_bubble
-# proceeds straight to staging. A sentinel in place of ensure_bubble_home proves we reach staging (not a
-# Die) for both the non-default and default cases.
-class ReachedStaging(Exception): pass
-tc.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(ReachedStaging())   # past the (removed) guard
+# gets past the (removed) guard. The guard sat before ensure_bubble_home, so a sentinel there proves we
+# pass it (no Die) for both the non-default and default cases.
+class PastGuard(Exception): pass
+tc.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(PastGuard())   # the first call after the removed guard
 w = types.SimpleNamespace(cfg=types.SimpleNamespace(home=Path("/home/example"), state=Path("/tmp"), wid="w"))
 opts = types.SimpleNamespace(work_model="claude")
 
@@ -74,11 +74,11 @@ for label, cfgdir in (("non-default", "/custom/work-claude"), ("default", str(Pa
     os.environ["CLAUDE_CONFIG_DIR"] = cfgdir
     try:
         tc.run_in_bubble(w, "review", "PROMPT", opts)
-        check(f"bubble + {label} config dir reaches staging", "no raise", "ReachedStaging")
+        check(f"bubble + {label} config dir gets past the guard", "no raise", "PastGuard")
     except tc.Die:
-        check(f"bubble + {label} config dir must NOT Die", "raised Die", "ReachedStaging")
-    except ReachedStaging:
-        check(f"bubble + {label} config dir reaches staging (no Die)", True, True)
+        check(f"bubble + {label} config dir must NOT Die", "raised Die", "PastGuard")
+    except PastGuard:
+        check(f"bubble + {label} config dir gets past the guard (no Die)", True, True)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
