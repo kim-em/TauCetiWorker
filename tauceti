@@ -1576,11 +1576,8 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
     import shlex
     cfg, wm = w.cfg, opts.work_model
     cred_model = cred_model or wm
-    if cred_model in OPENROUTER_MODELS and not os.environ.get("TAUCETI_ALLOW_OPENROUTER_BUBBLE"):
-        # The bubble image needs `pi` + openrouter.ai egress (kim-em/bubble#299); until then this fails
-        # at `pi: command not found`. Fail early with a clear pointer rather than after staging.
-        raise Die(f"--agent {cred_model} requires --host until kim-em/bubble#299 lands pi in the bubble "
-                  f"image (set TAUCETI_ALLOW_OPENROUTER_BUBBLE=1 to override once it has)")
+    # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
+    # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
     # bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317), reading it
     # from this subprocess's inherited env, so the in-bubble claude and the pacer agree on the account
     # with no extra plumbing here.
@@ -2019,27 +2016,77 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
 # CLI
 # ============================================================================
 
+WORK_EPILOG = """\
+the cascade (priority order; a round does the first that applies):
+  rebase    bring our open PRs up to date with their base branch
+  review    review an open PR (runs the tauceti-review engine)
+  fix-ci    fix red CI on one of our PRs
+  fix       address review feedback on one of our PRs
+  bump      adapt a red hopscotch/lkg-bump PR (the worker never authors one)
+  roadmap   open a new PR for a roadmap item
+
+  With no --only a round walks the whole cascade; --only pins it to a subset.
+
+examples:
+  tauceti work                          one round: auto agent, in a bubble
+  tauceti work --loop                   the driver: keep picking the best job
+  tauceti work --loop --only review     a focused reviewer
+  tauceti work --only roadmap --roadmap-focus ReductiveGroups
+  tauceti work --agent claude --host    run Opus directly on the host
+  tauceti work --dry-run                show what it WOULD do; act on nothing
+
+multiple workers (share a host, coordinate through GitHub; a distinct id isolates each):
+  tauceti work --loop --worker-id alice --only review
+  tauceti work --loop --worker-id bob   --only roadmap
+
+environment (flags win; see README.md for the full list):
+  TAUCETI_AGENT          default for --agent
+  TAUCETI_WORKER_ID      default for --worker-id
+  TAUCETI_ROADMAP_FOCUS  default for --roadmap-focus
+  TAUCETI_QUOTA_CMD      default for --quota-cmd
+  TAUCETI_STREAM=1       same as --stream
+  CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
+                         (account switching, where the creds live in a file)
+"""
+
+
 def add_work_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--loop", action="store_true", help="keep doing rounds (the driver); default is one round")
+    p.add_argument("--loop", action="store_true",
+                   help="run the driver: keep doing rounds (pacing against quota between them) "
+                        "instead of the default single round")
     p.add_argument("--only", action="append", default=[], metavar="TASKS",
-                   help="restrict to these work units (comma list): " + ", ".join(ALLOWED_TASKS))
+                   help="restrict the round to these work units, a comma list of: "
+                        + ", ".join(ALLOWED_TASKS) + " (default: walk the whole cascade)")
     p.add_argument("--agent", choices=AGENTS, default=None,
-                   help="which agent to run (default: $TAUCETI_AGENT or auto)")
-    p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble)")
+                   help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
+                        "or deepseek/minimax (pay-per-token OpenRouter, asked for by name) "
+                        "(default: $TAUCETI_AGENT or auto)")
+    p.add_argument("--host", action="store_true",
+                   help="opt OUT of the bubble sandbox and run the agent directly on the host "
+                        "(faster, but the agent gets your full credentials and network; default: bubble)")
     p.add_argument("--stream", action="store_true",
                    help="stream the agent's (noisy) conversation log to the terminal; "
-                        "default redirects it to a file under logs/ and prints the path")
+                        "default redirects it to a file under logs/ and prints the path (or $TAUCETI_STREAM=1)")
     p.add_argument("--roadmap-focus", dest="roadmap_focus", default=None, metavar="AREA",
-                   help="roadmap area to steer toward (empty string = all areas); "
-                        "overrides $TAUCETI_ROADMAP_FOCUS for this run")
+                   help="for roadmap rounds, the single roadmap area to steer toward: a subdirectory of "
+                        "the TauCetiRoadmap repo. List them by opening the dashboard (bare `tauceti`) and "
+                        "expanding the roadmap row, or browse github.com/FormalFrontier/TauCetiRoadmap. "
+                        "Empty string = all areas. Overrides $TAUCETI_ROADMAP_FOCUS for this run")
     p.add_argument("--ignore-quota", dest="ignore_quota", action="store_true",
                    help="ignore the quota pacer; run the requested --agent regardless of pace "
                         "(needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)")
     p.add_argument("--quota-cmd", default=os.environ.get("TAUCETI_QUOTA_CMD"),
-                   help="external command that decides agent availability (overrides the built-in pacer)")
-    p.add_argument("--worker-id", dest="worker_id", default=None, help="stable worker id (else 'default')")
+                   help="external command that decides agent availability, run as '<cmd> <agent>' "
+                        "(first stdout token = model to run; empty output or nonzero exit = wait); "
+                        "overrides the built-in pacer (or $TAUCETI_QUOTA_CMD)")
+    p.add_argument("--worker-id", dest="worker_id", default=None, metavar="ID",
+                   help="run an independent worker under this name: it namespaces the worker's state, "
+                        "checkout, review store, and logs, and (for any id other than 'default') gives it "
+                        "its own $HOME so credential refreshes don't race. Use a distinct id per worker to "
+                        "share a host (default: $TAUCETI_WORKER_ID or 'default')")
     p.add_argument("--isolate-home", dest="isolate_home", action="store_true",
-                   help="per-worker Claude/Codex auth state (needed for multi-worker)")
+                   help="force the per-worker $HOME even for the 'default' worker id "
+                        "(a distinct --worker-id already implies it)")
     p.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="survey + print the picker's decision; act on nothing")
 
@@ -2062,11 +2109,20 @@ def resolve_agent(args) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tauceti", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        prog="tauceti", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Run 'tauceti work -h' for the work units, examples, multi-worker setup, and\n"
+               "environment variables. See README.md for the full reference.")
     sub = p.add_subparsers(dest="cmd")
 
-    w = sub.add_parser("work", help="do work: one round, or the driver loop with --loop")
+    w = sub.add_parser(
+        "work", help="do work: one round, or the driver loop with --loop",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Do one unit of work and exit, or pass --loop to run the driver. A round picks the\n"
+                    "first applicable job from the cascade (or from --only), paces subscription agents\n"
+                    "against your quota, and runs it on --agent inside a bubble sandbox (or --host).",
+        epilog=WORK_EPILOG)
     add_work_flags(w)
 
     s = sub.add_parser("status", help="read-only survey of available work + quota")
@@ -2231,11 +2287,14 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # children inherit it.
     if getattr(args, "stream", False):
         os.environ["TAUCETI_STREAM"] = "1"
-    # --isolate-home must set $HOME BEFORE Config.resolve (so cfg.home + credential paths point at the
-    # per-worker copy). Children spawned by the loop inherit $HOME and don't re-isolate.
-    if getattr(args, "isolate_home", False):
-        isolate_home(sanitize_wid(getattr(args, "worker_id", None)
-                                  or os.environ.get("TAUCETI_WORKER_ID", "default") or "default"))
+    # A distinct worker id implies its own $HOME (so several workers' credential refreshes don't race);
+    # --isolate-home forces it even for the 'default' id. This must set $HOME BEFORE Config.resolve, so
+    # cfg.home + credential paths point at the per-worker copy. isolate_home is a no-op when $HOME is
+    # already the worker home, so loop children that inherit it don't re-isolate.
+    wid = sanitize_wid(getattr(args, "worker_id", None)
+                       or os.environ.get("TAUCETI_WORKER_ID", "default") or "default")
+    if wid != "default" or getattr(args, "isolate_home", False):
+        isolate_home(wid)
     cfg = Config.resolve(getattr(args, "worker_id", None))
     if getattr(args, "loop", False) and not one_round:
         return cmd_loop(args, cfg, only=only, agent=agent)
@@ -2360,9 +2419,11 @@ def isolate_home(wid: str) -> Path:
     repointing is a no-op there: the spawned claude reads the shared Keychain regardless, and the pacer's
     read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature."""
     import shutil
+    home = HERE / "state" / wid / "home"
+    if Path(os.environ.get("HOME", "")) == home:
+        return home   # already isolated (a loop child inherits the parent's $HOME) — don't re-copy or warn
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
     real_claude = claude_dir(real)   # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
-    home = HERE / "state" / wid / "home"
     iso_claude = home / ".claude"
     iso_claude.mkdir(parents=True, exist_ok=True)
     (home / ".codex").mkdir(parents=True, exist_ok=True)
@@ -2390,6 +2451,16 @@ def isolate_home(wid: str) -> Path:
     src, dst = real / ".codex" / "auth.json", home / ".codex" / "auth.json"
     if src.exists() and not dst.exists():
         shutil.copy2(src, dst)
+    # Keep host-side gh and git working under the isolated $HOME: the survey's `gh pr list` and host
+    # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
+    # point them back at the operator's real config rather than an empty isolated one. Respect a value
+    # the operator already exported. Children inherit these, so the early-return path above is covered.
+    gh_cfg = real / ".config" / "gh"
+    if gh_cfg.is_dir():
+        os.environ.setdefault("GH_CONFIG_DIR", str(gh_cfg))
+    git_cfg = real / ".gitconfig"
+    if git_cfg.exists():
+        os.environ.setdefault("GIT_CONFIG_GLOBAL", str(git_cfg))
     os.environ["HOME"] = str(home)
     os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)   # so claude_dir() + the spawned claude agree
     log(f"isolated HOME={home} (worker '{wid}')")
