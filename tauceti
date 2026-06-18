@@ -2189,8 +2189,8 @@ def cmd_tui(args) -> int:
             sel = (sel + 1) % len(ALLOWED_TASKS); continue
         if choice == "RIGHT":
             kind = ALLOWED_TASKS[sel]
-            if kind == "roadmap" and areas is None:          # lazily fetch the area list, once
-                areas = roadmap_areas(GitHub())
+            if kind == "roadmap" and not areas:              # fetch lazily; retry while empty so a
+                areas = roadmap_areas(GitHub())              # transient failure ([]) isn't cached forever
             expanded.add(kind); continue                     # list this kind's PRs (or roadmap areas)
         if choice == "LEFT":
             expanded.discard(ALLOWED_TASKS[sel]); continue   # collapse
@@ -2205,7 +2205,7 @@ def cmd_tui(args) -> int:
             continue
         if choice == "f":                  # pick the roadmap focus (affects display + launched rounds)
             console.print("[dim]  fetching roadmap areas…[/]")
-            if areas is None:
+            if not areas:                                    # retry while empty (transient failure → [])
                 areas = roadmap_areas(GitHub())
             cur = roadmap_focus()
             if areas:                      # arrow-key picker over the real areas + "all areas"
