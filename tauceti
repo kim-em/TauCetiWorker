@@ -2019,27 +2019,74 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
 # CLI
 # ============================================================================
 
+WORK_EPILOG = """\
+the cascade (priority order; a round does the first that applies):
+  rebase    bring our open PRs up to date with their base branch
+  review    review an open PR (runs the tauceti-review engine)
+  fix-ci    fix red CI on one of our PRs
+  fix       address review feedback on one of our PRs
+  bump      adapt a red hopscotch/lkg-bump PR (the worker never authors one)
+  roadmap   open a new PR for a roadmap item
+
+  With no --only a round walks the whole cascade; --only pins it to a subset.
+
+examples:
+  tauceti work                          one round: auto agent, in a bubble
+  tauceti work --loop                   the driver: keep picking the best job
+  tauceti work --loop --only review     a focused reviewer
+  tauceti work --only roadmap --roadmap-focus ReductiveGroups
+  tauceti work --agent claude --host    run Opus directly on the host
+  tauceti work --dry-run                show what it WOULD do; act on nothing
+
+multiple workers (share a host, coordinate through GitHub):
+  tauceti work --loop --worker-id alice --isolate-home --only review
+  tauceti work --loop --worker-id bob   --isolate-home --only roadmap
+
+environment (flags win; see README.md for the full list):
+  TAUCETI_AGENT          default for --agent
+  TAUCETI_WORKER_ID      default for --worker-id
+  TAUCETI_ROADMAP_FOCUS  default for --roadmap-focus
+  TAUCETI_QUOTA_CMD      default for --quota-cmd
+  TAUCETI_STREAM=1       same as --stream
+  CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
+                         (account switching, where the creds live in a file)
+"""
+
+
 def add_work_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--loop", action="store_true", help="keep doing rounds (the driver); default is one round")
+    p.add_argument("--loop", action="store_true",
+                   help="run the driver: keep doing rounds (pacing against quota between them) "
+                        "instead of the default single round")
     p.add_argument("--only", action="append", default=[], metavar="TASKS",
-                   help="restrict to these work units (comma list): " + ", ".join(ALLOWED_TASKS))
+                   help="restrict the round to these work units, a comma list of: "
+                        + ", ".join(ALLOWED_TASKS) + " (default: walk the whole cascade)")
     p.add_argument("--agent", choices=AGENTS, default=None,
-                   help="which agent to run (default: $TAUCETI_AGENT or auto)")
-    p.add_argument("--host", action="store_true", help="opt OUT of bubble (default: bubble)")
+                   help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
+                        "or deepseek/minimax (pay-per-token OpenRouter; run with --host until "
+                        "kim-em/bubble#299 lands pi in the sandbox) (default: $TAUCETI_AGENT or auto)")
+    p.add_argument("--host", action="store_true",
+                   help="opt OUT of the bubble sandbox and run the agent directly on the host "
+                        "(faster, but the agent gets your full credentials and network; default: bubble)")
     p.add_argument("--stream", action="store_true",
                    help="stream the agent's (noisy) conversation log to the terminal; "
-                        "default redirects it to a file under logs/ and prints the path")
+                        "default redirects it to a file under logs/ and prints the path (or $TAUCETI_STREAM=1)")
     p.add_argument("--roadmap-focus", dest="roadmap_focus", default=None, metavar="AREA",
-                   help="roadmap area to steer toward (empty string = all areas); "
-                        "overrides $TAUCETI_ROADMAP_FOCUS for this run")
+                   help="for roadmap rounds, the roadmap subdirectory to steer toward "
+                        "(empty string = all areas); overrides $TAUCETI_ROADMAP_FOCUS for this run")
     p.add_argument("--ignore-quota", dest="ignore_quota", action="store_true",
                    help="ignore the quota pacer; run the requested --agent regardless of pace "
                         "(needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)")
     p.add_argument("--quota-cmd", default=os.environ.get("TAUCETI_QUOTA_CMD"),
-                   help="external command that decides agent availability (overrides the built-in pacer)")
-    p.add_argument("--worker-id", dest="worker_id", default=None, help="stable worker id (else 'default')")
+                   help="external command that decides agent availability, run as '<cmd> <agent>' "
+                        "(first stdout token = model to run; empty output or nonzero exit = wait); "
+                        "overrides the built-in pacer (or $TAUCETI_QUOTA_CMD)")
+    p.add_argument("--worker-id", dest="worker_id", default=None, metavar="ID",
+                   help="stable name that namespaces this worker's state, checkout, review store, and logs; "
+                        "use a distinct id (and --isolate-home) per worker when several share a host "
+                        "(default: $TAUCETI_WORKER_ID or 'default')")
     p.add_argument("--isolate-home", dest="isolate_home", action="store_true",
-                   help="per-worker Claude/Codex auth state (needed for multi-worker)")
+                   help="give this worker its own $HOME for Claude/Codex auth state so credential "
+                        "refreshes don't race; needed when running multiple workers on one host")
     p.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="survey + print the picker's decision; act on nothing")
 
@@ -2062,11 +2109,20 @@ def resolve_agent(args) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tauceti", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        prog="tauceti", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Run 'tauceti work -h' for the work units, examples, multi-worker setup, and\n"
+               "environment variables. See README.md for the full reference.")
     sub = p.add_subparsers(dest="cmd")
 
-    w = sub.add_parser("work", help="do work: one round, or the driver loop with --loop")
+    w = sub.add_parser(
+        "work", help="do work: one round, or the driver loop with --loop",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Do one unit of work and exit, or pass --loop to run the driver. A round picks the\n"
+                    "first applicable job from the cascade (or from --only), paces subscription agents\n"
+                    "against your quota, and runs it on --agent inside a bubble sandbox (or --host).",
+        epilog=WORK_EPILOG)
     add_work_flags(w)
 
     s = sub.add_parser("status", help="read-only survey of available work + quota")
