@@ -45,6 +45,7 @@ from typing import Any, Optional
 HERE = Path(__file__).resolve().parent
 
 TAUCETI = "FormalFrontier/TauCeti"
+TAUCETI_OWNER = TAUCETI.split("/", 1)[0]   # base-repo owner: a bot PR is first-party iff its head lives here
 ROADMAP = "FormalFrontier/TauCetiRoadmap"
 REVIEW = "FormalFrontier/TauCetiReview"
 
@@ -1089,11 +1090,14 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     nondraft = [p for p in prs if not p.is_draft]
     me_login = me()
     mine = [p for p in nondraft if p.author == me_login]
-    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci): its own, plus bot-authored
-    # ones — the review bot's bump PRs are automation the fleet maintains, not a third party's PR. (A
-    # human contributor's PR is neither, so it is left alone.) Roadmap backpressure still counts only
-    # `mine`: it bounds how many PRs WE author, which a bot's PRs don't.
-    tended = [p for p in nondraft if p.author == me_login or p.author_is_bot]
+    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci): its own, plus FIRST-PARTY
+    # bot automation — a bot-authored PR whose head branch lives in the base repo (the review bot's
+    # bump PRs). Requiring the head in-repo keeps the worker off a fork or an external/unrelated bot's
+    # branch (which it either can't push to, or shouldn't touch); a human contributor's PR is neither
+    # ours nor a first-party bot's, so it is left alone. Roadmap backpressure still counts only `mine`:
+    # it bounds how many PRs WE author, which a bot's PRs don't.
+    tended = [p for p in nondraft
+              if p.author == me_login or (p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)
