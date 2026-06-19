@@ -73,18 +73,23 @@ def main():
           '| select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))',
           [p.number for p in prs if not p.is_draft and p.build_success])
 
-    # rebaseable: mine, non-draft, CONFLICTING (round.sh 832-835).
-    check("rebaseable",
-          '.[] | select(.isDraft|not) | select(.author.login=="%s") | select(.mergeable=="CONFLICTING")' % ME,
-          [p.number for p in prs if not p.is_draft and p.author == ME and p.mergeable == "CONFLICTING"])
+    # tended = a PR the maintenance stages act on: ours OR bot-authored (the review bot's bump PRs).
+    tended = '(.author.login=="%s" or .author.is_bot)' % ME
 
-    # red_ci: mine, build check FAILED-ish (round.sh 878-882).
+    # rebaseable: tended, non-draft, CONFLICTING.
+    check("rebaseable",
+          '.[] | select(.isDraft|not) | select(%s) | select(.mergeable=="CONFLICTING")' % tended,
+          [p.number for p in prs
+           if not p.is_draft and (p.author == ME or p.author_is_bot) and p.mergeable == "CONFLICTING"])
+
+    # fix-ci: tended, build check FAILED-ish, but NOT a bump PR (those go to the bump stage).
     fail_set = '"FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"'
-    check("red_ci",
-          '.[] | select(.author.login=="%s") '
+    check("fix-ci",
+          '.[] | select(%s) | select(.headRefName|startswith("bump-mathlib/")|not) '
           '| select([.statusCheckRollup[]? | select(.name=="build") '
-          '| select(.conclusion | IN(%s))] | any)' % (ME, fail_set),
-          [p.number for p in prs if p.author == ME and p.build_failed])
+          '| select(.conclusion | IN(%s))] | any)' % (tended, fail_set),
+          [p.number for p in prs if (p.author == ME or p.author_is_bot) and p.build_failed
+           and not p.head_ref.startswith("bump-mathlib/")])
 
     # bump: a bump-mathlib PR (bot-authored) whose build is red.
     check("bump (bump-mathlib)",

@@ -1000,6 +1000,7 @@ class PRInfo:
     author: str
     build_success: bool
     build_failed: bool
+    author_is_bot: bool = False   # a GitHub App / bot author (e.g. the review bot's bump PRs)
     title: str = ""
 
     @staticmethod
@@ -1016,6 +1017,7 @@ class PRInfo:
             is_draft=bool(d.get("isDraft")),
             mergeable=d.get("mergeable", "UNKNOWN"),
             author=(d.get("author") or {}).get("login", ""),
+            author_is_bot=bool((d.get("author") or {}).get("is_bot")),
             build_success=any(c.get("conclusion") == "SUCCESS" for c in builds),
             build_failed=any(c.get("conclusion") in BUILD_FAIL for c in builds),
         )
@@ -1085,14 +1087,22 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     prs = [PRInfo.from_json(d) for d in raw]
     sv.open_prs = prs
     nondraft = [p for p in prs if not p.is_draft]
-    mine = [p for p in nondraft if p.author == me()]
+    me_login = me()
+    mine = [p for p in nondraft if p.author == me_login]
+    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci): its own, plus bot-authored
+    # ones — the review bot's bump PRs are automation the fleet maintains, not a third party's PR. (A
+    # human contributor's PR is neither, so it is left alone.) Roadmap backpressure still counts only
+    # `mine`: it bounds how many PRs WE author, which a bot's PRs don't.
+    tended = [p for p in nondraft if p.author == me_login or p.author_is_bot]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)
     sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
 
-    # 1) rebase: ours, CONFLICTING, under budgets (review budget owns past-budget PRs).
-    for p in mine:
+    # 1) rebase: tended (ours or bot-authored), CONFLICTING, under budgets (review budget owns
+    #    past-budget PRs). Covers a bot bump PR that main moved out from under — no bump-specific
+    #    conflict resolver exists, so rebase owns the git conflict on those too.
+    for p in tended:
         if p.mergeable != "CONFLICTING":
             continue
         c = Candidate(p.number, p.head_oid, "conflicting")
@@ -1154,8 +1164,10 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
             sv.reviewable.actionable.append(c)
 
     if deep:
-        # 3) fix: ours, reviewed-at-head, latest rubric blocking, under budgets.
-        for p in mine:
+        # 3) fix: tended (ours or bot-authored), reviewed-at-head, latest rubric blocking, under
+        #    budgets. Bump PRs get reviewed like any other, so a blocking rubric on one is ours to fix
+        #    (orthogonal to the bump stage, which only adapts a RED build).
+        for p in tended:
             if rs.ledger_head(p.number) != p.head_oid:
                 continue
             if not rs.ledger_blocking(p.number, p.head_oid):
@@ -1168,9 +1180,11 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
             else:
                 sv.needs_fix.actionable.append(c)
 
-    # 4) fix-ci: ours, build FAILED at head, under budgets.
-    for p in mine:
-        if not p.build_failed:
+    # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
+    #    the bump stage's job (its adaptation prompt knows mathlib moved), so fix-ci defers those to
+    #    bump; it picks up only non-bump red PRs (ours, or any other bot-authored one).
+    for p in tended:
+        if not p.build_failed or p.head_ref.startswith(BUMP_HEAD_PREFIX):
             continue
         c = Candidate(p.number, p.head_oid, "build failed at head")
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
@@ -1183,8 +1197,9 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
 
     # 5) bump: a bump-mathlib PR (opened by the review bot) whose build is RED — mathlib moved
     #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
-    #    author a bump (the bot owns opening them, CI owns merging the green ones). These PRs are
-    #    bot-authored, so the fix/fix-ci steps (which scope to our own PRs) never touch them.
+    #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
+    #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
+    #    fix still owns its review findings).
     for p in nondraft:
         if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
             continue
