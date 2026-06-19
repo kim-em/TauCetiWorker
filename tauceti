@@ -1277,6 +1277,28 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
         return True
 
+    def begin_review(self, pr: int, head: str, reviewer: str) -> bool:
+        """Take a cooperative review claim so a fleet doesn't pay twice for IDENTICAL review work.
+        The key is scoped to (pr, head, reviewer): two workers running the same reviewer model over
+        the same commit dedup, but different models — or the same model after a new push — are
+        distinct units that both proceed (and both land in the backend DB). Returns False if another
+        worker holds a live lease (caller skips to the next candidate). Pure [COOP] dedup: a review
+        pushes nothing to the PR branch, so there is no push-arbiter env and no [HARD] guarantee — a
+        claim error or expired lease only risks a duplicate review, never a corrupted branch.
+        Heartbeat + release mirror begin_branch_work (one claim per round)."""
+        key = f"review/{pr}/{head[:12]}/{reviewer.replace('/', '-').replace(' ', '')}"
+        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True).returncode
+        if rc == 1:
+            log(f"review #{pr} claimed by another worker — skipping (COOP dedup)")
+            return False
+        if rc == 0:
+            self.held = key
+            self.ctx.add_cleanup(self.release)
+            self.start_heartbeat(key)
+        else:
+            log(f"claim acquire review #{pr} errored (rc={rc}) — proceeding unclaimed (duplicate review possible)")
+        return True
+
     def start_heartbeat(self, key: str) -> None:
         rfd, wfd = os.pipe()
         os.set_inheritable(rfd, True)
@@ -1855,11 +1877,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
 # --- the work units (host path here; bubble path lands in M9) ---------------
 
-def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
+def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> Optional[int]:
     pr, head = c.pr, c.head
     reviewers = opts.work_model
     if reviewers in ("auto", ""):
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
+    if not w.claims.begin_review(pr, head, reviewers):
+        return None   # another worker is already reviewing this PR (COOP dedup) → caller tries next
     errkey = f"review-err-{pr}"
     leasekey = f"review-reply-lease-{pr}"
     if c.contest:
