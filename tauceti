@@ -69,7 +69,12 @@ MAX_REVIEW_ERRORS = 3       # give up re-trying a PR whose review keeps erroring
 MAX_REVIEW_CONTESTS = 10    # per-PR lifetime cap on author-contest re-reviews (no-bar: anyone may
                             # reply, so this bounds spend; separate from the review-round budget)
 MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't starve the PR's budget
-REPLY_LEASE_TTL = 300       # seconds an in-flight contest-dispatch lease suppresses a re-fire
+CONTEST_CLAIM_TTL = 3600    # seconds a 👀 on the contested reply claims an in-flight contest re-review.
+                            # The claim lives on GitHub (a reaction on the reply comment), so it dedups
+                            # ACROSS the fleet — unlike a per-worker counter, which can't coordinate
+                            # between isolated stores. Removed once the round publishes; this TTL is only
+                            # the backstop that frees a claim left by a worker that crashed mid-review.
+CONTEST_CLAIM_EMOJI = "eyes"
 MAX_CI_ATTEMPTS = 3         # per-head: stop trying to green a red-CI head
 MAX_CI_PR_ATTEMPTS = 5      # per-PR lifetime backstop for red-CI fixing
 MAX_REBASE_ATTEMPTS = 3     # per-PR: stop trying to rebase a conflicting PR
@@ -210,6 +215,17 @@ def run(argv: list[str], *, cwd: Optional[Path] = None, env: Optional[dict] = No
     )
 
 
+def _parse_iso8601(s: Optional[str]) -> Optional[int]:
+    """ISO 8601 (e.g. GitHub's '2026-06-19T08:03:48Z') → epoch seconds, or None on a bad value."""
+    if not s:
+        return None
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
 # ============================================================================
 # GitHub — every gh wrapper. JSON via `gh ... --json` + stdlib json (no jq).
 # ============================================================================
@@ -263,6 +279,59 @@ class GitHub:
         if p.returncode != 0:
             return None
         return p.stdout.strip()
+
+    def reactions(self, comment_id: int) -> Optional[list[dict]]:
+        """Reactions on a pull-request review (thread) comment. Each carries {content, created_at
+        (whole-second ISO 8601), user, id}. None on fetch failure (distinct from no reactions)."""
+        p = self._gh(["api", "--paginate",
+                       f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions?per_page=100"])
+        if p.returncode != 0:
+            return None
+        try:
+            return json.loads(p.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+
+    def fresh_claim_age(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> Optional[int]:
+        """Seconds since the newest `emoji` reaction on this comment, or None if there is none (or the
+        fetch failed — fail OPEN: a transient API error must not let a stale claim block work forever,
+        and the worst case of a missed claim is a rare double-review, which we've accepted)."""
+        rs = self.reactions(comment_id)
+        if not rs:
+            return None
+        newest = 0
+        for r in rs:
+            if r.get("content") != emoji:
+                continue
+            ts = _parse_iso8601(r.get("created_at"))
+            if ts is not None and ts > newest:
+                newest = ts
+        if not newest:
+            return None
+        return max(0, int(time.time()) - newest)
+
+    def add_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
+        """Add `emoji` to a review comment (idempotent per (login, content)). False on failure — a
+        claim we couldn't post just means a peer may double up, which is acceptable."""
+        p = self._gh(["api", "-X", "POST",
+                       f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions",
+                       "-f", f"content={emoji}"])
+        return p.returncode == 0
+
+    def remove_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
+        """Remove our own `emoji` reaction from a review comment (releases the claim). Looks up the
+        reaction id for THIS login, then deletes it; a no-op (True) if we hold none."""
+        rs = self.reactions(comment_id)
+        if rs is None:
+            return False
+        mine = me()
+        rid = next((r["id"] for r in rs
+                    if r.get("content") == emoji and (r.get("user") or {}).get("login") == mine), None)
+        if rid is None:
+            return True
+        p = self._gh(["api", "-X", "DELETE",
+                       f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions/{rid}"])
+        return p.returncode == 0
 
 
 # ============================================================================
@@ -961,6 +1030,7 @@ class Candidate:
     budget: int = 0
     provenance: str = "fresh"
     contest: str = ""        # set to the contested rubric when this is an author-contest re-review
+    contest_reply_id: int = 0  # the review-comment id of the contesting reply (the 👀 claim anchor)
 
 
 @dataclass
@@ -1066,14 +1136,15 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
         through = through if isinstance(through, int) else 0
         if reply["id"] <= through:
             continue  # already adjudicated by some review round
-        # An in-flight dispatch lease suppresses a re-fire in the window before the new scoreboard
-        # lands; stale leases (a crashed dispatch) expire so the contest is retried.
-        lease = counters.read(f"review-reply-lease-{p.number}")
-        if lease and (int(time.time()) - lease) < REPLY_LEASE_TTL:
+        # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
+        # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
+        # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
+        age = gh.fresh_claim_age(reply["id"])
+        if age is not None and age < CONTEST_CLAIM_TTL:
             continue
         rubric = reply["rubric"]
         c = Candidate(p.number, p.head_oid, f"author contest on {rubric}", provenance=m.provenance,
-                      contest=rubric,
+                      contest=rubric, contest_reply_id=reply["id"],
                       attempts=counters.read(f"review-contest-{p.number}"), budget=MAX_REVIEW_CONTESTS)
         if (counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
                 or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
@@ -1861,50 +1932,53 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
     if reviewers in ("auto", ""):
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
-    leasekey = f"review-reply-lease-{pr}"
     if c.contest:
-        # Lease the in-flight contest so a re-survey before the new scoreboard lands does not re-fire
-        # it. The engine auto-detects the contest from the thread reply (no extra flag); a contest-
-        # only round is recorded as a reply round, so it does not consume the review-round budget.
-        w.counters.write(leasekey, int(time.time()))
+        # Claim the in-flight contest with a 👀 on the contesting reply so a peer worker re-surveying
+        # before the new scoreboard lands skips it (cross-fleet dedup). The engine auto-detects the
+        # contest from the thread reply (no extra flag); a contest-only round is recorded as a reply
+        # round, so it does not consume the review-round budget.
+        if c.contest_reply_id and not w.gh.add_reaction(c.contest_reply_id):
+            log(f"  review #{pr}: contest claim (👀) failed to post — a peer may double-review")
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
         nrnd = w.rs.review_rounds(pr, w.counters)
         log(f"  review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget @ {head[:12]}, reviewers={reviewers}")
-    if bubble:
-        rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
-    else:
-        rc = subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
-                             str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
-                             "--reviewer", reviewers, "--expect-head", head,
-                             "--submitted-by", me()]).returncode
-    if rc == 0:
-        # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
-        # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
-        # outbox mean the merge gate can't see this round, so don't report the round as a success.
-        srv = _sync_review_outbox(w, pr)
-        if srv != 0:
-            log(f"  review #{pr}: archived but the TauCetiData sync FAILED — records remain in "
-                f"{w.cfg.store_dir / 'outbox'} (the merge gate can't see this round until they "
-                f"land); a later round retries the drain")
-            w.counters.incr(errkey)
+    try:
+        if bubble:
+            rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
+        else:
+            rc = subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
+                                 str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
+                                 "--reviewer", reviewers, "--expect-head", head,
+                                 "--submitted-by", me()]).returncode
+        if rc == 0:
+            # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
+            # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
+            # outbox mean the merge gate can't see this round, so don't report the round as a success.
+            srv = _sync_review_outbox(w, pr)
+            if srv != 0:
+                log(f"  review #{pr}: archived but the TauCetiData sync FAILED — records remain in "
+                    f"{w.cfg.store_dir / 'outbox'} (the merge gate can't see this round until they "
+                    f"land); a later round retries the drain")
+                w.counters.incr(errkey)
+                return srv
+            w.counters.write(errkey, 0)
             if c.contest:
-                w.counters.write(leasekey, 0)  # release the lease; the contest retries next round
-            return srv
-        w.counters.write(errkey, 0)
-        if c.contest:
-            # The engine advanced replies_through in the new scoreboard (the durable per-reply
-            # watermark); rs.bust below re-fetches it, so this contest won't re-fire. Just bump the
-            # contest caps and release the lease.
-            w.counters.incr(f"review-contest-{pr}")
-            w.counters.incr(f"review-contest-{pr}-{c.contest}")
-            w.counters.write(leasekey, 0)
-        w.rs.bust(pr)
-    else:
-        w.counters.incr(errkey)
-        if c.contest:
-            w.counters.write(leasekey, 0)  # release the lease; the contest retries next round
-    return rc
+                # The engine advanced replies_through in the new scoreboard (the durable per-reply
+                # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀
+                # is dropped. Just bump the contest caps.
+                w.counters.incr(f"review-contest-{pr}")
+                w.counters.incr(f"review-contest-{pr}-{c.contest}")
+            w.rs.bust(pr)
+        else:
+            w.counters.incr(errkey)
+        return rc
+    finally:
+        # Drop the claim: on success the watermark now prevents a re-fire; on failure releasing it lets
+        # the contest be retried. A crash before here leaves the 👀 to TTL out (CONTEST_CLAIM_TTL).
+        if c.contest and c.contest_reply_id and not w.gh.remove_reaction(c.contest_reply_id):
+            log(f"  review #{pr}: contest claim (👀) failed to release — it will TTL out in "
+                f"{CONTEST_CLAIM_TTL // 60}m")
 
 
 def _sync_review_outbox(w: "Worker", pr: int) -> int:
