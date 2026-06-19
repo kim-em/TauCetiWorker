@@ -12,7 +12,7 @@ The worker acts on FormalFrontier/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
 of work, chosen in priority order: rebase → review → fix-ci → fix → bump → roadmap.
 The `bump` step
-adapts a red hopscotch/lkg-bump PR (the review bot opens those; the worker never
+adapts a red bump-mathlib PR (the review bot opens those; the worker never
 authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI, not
 the worker.
 
@@ -73,8 +73,9 @@ REPLY_LEASE_TTL = 300       # seconds an in-flight contest-dispatch lease suppre
 MAX_CI_ATTEMPTS = 3         # per-head: stop trying to green a red-CI head
 MAX_CI_PR_ATTEMPTS = 5      # per-PR lifetime backstop for red-CI fixing
 MAX_REBASE_ATTEMPTS = 3     # per-PR: stop trying to rebase a conflicting PR
-MAX_BUMP_ATTEMPTS = 3       # per-head: stop trying to green a red hopscotch bump head
+MAX_BUMP_ATTEMPTS = 3       # per-head: stop trying to green a red bump-mathlib head
 MAX_BUMP_PR_ATTEMPTS = 5    # per-PR lifetime backstop for bump fixing across heads
+BUMP_HEAD_PREFIX = "bump-mathlib/"   # branch prefix the review bot opens its mathlib-bump PRs on
 MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
 
 ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # default; "" = all areas
@@ -983,7 +984,7 @@ class Survey:
     reviewable: WorkKind = field(default_factory=lambda: WorkKind("review"))
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
     red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
-    bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))   # broken hopscotch/lkg-bump PRs
+    bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))   # broken bump-mathlib PRs
     roadmap_focus: str = ""
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
@@ -1109,14 +1110,14 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
         else:
             sv.red_ci.actionable.append(c)
 
-    # 5) bump: a hopscotch/lkg-bump PR (opened by the review bot) whose build is RED — mathlib moved
+    # 5) bump: a bump-mathlib PR (opened by the review bot) whose build is RED — mathlib moved
     #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
     #    author a bump (the bot owns opening them, CI owns merging the green ones). These PRs are
     #    bot-authored, so the fix/fix-ci steps (which scope to our own PRs) never touch them.
     for p in nondraft:
-        if not (p.head_ref.startswith("hopscotch/") and p.build_failed):
+        if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
             continue
-        c = Candidate(p.number, p.head_oid, "hopscotch bump, build red")
+        c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
@@ -1734,7 +1735,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
     # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
     # fix-ci before fix: a red PR can't be reviewed or review-fixed until it builds. bump adapts a
-    # hopscotch/lkg-bump PR (opened by the review bot) that mathlib moved out from under.
+    # bump-mathlib PR (opened by the review bot) that mathlib moved out from under.
     for stage in ("rebase", "review", "fix-ci", "fix", "bump"):
         if not want(opts.only, stage):
             continue
@@ -1982,7 +1983,7 @@ def do_rebase(w, sv, c, opts, bubble) -> Optional[int]:
 
 
 def do_bump(w, sv, c, opts, bubble) -> Optional[int]:
-    """Adapt a red hopscotch/lkg-bump PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
+    """Adapt a red bump-mathlib PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
     w.counters.incr(f"bump-{pr}-{head[:12]}")   # count up front so an un-checkout-able PR can't loop
@@ -2022,7 +2023,7 @@ the cascade (priority order; a round does the first that applies):
   review    review an open PR (runs the tauceti-review engine)
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
-  bump      adapt a red hopscotch/lkg-bump PR (the worker never authors one)
+  bump      adapt a red bump-mathlib PR (the worker never authors one)
   roadmap   open a new PR for a roadmap item
 
   With no --only a round walks the whole cascade; --only pins it to a subset.
@@ -2243,7 +2244,7 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
         extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
         note = (_sample(wk.actionable) or "") + extra
         if name == "bump" and not wk.actionable and not wk.suppressed:
-            note = "no broken hopscotch bump"
+            note = "no broken bump-mathlib PR"
         t.add_row(num, kind_cell, ready, note, style=style)
         if name in expanded:                            # tree-style PR list under the expanded kind
             rows = [(c, False) for c in wk.actionable] + [(c, True) for c in wk.suppressed]
@@ -2820,7 +2821,7 @@ def _dashboard_app(cfg, loader=None):
                 extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
                 note = (_sample(wk.actionable) or "") + extra
                 if name == "bump" and not wk.actionable and not wk.suppressed:
-                    note = "no broken hopscotch bump"
+                    note = "no broken bump-mathlib PR"
                 self._hdr_row[name] = t.row_count
                 t.add_row(cell(num), cell(marker + name), cell(ready), cell(note))
                 if name in self.expanded:

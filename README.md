@@ -71,7 +71,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. |
 | **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
-| **Bump** | Adapt a red `hopscotch/lkg-bump` PR (the [hopscotch bot](https://github.com/leanprover-community/hopscotch) opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
+| **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/FormalFrontier/TauCetiRoadmap) target. |
 
 Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
@@ -92,7 +92,7 @@ applies. `--only <task>[,<task>...]` pins it to particular kinds:
 tauceti work --loop --only review     # only review open PRs
 tauceti work --loop --only roadmap    # only open new roadmap PRs
 tauceti work --loop --only fix,fix-ci # only tend to our own PRs
-tauceti work --loop --only bump       # only adapt broken hopscotch bump PRs
+tauceti work --loop --only bump       # only adapt broken bump-mathlib PRs
 ```
 
 The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
