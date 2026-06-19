@@ -86,12 +86,12 @@ def main():
           '| select(.conclusion | IN(%s))] | any)' % (ME, fail_set),
           [p.number for p in prs if p.author == ME and p.build_failed])
 
-    # bump: a hopscotch/lkg-bump PR (bot-authored) whose build is red.
-    check("bump (hopscotch)",
-          '.[] | select(.headRefName|startswith("hopscotch/")) '
+    # bump: a bump-mathlib PR (bot-authored) whose build is red.
+    check("bump (bump-mathlib)",
+          '.[] | select(.headRefName|startswith("bump-mathlib/")) '
           '| select([.statusCheckRollup[]? | select(.name=="build") '
           '| select(.conclusion | IN(%s))] | any)' % fail_set,
-          [p.number for p in prs if p.head_ref.startswith("hopscotch/") and p.build_failed])
+          [p.number for p in prs if p.head_ref.startswith("bump-mathlib/") and p.build_failed])
 
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} selector mismatch(es)")
     return 1 if fails else 0
