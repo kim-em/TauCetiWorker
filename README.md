@@ -291,5 +291,6 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
   these on `PATH` inside a round, so they stay shell.
 - `prompts/*.md`: the per-task agent prompts.
 - `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`, `claude_config_dir.py`,
-  `claude_keychain.py`.
+  `claude_keychain.py`, `contest_claim.py`, `inflight_review.py`, `ledger_blocking.py`,
+  `dashboard.py`, `mirror_creds.py`.
 - `checkouts/`, `state/`, `logs/`: runtime only, git-ignored.

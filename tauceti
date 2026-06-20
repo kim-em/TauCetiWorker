@@ -131,6 +131,15 @@ CLAIM_TTL_S = int(os.environ.get("CLAIM_TTL", "1500"))         # 25 min lease; e
 CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every 5 min while the agent runs
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))   # seconds a cached scoreboard meta stays fresh
 
+# In-flight review de-contention. The review engine (TauCetiReview) posts a PR comment marking a head
+# as under review and embeds an `expires_at` so a crashed reviewer self-clears. De-contention is on the
+# head ALONE (a commit is reviewed once, regardless of model), and the engine's coordinate() remains the
+# authoritative claim. The worker reads the SAME marker during the survey so it can skip a head a peer is
+# already reviewing BEFORE paying the engine's build+launch cost — and, crucially, without busy-looping
+# on the one PR a peer holds. The marker format is owned by the engine; we parse only the head and the
+# expiry, so the engine's TTL value stays its own concern.
+REVIEW_INPROGRESS_RE = re.compile(r"<!--tauceti-review-in-progress (.*?)-->", re.S)
+
 # Agents.
 OPENROUTER_MODELS = {
     "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek/deepseek-v4-pro"),
@@ -1131,10 +1140,38 @@ class Survey:
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
     # escalates — a loud warning + a tracking issue — rather than stranding them silently.
     review_stuck: list[int] = field(default_factory=list)
+    # Heads a peer reviewer is actively reviewing right now (an unexpired in-progress marker on the
+    # exact head). Skipped this round so the worker neither pays the engine's launch cost just to have
+    # it skip nor busy-loops on the one PR a peer holds. (pr, providers) for a one-line status note.
+    review_inflight: list[tuple[int, str]] = field(default_factory=list)
 
     def kind(self, name: str) -> WorkKind:
         return {"rebase": self.rebaseable, "review": self.reviewable, "fix": self.needs_fix,
                 "fix-ci": self.red_ci, "bump": self.bump}[name]
+
+
+def inflight_review_providers(comments: Optional[list[dict]], head: str, now: int) -> set[str]:
+    """Providers named by any UNEXPIRED in-progress review marker on this EXACT head (a new push is a
+    new unit, so the head must match). Mirrors the review engine's de-contention read so the worker can
+    skip a head a peer already holds before launching the engine. Empty set when none apply; a fetch
+    failure (comments is None) is treated as 'not held' and proceeds — fail-open, matching the engine
+    (a rare duplicate review at worst, the engine's own claim still being the backstop)."""
+    cov: set[str] = set()
+    for c in comments or []:
+        m = REVIEW_INPROGRESS_RE.search(c.get("body") or "")
+        if not m:
+            continue
+        try:
+            d = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        exp = d.get("expires_at")
+        if not isinstance(exp, int) or exp <= now:
+            continue
+        if d.get("head") != head:   # exact: a new push is a new unit, not covered by an old marker
+            continue
+        cov.update(p for p in (d.get("providers") or []) if isinstance(p, str))
+    return cov
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
@@ -1207,8 +1244,17 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
             if c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
                 sv.review_stuck.append(p.number)     # can't be reviewed → escalate (warn + issue)
-            else:
-                sv.reviewable.actionable.append(c)
+                continue
+            # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
+            # the same call the engine's coordinate() would make after a full build+launch. Doing it
+            # here keeps the loop off the one PR a peer is reviewing instead of re-selecting it every
+            # round and spending ~25s per pass to have the engine skip. Fail-open (a fetch failure
+            # reads as 'not held'); the engine's own claim is still the authoritative backstop.
+            cov = inflight_review_providers(gh.issue_comments(p.number), p.head_oid, int(time.time()))
+            if cov:
+                sv.review_inflight.append((p.number, ",".join(sorted(cov))))
+                continue
+            sv.reviewable.actionable.append(c)
             continue
         # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
         # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
@@ -1897,6 +1943,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
+    for pr, providers in sv.review_inflight:
+        log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
 
     # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
     # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
