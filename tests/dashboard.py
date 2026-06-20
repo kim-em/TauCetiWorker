@@ -47,7 +47,8 @@ def fake_survey(next_stage="review"):
     sv.n_open_nondraft = 2
     sv.n_reviewable = 2
     sv.reviewable.actionable = [tc.Candidate(101, "x"), tc.Candidate(102, "x")]
-    sv.roadmap_focus = tc.roadmap_focus() or "any"
+    _f = tc.roadmap_focus()                       # mirror survey()'s sanitization: None → "auto"
+    sv.roadmap_focus = "auto" if _f is None else (_f or "any")
     sv.next_auto_stage = next_stage
     return sv
 
@@ -174,11 +175,81 @@ def test_load_token():
     check("stale load result ignored", app.sv == "FRESH")
 
 
+def test_random_default():
+    """The new default: with no focus set, do_roadmap resolves "auto" to a random roadmap area
+    (and falls back to "all areas" when the area list can't be fetched). Stub the IO so only the
+    focus-resolution + prompt substitution runs."""
+    captured = {}
+    orig = {k: getattr(tc, k) for k in ("fetch_ref", "prepare_checkout", "run_agent_host", "roadmap_areas")}
+    orig_choice = tc.random.choice
+    tc.fetch_ref = lambda *a, **k: True
+    tc.prepare_checkout = lambda cfg: True
+    tc.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
+    cfg = SimpleNamespace(state=Path("/tmp/tauceti-test/state"), checkout=Path("/tmp/tauceti-test/co"),
+                          logdir=Path("/tmp/tauceti-test"))
+    w = SimpleNamespace(cfg=cfg, gh=object())
+    opts = SimpleNamespace(agent_name="Claude Code", work_model="claude")
+    try:
+        # areas available → a random area is chosen and substituted into the prompt
+        tc.roadmap_areas = lambda gh: ["algebra", "topology"]
+        tc.random.choice = lambda seq: seq[1]          # deterministic: "topology"
+        tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
+        check("auto leaves no __FOCUS__ placeholder", "__FOCUS__" not in captured["prompt"])
+        check("auto picked the area from the list", "`topology`" in captured["prompt"])
+        # no areas (fetch failed) → fall back to all areas ("any")
+        captured.clear()
+        tc.roadmap_areas = lambda gh: []
+        tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
+        check("auto falls back to all areas when the list is empty", "`any`" in captured["prompt"])
+    finally:
+        for k, v in orig.items():
+            setattr(tc, k, v)
+        tc.random.choice = orig_choice
+        os.environ.pop("TAUCETI_REQUIRE_TARGET_MARKER", None)
+
+
+def test_bare_cli_ignores_prefs():
+    """Requirement 1: a saved dashboard pref must NOT be read by a bare CLI run. roadmap_focus()
+    consults only the env, so with a prefs file present but the env unset it stays None (auto)."""
+    cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-cli-")
+    old_xdg, old_env = os.environ.get("XDG_CONFIG_HOME"), os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+    os.environ["XDG_CONFIG_HOME"] = cfgdir
+    try:
+        cfg = SimpleNamespace(home=Path(cfgdir))
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": False, "roadmap_focus": "SavedArea"})
+        check("bare CLI focus is None (auto), ignoring the saved pref", tc.roadmap_focus() is None)
+    finally:
+        os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
+        if old_env is not None:
+            os.environ["TAUCETI_ROADMAP_FOCUS"] = old_env
+
+
+def test_dashboard_uses_saved_pref():
+    """Requirement 1 (other half): the dashboard DOES apply the saved focus — on init it seeds the
+    process env (so its display and any launched round inherit it) when the env is unset."""
+    cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-dash-")
+    old_xdg, old_env = os.environ.get("XDG_CONFIG_HOME"), os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+    os.environ["XDG_CONFIG_HOME"] = cfgdir
+    try:
+        cfg = SimpleNamespace(home=Path(cfgdir), state=Path(cfgdir) / "state", logdir=Path("/tmp/x"))
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": False, "roadmap_focus": "topology"})
+        tc._dashboard_app(cfg, loader=loader)          # runs the saved-pref restore
+        check("dashboard applied the saved focus to the env", os.environ.get("TAUCETI_ROADMAP_FOCUS") == "topology")
+    finally:
+        os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+        os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
+        if old_env is not None:
+            os.environ["TAUCETI_ROADMAP_FOCUS"] = old_env
+
+
 async def run_all():
     await test_dashboard()
     await test_cursor_before_load()
     await test_sticky_env_focus()
     test_load_token()
+    test_random_default()
+    test_bare_cli_ignores_prefs()
+    test_dashboard_uses_saved_pref()
 
 
 asyncio.run(run_all())
