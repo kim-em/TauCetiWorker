@@ -374,11 +374,7 @@ import urllib.error
 import urllib.request
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_BETA = "oauth-2025-04-20"
 SESSION_WINDOW_S = 5 * 3600
 WEEK_WINDOW_S = 7 * 24 * 3600
@@ -402,6 +398,8 @@ class Provider:
     windows: list[Window] = field(default_factory=list)
     error: Optional[str] = None
     next_eligible: Optional[float] = None  # epoch when a blocking window should free
+    retry_after: Optional[float] = None    # seconds the endpoint asked us to back off (HTTP 429); NOT a
+                                           # quota reset — must not be classified as exhausted/next_eligible
 
 
 def _classify_window(name: str, used: Optional[float], elapsed: Optional[float],
@@ -419,29 +417,35 @@ def _classify_window(name: str, used: Optional[float], elapsed: Optional[float],
     return Window(name, used, e, resets_at, st)
 
 
-def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict]:
+def _parse_retry_after(raw: Optional[str]) -> Optional[float]:
+    """A `Retry-After` header is either delta-seconds or an HTTP-date; return seconds-from-now, clamped to
+    [0, 3600] (the server can send bogus/huge/negative values). Returns None when absent/unparseable."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    secs: Optional[float] = None
+    try:
+        secs = float(raw)
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            secs = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if secs is None:
+        return None
+    return max(0.0, min(3600.0, secs))
+
+
+def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict, Optional[float]]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode())
+            return r.status, json.loads(r.read().decode()), None
     except urllib.error.HTTPError as e:
-        return e.code, {}
+        return e.code, {}, _parse_retry_after(e.headers.get("Retry-After"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
         raise GitHubError(f"usage fetch failed: {e}")
-
-
-def _http_post_form(url: str, form: dict, timeout: int = 15) -> tuple[int, dict]:
-    import urllib.parse
-    data = urllib.parse.urlencode(form).encode()
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, {}
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return 0, {}
 
 
 def _read_json_file(path: Path) -> Optional[dict]:
@@ -570,6 +574,72 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         raise
 
 
+def _read_marker(p: Path) -> Optional[str]:
+    try:
+        return p.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _mirror_creds_file(src: Path, dst: Path, *, block_key: str, tok_key: str,
+                       rt_key: str, exp_key: Optional[str]) -> None:
+    """Copy src -> dst with the refresh token STRIPPED, iff src is fresher than dst. Freshness is keyed on
+    the access token changing (the operator's external writer only ever moves forward); a src whose expiry
+    is OLDER than dst's is treated as a torn read and skipped. A missing/unreadable src leaves dst
+    untouched — never blank a good copy. The refresh token is dropped so nothing in the worker (pacer or
+    spawned agent) can rotate the operator's single-use token and invalidate their copy."""
+    sd = _read_json_file(src)
+    if not sd:
+        return                                  # source unreadable this cycle — keep what we have
+    sblk = sd.get(block_key) or {}
+    stok = sblk.get(tok_key)
+    if not stok:
+        return                                  # no usable source access token — nothing to mirror
+    dd = _read_json_file(dst) or {}
+    dblk = dd.get(block_key) or {}
+    if dblk.get(tok_key) == stok and not dblk.get(rt_key):
+        return                                  # already current AND already stripped — nothing to do
+    # else: a changed access token, or a still-present refresh token (e.g. the once-only isolate_home seed
+    # copied the full creds) — re-write, stripping the refresh token.
+    if exp_key:                                 # torn-read guard: don't move expiry backwards
+        se, de = sblk.get(exp_key), dblk.get(exp_key)
+        if isinstance(se, (int, float)) and isinstance(de, (int, float)) and se < de:
+            return
+    out = dict(sd)
+    blk = dict(sblk)
+    blk.pop(rt_key, None)
+    out[block_key] = blk
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_json_atomic(dst, out)
+    except OSError:
+        pass                                    # best-effort; a failed mirror just keeps the prior copy
+
+
+def mirror_creds(cfg: Config) -> None:
+    """Keep an isolated worker's credential copies in step with the operator's real, externally-refreshed
+    files — without ever using a refresh token. The operator runs their own processes that rotate
+    ~/.claude/.credentials.json and ~/.codex/auth.json (they own the single-use refresh token); the worker
+    only READS those and mirrors a fresher access token into its isolated home, refresh token stripped.
+    No-op when not isolated (no seed marker ⇒ the worker reads the live file directly) or on macOS (the
+    Keychain is the store; the keychain-first pacer and _ensure_claude_creds_for_bubble handle it). Safe to
+    call every pacer cycle and before every bubble launch: in steady state it is two small reads + a string
+    compare and no write."""
+    if sys.platform == "darwin":
+        return
+    iso_claude = claude_dir(cfg.home)
+    src_claude = _read_marker(iso_claude / ".tauceti-creds-source")
+    if src_claude:
+        _mirror_creds_file(Path(src_claude) / ".credentials.json", iso_claude / ".credentials.json",
+                           block_key="claudeAiOauth", tok_key="accessToken",
+                           rt_key="refreshToken", exp_key="expiresAt")
+    src_codex = _read_marker(cfg.home / ".codex" / ".tauceti-creds-source")
+    if src_codex:                               # absent on homes seeded before this marker existed
+        _mirror_creds_file(Path(src_codex) / "auth.json", cfg.home / ".codex" / "auth.json",
+                           block_key="tokens", tok_key="access_token",
+                           rt_key="refresh_token", exp_key=None)
+
+
 class Quota:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -609,6 +679,7 @@ class Quota:
         return None
 
     def codex(self) -> Provider:
+        mirror_creds(self.cfg)                    # re-sync the isolated copy from the operator's fresh file
         auth = self._codex_creds()
         if not auth:
             return Provider("codex", False, None, error="no ~/.codex/auth.json")
@@ -622,47 +693,18 @@ class Quota:
             if acct:
                 headers["ChatGPT-Account-Id"] = acct
             try:
-                code, payload = _http_get_json(CODEX_USAGE_URL, headers)
+                code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
             except GitHubError as e:
                 return Provider("codex", False, None, error=str(e))
-            if code == 401:
-                tok = self._refresh_codex(auth)   # one refresh attempt on expiry
-                if not tok:
-                    return Provider("codex", False, None, error="codex 401 (refresh failed)")
-                headers["Authorization"] = f"Bearer {tok}"
-                try:
-                    code, payload = _http_get_json(CODEX_USAGE_URL, headers)
-                except GitHubError as e:
-                    return Provider("codex", False, None, error=str(e))
+            # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
+            # access token simply reads as unavailable until the operator's external refresher rotates it
+            # and mirror_creds picks it up next cycle.
             if code != 200 or not payload:
-                return Provider("codex", False, None, error=f"codex usage HTTP {code}")
+                err = ("codex token expired; refresh left to the operator" if code == 401
+                       else f"codex usage HTTP {code}")
+                return Provider("codex", False, None, error=err, retry_after=retry_after)
             self._store_raw("codex", payload)
         return self._codex_from_payload(payload)
-
-    def _refresh_codex(self, auth: dict) -> Optional[str]:
-        rt = (auth.get("tokens") or {}).get("refresh_token")
-        if not rt:
-            return None
-        code, resp = _http_post_form(CODEX_TOKEN_URL, {
-            "grant_type": "refresh_token", "client_id": CODEX_CLIENT_ID, "refresh_token": rt})
-        if code != 200 or not resp.get("access_token"):
-            return None
-        # Re-read the file just before writing so we update only the rotated token fields on top of
-        # whatever the official CLI may have written meanwhile (minimize the clobber window).
-        path = self.cfg.home / ".codex" / "auth.json"
-        fresh = _read_json_file(path) or auth
-        tok = fresh.setdefault("tokens", {})
-        tok["access_token"] = resp["access_token"]
-        if resp.get("refresh_token"):
-            tok["refresh_token"] = resp["refresh_token"]
-        if resp.get("id_token"):
-            tok["id_token"] = resp["id_token"]
-        fresh["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            _write_json_atomic(path, fresh)
-        except OSError:
-            return None   # couldn't persist → treat as unavailable, don't crash quota checking
-        return resp["access_token"]
 
     def _codex_from_payload(self, payload: dict) -> Provider:
         rl = payload.get("rate_limit") or {}
@@ -703,6 +745,7 @@ class Quota:
         return None, False
 
     def claude(self) -> Provider:
+        mirror_creds(self.cfg)                    # re-sync the isolated copy from the operator's fresh file
         oauth, from_keychain = self._claude_creds()
         if not oauth:
             err = f"no {claude_dir(self.cfg.home) / '.credentials.json'}"
@@ -717,51 +760,19 @@ class Quota:
             headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA,
                        "User-Agent": "claude-code/2.1"}
             try:
-                code, payload = _http_get_json(CLAUDE_USAGE_URL, headers)
+                code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
             except GitHubError as e:
                 return Provider("claude", False, None, error=str(e))
-            if code == 401:
-                if from_keychain:
-                    # Keychain creds are read-only on purpose: a refresh rotates the single-use refresh
-                    # token and writes the Keychain first, which would log out the operator's interactive
-                    # claude. Sit out this cycle; the spawned claude refreshes the Keychain on its own runs.
-                    return Provider("claude", False, None,
-                                    error="claude token expired (Keychain; refresh left to claude)")
-                tok = self._refresh_claude(oauth)
-                if not tok:
-                    return Provider("claude", False, None, error="claude 401 (refresh failed)")
-                headers["Authorization"] = f"Bearer {tok}"
-                try:
-                    code, payload = _http_get_json(CLAUDE_USAGE_URL, headers)
-                except GitHubError as e:
-                    return Provider("claude", False, None, error=str(e))
+            # The worker never refreshes: the operator owns the single-use refresh token (rotating it here
+            # would invalidate their copy). An expired access token reads as unavailable until the operator's
+            # external refresher rotates it and mirror_creds picks it up next cycle. (On macOS the keychain-
+            # first read above already means we never hold a file refresh token to rotate.)
             if code != 200 or not payload:
-                return Provider("claude", False, None, error=f"claude usage HTTP {code}")
+                err = ("claude token expired; refresh left to the operator" if code == 401
+                       else f"claude usage HTTP {code}")
+                return Provider("claude", False, None, error=err, retry_after=retry_after)
             self._store_raw("claude", payload)
         return self._claude_from_payload(payload)
-
-    def _refresh_claude(self, oauth: dict) -> Optional[str]:
-        rt = oauth.get("refreshToken")
-        if not rt:
-            return None
-        code, resp = _http_post_form(CLAUDE_TOKEN_URL, {
-            "grant_type": "refresh_token", "client_id": CLAUDE_CLIENT_ID, "refresh_token": rt,
-            "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers"})
-        if code != 200 or not resp.get("access_token"):
-            return None
-        path = claude_dir(self.cfg.home) / ".credentials.json"
-        full = _read_json_file(path) or {}    # re-read just before writing (minimize the clobber window)
-        block = full.setdefault("claudeAiOauth", {})
-        block["accessToken"] = resp["access_token"]
-        if resp.get("refresh_token"):
-            block["refreshToken"] = resp["refresh_token"]
-        if resp.get("expires_in"):
-            block["expiresAt"] = int(time.time() * 1000) + int(resp["expires_in"]) * 1000
-        try:
-            _write_json_atomic(path, full)
-        except OSError:
-            return None   # couldn't persist → treat as unavailable, don't crash quota checking
-        return resp["access_token"]
 
     def _claude_from_payload(self, payload: dict) -> Provider:
         def win(key, name, window_s):
@@ -1714,6 +1725,10 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
         return 0
 
+    # Re-mirror the operator's fresh creds into the isolated home at the last moment before bubble seeds
+    # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that
+    # never call the pacer). No-op when not isolated or on macOS.
+    mirror_creds(cfg)
     # On macOS, Claude Code keeps creds in the Keychain, not a file; make sure the configured
     # CLAUDE_CONFIG_DIR holds a current credentials file so bubble can seed it (done after the echo path
     # so a dry-run never prompts the Keychain).
@@ -2471,8 +2486,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             else:
                 model, snap = choose_model(cfg, agent, quota_cmd)
                 if model is None:
-                    log(f"quota: {quota_line(snap)} — sleeping {POLL}s")
-                    time.sleep(POLL)
+                    # Honor a provider's Retry-After (e.g. a 429 asking for 580s) over the fixed poll, so
+                    # we don't re-trip a rate limit by polling sooner than the server asked.
+                    nap = max(POLL, max((p.retry_after or 0 for p in snap.values()), default=0))
+                    log(f"quota: {quota_line(snap)} — sleeping {nap}s")
+                    time.sleep(nap)
                     continue
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
@@ -2501,12 +2519,14 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
 
 
 def isolate_home(wid: str) -> Path:
-    """Give this worker its OWN $HOME so its credential refreshes can't race other workers or the
-    operator (Codex review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface
-    from the real config dir; copies the mutable Claude/Codex auth files in ONCE (thereafter the worker
-    refreshes within its own copy). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is
-    repointed there, so both the pacer and the spawned claude read the isolated creds even when the
-    operator's real config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
+    """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
+    review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface from the real
+    config dir; copies the mutable Claude/Codex auth files in ONCE, then records the source dirs in
+    .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher access token whenever the
+    operator's external refresher rotates it. The worker itself never refreshes (never touches the
+    single-use refresh token). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is repointed
+    there, so both the pacer and the spawned claude read the isolated creds even when the operator's real
+    config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
 
     macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
     Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
@@ -2532,9 +2552,10 @@ def isolate_home(wid: str) -> Path:
         src, dst = real_claude / f, iso_claude / f
         if src.exists() and not dst.exists():
             shutil.copy2(src, dst)
-    # The copies are once-only (thereafter the worker refreshes its own tokens), so a reused --worker-id
-    # stays pinned to whatever account it was first seeded from. Record the source and warn if it changes,
-    # rather than silently pacing/running the stale account.
+    # The initial copy is once-only; thereafter mirror_creds() RE-MIRRORS a fresher access token from the
+    # source whenever the operator's external refresher rotates it (the worker never refreshes its own
+    # tokens). So a reused --worker-id stays pinned to whatever account it was first seeded from. Record the
+    # source and warn if it changes, rather than silently pacing/running the stale account.
     marker = iso_claude / ".tauceti-creds-source"
     if marker.exists():
         if marker.read_text().strip() != str(real_claude):
@@ -2542,9 +2563,19 @@ def isolate_home(wid: str) -> Path:
                 f"(not {real_claude}); use a fresh --worker-id to switch accounts.")
     else:
         marker.write_text(str(real_claude))
-    src, dst = real / ".codex" / "auth.json", home / ".codex" / "auth.json"
+    real_codex, iso_codex = real / ".codex", home / ".codex"
+    src, dst = real_codex / "auth.json", iso_codex / "auth.json"
     if src.exists() and not dst.exists():
         shutil.copy2(src, dst)
+    # Record the real ~/.codex so mirror_creds() can re-mirror the codex token too (the Claude marker only
+    # names the Claude source). Written unconditionally so homes seeded before this marker existed get it
+    # backfilled on their next isolate_home() run.
+    codex_marker = iso_codex / ".tauceti-creds-source"
+    if not codex_marker.exists():
+        try:
+            codex_marker.write_text(str(real_codex))
+        except OSError:
+            pass
     # Keep host-side gh and git working under the isolated $HOME: the survey's `gh pr list` and host
     # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
     # point them back at the operator's real config rather than an empty isolated one. Respect a value
