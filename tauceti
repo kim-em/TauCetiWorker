@@ -130,6 +130,8 @@ BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))   # cap on the e
 CLAIM_TTL_S = int(os.environ.get("CLAIM_TTL", "1500"))         # 25 min lease; expires if a worker stops heartbeating
 CLAIM_HEARTBEAT_S = int(os.environ.get("CLAIM_HEARTBEAT", "300"))  # renew every 5 min while the agent runs
 SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))   # seconds a cached scoreboard meta stays fresh
+COMMENTS_MEMO_S = 5   # in-memory window over which one survey pass coalesces its issue-comment fetches
+                      # (scoreboard meta + in-flight marker share one read); << the round/dashboard cadence
 
 # In-flight review de-contention. The review engine (TauCetiReview) posts a PR comment marking a head
 # as under review and embeds an `expires_at` so a crashed reviewer self-clears. De-contention is on the
@@ -914,9 +916,30 @@ class ReviewState:
         self.cfg = cfg
         self.gh = gh
         self.sbcache = cfg.sbcache
+        self._comments: dict[int, tuple[float, Optional[list[dict]]]] = {}
 
     def _cache_path(self, pr: int) -> Path:
         return self.sbcache / f"{pr}.json"
+
+    def _issue_comments(self, pr: int) -> Optional[list[dict]]:
+        """A PR's issue comments, memoized briefly so the two readers in one survey pass — the scoreboard
+        meta and the in-flight review marker — share ONE fetch (a cold meta read plus a marker check
+        would otherwise double-read the same paginated endpoint). The window is a few seconds: long
+        enough to coalesce within a pass, far short of the round/dashboard cadence, so each pass still
+        reads fresh markers (the loop-breaking guarantee). None (a fetch failure) is memoized too, so a
+        blip isn't retried twice in one pass."""
+        hit = self._comments.get(pr)
+        if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
+            return hit[1]
+        cs = self.gh.issue_comments(pr)
+        self._comments[pr] = (time.time(), cs)
+        return cs
+
+    def inflight_review(self, pr: int, head: str) -> set[str]:
+        """Providers holding this EXACT head via an unexpired in-progress marker — the engine's
+        de-contention, read worker-side so a held head is skipped before the engine is launched. Shares
+        the memoized comment fetch with gh_meta so the survey reads each PR's comments at most once."""
+        return inflight_review_providers(self._issue_comments(pr), head, int(time.time()))
 
     def gh_meta(self, pr: int) -> Meta:
         """Newest trusted scoreboard's <!--tauceti-meta:v1 {...}--> JSON, with TTL cache.
@@ -931,7 +954,7 @@ class ReviewState:
             if age < SBCACHE_TTL:
                 return Meta(self._load(cache), "fresh")
 
-        comments = self.gh.issue_comments(pr)
+        comments = self._issue_comments(pr)
         meta_str = ""
         fetch_failed = comments is None
         if comments:
@@ -1250,7 +1273,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
             # here keeps the loop off the one PR a peer is reviewing instead of re-selecting it every
             # round and spending ~25s per pass to have the engine skip. Fail-open (a fetch failure
             # reads as 'not held'); the engine's own claim is still the authoritative backstop.
-            cov = inflight_review_providers(gh.issue_comments(p.number), p.head_oid, int(time.time()))
+            cov = rs.inflight_review(p.number, p.head_oid)
             if cov:
                 sv.review_inflight.append((p.number, ",".join(sorted(cov))))
                 continue
