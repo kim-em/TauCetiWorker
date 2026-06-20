@@ -54,7 +54,9 @@ re-queries GitHub. It reacts to single keypresses (no Enter):
 The agent, sandbox, and roadmap focus you pick are remembered between runs in
 `$XDG_CONFIG_HOME/tauceti/dashboard.json` (default `~/.config/tauceti/`), so the
 dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_FOCUS` in
-the environment still overrides the saved focus. The file is a user config dir, not
+the environment still overrides the saved focus. The saved focus is dashboard-only:
+a bare `tauceti work` never reads it (rounds launched from the dashboard carry it via
+an explicit `--roadmap-focus`). The file is a user config dir, not
 the per-worker `state/`, so it is shared whether you run `./tauceti` from a clone or
 the `uv tool install`ed `tauceti`, and survives upgrades.
 
@@ -100,7 +102,8 @@ The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
 Roadmap rounds steer toward one focus area (a subdirectory of the
 [roadmap](https://github.com/FormalFrontier/TauCetiRoadmap)). Set it with
 `--roadmap-focus <area>` (or `TAUCETI_ROADMAP_FOCUS`, or the dashboard's `f`
-key); an empty value means "all areas".
+key); an empty value means "all areas". With nothing set, each round picks a
+fresh random area (so an unpinned `--loop` roams the whole roadmap over time).
 
 ### Which agent: `--agent`
 
@@ -248,7 +251,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | --- | --- | --- |
 | `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
 | `TAUCETI_WORKER_ID` | `default` | Default for `--worker-id`. |
-| `TAUCETI_ROADMAP_FOCUS` | `ReductiveGroups` | Default for `--roadmap-focus` (`""` = all areas). |
+| `TAUCETI_ROADMAP_FOCUS` | _(unset)_ | Roadmap focus for `--roadmap-focus`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |

@@ -29,6 +29,7 @@ import fcntl
 import functools
 import json
 import os
+import random
 import re
 import signal
 import subprocess
@@ -84,14 +85,24 @@ MAX_BUMP_PR_ATTEMPTS = 5    # per-PR lifetime backstop for bump fixing across he
 BUMP_HEAD_PREFIX = "bump-mathlib/"   # branch prefix the review bot opens its mathlib-bump PRs on
 MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
 
-ROADMAP_FOCUS = os.environ.get("TAUCETI_ROADMAP_FOCUS", "ReductiveGroups")  # default; "" = all areas
+
+def roadmap_focus() -> Optional[str]:
+    """The roadmap area the worker steers toward, as the operator set it — read live from the env
+    each call so the TUI's [f] key can change it and have both the survey display and any launched
+    round pick it up (children inherit TAUCETI_ROADMAP_FOCUS). Tri-state: None = unset, so a fresh
+    random area is picked per round (see do_roadmap); "" = all areas; else the area name. There is
+    deliberately no baked-in default, and nothing here consults the dashboard prefs — a bare CLI run
+    resolves only from the env + the live area list, never from a saved dashboard preference."""
+    return os.environ.get("TAUCETI_ROADMAP_FOCUS")
 
 
-def roadmap_focus() -> str:
-    """The roadmap area the worker steers toward. Read live from the env each call so the TUI's
-    [f] key can change it and have both the survey display and any launched round pick it up
-    (children inherit TAUCETI_ROADMAP_FOCUS). Empty string means "all areas"."""
-    return os.environ.get("TAUCETI_ROADMAP_FOCUS", ROADMAP_FOCUS)
+def _focus_label(sv=None) -> str:
+    """Friendly render of the roadmap focus for the status bar. Prefers the survey's sanitized value
+    ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""
+    v = sv.roadmap_focus if (sv is not None and sv.roadmap_focus) else roadmap_focus()
+    if v is None or v == "auto":
+        return "auto (random each round)"
+    return "all areas" if v in ("", "any") else v
 
 
 def roadmap_areas(gh) -> list[str]:
@@ -1077,7 +1088,12 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
     always uses deep=True.
     """
-    sv = Survey(worker_id=cfg.wid, roadmap_focus=roadmap_focus() or "any")
+    _f = roadmap_focus()
+    # Keep sv.roadmap_focus a non-None string: "auto" = unset (a round will pick a random area),
+    # "any" = all areas, else the chosen area. The concrete random area is resolved later, in
+    # do_roadmap (once per authoring round) — not here, since survey() re-runs read-only for status
+    # and every ~90s in the dashboard, which would re-roll and flicker the displayed focus.
+    sv = Survey(worker_id=cfg.wid, roadmap_focus=("auto" if _f is None else (_f or "any")))
     try:
         raw = gh.pr_list(["number", "title", "headRefOid", "headRefName", "headRepositoryOwner",
                           "headRepository", "isDraft", "statusCheckRollup", "author", "mergeable"])
@@ -2086,6 +2102,10 @@ def do_bump(w, sv, c, opts, bubble) -> Optional[int]:
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     focus = c.reason or "any"
+    if focus == "auto":   # no focus set: pick a fresh random area this round (per-round, in-child)
+        areas = roadmap_areas(w.gh)
+        focus = random.choice(areas) if areas else "any"
+        log(f"→ ROADMAP focus: {focus} (auto-picked from {len(areas)} areas)")
     refs = w.cfg.state / "refs"
     if not fetch_ref(ROADMAP, refs / "roadmap"):
         raise Die(f"fetch {ROADMAP} failed")
@@ -2136,7 +2156,7 @@ multiple workers (share a host, coordinate through GitHub; a distinct id isolate
 environment (flags win; see README.md for the full list):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      default for --worker-id
-  TAUCETI_ROADMAP_FOCUS  default for --roadmap-focus
+  TAUCETI_ROADMAP_FOCUS  roadmap focus (unset = a fresh random area each round; "" = all areas)
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_STREAM=1       same as --stream
   CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
@@ -2165,7 +2185,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
                    help="for roadmap rounds, the single roadmap area to steer toward: a subdirectory of "
                         "the TauCetiRoadmap repo. List them by opening the dashboard (bare `tauceti`) and "
                         "expanding the roadmap row, or browse github.com/FormalFrontier/TauCetiRoadmap. "
-                        "Empty string = all areas. Overrides $TAUCETI_ROADMAP_FOCUS for this run")
+                        "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_FOCUS "
+                        "unset) to pick a fresh random area each round. Overrides "
+                        "$TAUCETI_ROADMAP_FOCUS for this run")
     p.add_argument("--ignore-quota", dest="ignore_quota", action="store_true",
                    help="ignore the quota pacer; run the requested --agent regardless of pace "
                         "(needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)")
@@ -2328,6 +2350,8 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
                 if not areas:
                     t.add_row("", "    └ (areas unavailable)", "", "", style="dim")
                 else:
+                    # In "auto" mode no row matches (no area is pinned — a random one is picked per
+                    # round), so no "← focus" marker shows; that is the intended display.
                     for a in ["(all areas)"] + areas:
                         active = a == sv.roadmap_focus or (a == "(all areas)" and sv.roadmap_focus in ("", "any"))
                         t.add_row("", f"    └ {escape(a)}", "", "[dim]← focus[/]" if active else "")
@@ -2668,7 +2692,10 @@ def _dashboard_app(cfg, loader=None):
 
     # Restore the operator's last-used dials. An explicit TAUCETI_ROADMAP_FOCUS in the environment
     # (exported, or passed by a parent) always wins over the saved one; otherwise apply the saved focus
-    # to the env now so BOTH the survey display and any round launched from here inherit it.
+    # to the env now so BOTH the survey display and any round launched from here inherit it. This is the
+    # ONLY place a saved focus is read — it is dashboard-scoped: a bare `tauceti work` never loads prefs
+    # (cmd_work resolves focus from the env + the live area list only), so the saved pref cannot leak
+    # into a CLI run; rounds launched from here carry it via an explicit --roadmap-focus flag.
     prefs = load_dashboard_prefs(cfg)
     if "TAUCETI_ROADMAP_FOCUS" not in os.environ and isinstance(prefs.get("roadmap_focus"), str):
         os.environ["TAUCETI_ROADMAP_FOCUS"] = prefs["roadmap_focus"]
@@ -2903,6 +2930,8 @@ def _dashboard_app(cfg, loader=None):
                             t.add_row(Text(""), Text("    └ (areas unavailable)", style="dim"),
                                       Text(""), Text(""))
                         else:
+                            # "auto" mode pins no area (a random one is picked per round), so no row
+                            # matches and no "← focus" marker shows — the intended display.
                             for a in ["(all areas)"] + self.areas:
                                 active = a == sv.roadmap_focus or (a == "(all areas)"
                                                                    and sv.roadmap_focus in ("", "any"))
@@ -2937,7 +2966,7 @@ def _dashboard_app(cfg, loader=None):
             s = Text()
             s.append("model=", style="bold"); s.append(self.model_dial)
             s.append("   sandbox=", style="bold"); s.append(sandbox)
-            s.append("   roadmap focus=", style="bold"); s.append(roadmap_focus() or "all areas")
+            s.append("   roadmap focus=", style="bold"); s.append(_focus_label(self.sv))
             s.append("\nnext auto round would: ", style="bold"); s.append(nxt_s, style="bold")
             self.query_one("#status", Static).update(s)
 
@@ -2997,7 +3026,7 @@ def _dashboard_app(cfg, loader=None):
             self._render()
 
         def action_set_focus(self) -> None:
-            cur = roadmap_focus()
+            cur = roadmap_focus() or ""   # None (auto) → "" so the picker/prompt starts at all-areas
             if self.areas:
                 opts = ["(all areas)"] + self.areas
 
