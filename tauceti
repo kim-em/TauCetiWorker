@@ -61,12 +61,15 @@ def me() -> str:
     return login
 
 # Per-PR budgets (a PR can never churn forever). Names match round.sh.
-MAX_FIX_ATTEMPTS = 3        # per-head: stop re-running the fixer on a commit it can't change (the
-                            # one guard the 8-round review close can't supply, since a stuck head
-                            # never advances a review round). No per-PR lifetime cap: across moving
-                            # heads, review-budget-spent (8 rounds) is the convergence stop.
-MAX_REVIEW_ROUNDS = 8       # lifetime review budget per PR; past this we stop re-reviewing it
-MAX_REVIEW_ERRORS = 3       # give up re-trying a PR whose review keeps erroring (transient infra)
+MAX_FIX_ATTEMPTS = 3        # per-head: stop re-running the fixer on a commit it can't change (a stuck
+                            # head never advances a review round, so CI's round cap can't catch it).
+# The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
+# still blocking). The worker no longer caps its own review rounds — it keeps reviewing on every new
+# head until the PR merges or CI closes it — so every PR reaches a terminal state.
+MAX_REVIEW_ERRORS = 3       # per PR: after this many review rounds that ERROR without posting a verdict
+                            # (the engine can't produce a review at all), stop retrying and ESCALATE —
+                            # a loud per-round warning + a tracking issue — since a PR that can never be
+                            # reviewed neither merges nor reaches CI's round cap, so a human must step in.
 MAX_REVIEW_CONTESTS = 10    # per-PR lifetime cap on author-contest re-reviews (no-bar: anyone may
                             # reply, so this bounds spend; separate from the review-round budget)
 MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't starve the PR's budget
@@ -191,6 +194,14 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%F %T')} tauceti: {msg}", file=sys.stderr, flush=True)
 
 
+_RED, _RESET = "\033[1;31m", "\033[0m"
+
+
+def warn_red(msg: str) -> None:
+    """A bright-red, attention-demanding log line (a PR the automation can't make progress on)."""
+    log(f"{_RED}⚠ {msg}{_RESET}")
+
+
 class Die(Exception):
     """Fatal error → exit 1."""
 
@@ -253,6 +264,27 @@ class GitHub:
         if p.returncode != 0:
             return None
         return json.loads(p.stdout or "{}")
+
+    def ensure_stuck_issue(self, pr: int, reason: str) -> None:
+        """Ensure a tracking issue exists for a PR the automation can't make progress on (a permanent
+        record so a human notices). Deduped by an exact title: one open issue per stuck PR across the
+        whole fleet. Best-effort — a failure to create one is non-fatal (the per-round warning still
+        fires); never raises."""
+        title = f"Review stuck: PR #{pr}"
+        try:
+            p = self._gh(["issue", "list", "--repo", self.repo, "--state", "open",
+                          "--search", f'in:title "{title}"', "--json", "number,title",
+                          "--jq", f'[.[] | select(.title == "{title}")] | length'])
+            if p.returncode == 0 and (p.stdout or "0").strip() not in ("", "0"):
+                return  # already tracked
+            body = (f"The autonomous worker cannot make progress on #{pr}: {reason}\n\n"
+                    f"It can be neither merged (not all-green) nor auto-retired (its review rounds "
+                    f"are not advancing), so it needs a human to look. The worker re-checks each round "
+                    f"and will close this issue's PR-side concern once #{pr} merges or is closed.\n\n"
+                    f"<!--tauceti-review-stuck:{pr}-->")
+            self._gh(["issue", "create", "--repo", self.repo, "--title", title, "--body", body])
+        except Exception:
+            pass
 
     def issue_comments(self, pr: int) -> Optional[list[dict]]:
         """All issue comments for a PR (paginated). None on fetch failure (distinct from empty)."""
@@ -963,9 +995,18 @@ class ReviewState:
         return best
 
     def ledger_blocking(self, pr: int, head: str) -> bool:
+        # Consult the durable per-rubric `states`, not just the latest round's `runs`. A reply/partial
+        # round only re-runs some rubrics, so `runs` can show an approve for one rubric while another
+        # rubric is still `blocking_request` in `states` — keying on `runs` would miss it and `fix`
+        # would never address the blocking rubric (the PR strands). `states` is the same signal CI's
+        # close reads, so the two agree. Falls back to `runs` only for an older scoreboard with no
+        # `states` map. A rubric blocks unless it is green or stale (a carried-forward approval).
         m = self.gh_meta(pr).data
         if str(m.get("head_sha") or "") != head:
             return False
+        states = m.get("states") or {}
+        if states:
+            return any(v not in ("green", "stale") for v in states.values())
         runs = m.get("runs") or []
         return any(r.get("verdict") not in ("approve", "error") for r in runs)
 
@@ -1064,6 +1105,10 @@ class Survey:
     next_auto_stage: Optional[str] = None
     github_failed: bool = False
     errors: list[str] = field(default_factory=list)
+    # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
+    # can't review them and CI's round cap can't catch them (rounds never advance), so each round
+    # escalates — a loud warning + a tracking issue — rather than stranding them silently.
+    review_stuck: list[int] = field(default_factory=list)
 
     def kind(self, name: str) -> WorkKind:
         return {"rebase": self.rebaseable, "review": self.reviewable, "fix": self.needs_fix,
@@ -1103,22 +1148,22 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
     sv.n_mine_open = len(mine)
     sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
 
-    # 1) rebase: tended (ours or bot-authored), CONFLICTING, under budgets (review budget owns
-    #    past-budget PRs). Covers a bot bump PR that main moved out from under — no bump-specific
-    #    conflict resolver exists, so rebase owns the git conflict on those too.
+    # 1) rebase: tended (ours or bot-authored), CONFLICTING, under the per-PR rebase-attempt budget.
+    #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
+    #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
+    #    is rebased until it merges or CI retires it.
     for p in tended:
         if p.mergeable != "CONFLICTING":
             continue
         c = Candidate(p.number, p.head_oid, "conflicting")
-        if deep and rs.review_rounds(p.number, counters) >= MAX_REVIEW_ROUNDS:
-            sv.rebaseable.suppressed.append(c); continue
         c.attempts = counters.read(f"rebase-pr-{p.number}"); c.budget = MAX_REBASE_ATTEMPTS
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
-    #    or an errored round → normal round-budgeted review), OR a fresh author CONTEST reply landed
-    #    since the last review at a clean head (→ contest path: bypasses the review-round budget so a
-    #    maxed-out PR can still be answered, but bounded by the contest caps).
+    #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
+    #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
+    #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
+    #    review keeps erroring without posting a verdict is escalated, not silently dropped.
     for p in nondraft:
         if not p.build_success:
             continue
@@ -1130,13 +1175,13 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
         if rs.ledger_clean_head(p.number) != p.head_oid:
             # normal review path: the head moved or the last round errored.
             c = Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed",
-                          provenance=m.provenance)
-            if rs.review_rounds(p.number, counters) >= MAX_REVIEW_ROUNDS:
-                sv.reviewable.suppressed.append(c); continue
-            c = dataclasses.replace(c, attempts=counters.read(f"review-err-{p.number}"),
-                                    budget=MAX_REVIEW_ERRORS)
-            (sv.reviewable.suppressed if c.attempts >= c.budget
-             else sv.reviewable.actionable).append(c)
+                          provenance=m.provenance,
+                          attempts=counters.read(f"review-err-{p.number}"), budget=MAX_REVIEW_ERRORS)
+            if c.attempts >= c.budget:
+                sv.reviewable.suppressed.append(c)
+                sv.review_stuck.append(p.number)     # can't be reviewed → escalate (warn + issue)
+            else:
+                sv.reviewable.actionable.append(c)
             continue
         # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
         # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
@@ -1822,6 +1867,16 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 
     log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
 
+    # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
+    # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
+    # per PR for a permanent record. These PRs neither merge nor advance toward CI's round cap, so a
+    # human must intervene; surfacing them loudly is the alternative to stranding them in silence.
+    for pr in sv.review_stuck:
+        n_err = w.counters.read(f"review-err-{pr}")
+        warn_red(f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
+                 f"review it. Needs a human. https://github.com/{TAUCETI}/pull/{pr}")
+        w.gh.ensure_stuck_issue(pr, f"its review has errored {n_err} times without posting a verdict")
+
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
     # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
     # fix-ci before fix: a red PR can't be reviewed or review-fixed until it builds. bump adapts a
@@ -1961,7 +2016,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
         nrnd = w.rs.review_rounds(pr, w.counters)
-        log(f"  review {nrnd + 1}/{MAX_REVIEW_ROUNDS} budget @ {head[:12]}, reviewers={reviewers}")
+        log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers} (CI retires at the cap)")
     try:
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
