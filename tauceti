@@ -175,6 +175,34 @@ def sanitize_wid(raw: str) -> str:
     return re.sub(r"[^a-z0-9-]", "-", s)
 
 
+# Slots held by the current process for its whole life. The fds must NOT be closed (closing releases the
+# flock and frees the slot); keeping the ints here also documents the intentional hold and prevents any
+# tooling from flagging them as leaks.
+_HELD_SLOTS: list[int] = []
+
+
+def auto_assign_wid(limit: int = 64) -> str:
+    """Pick the lowest-numbered free worker slot (worker1, worker2, ...) and hold an instance lock on it
+    for the life of this process, so several `work --loop` terminals on one host get distinct ids without
+    the operator hand-numbering them. The lock auto-releases on exit/crash (the kernel drops the flock), so
+    a restart reclaims the SAME lowest free slot — reusing its seeded $HOME and recognising its own leases.
+    Mirrors RoundContext's flock-NB pattern, one level up (per process, not per round)."""
+    for n in range(1, limit + 1):
+        wid = f"worker{n}"
+        state = HERE / "state" / wid
+        state.mkdir(parents=True, exist_ok=True)
+        fd = os.open(state / "instance.lock", os.O_CREAT | os.O_WRONLY, 0o644)
+        os.set_inheritable(fd, False)   # spawned rounds take their own round.lock; don't inherit this one
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            continue
+        _HELD_SLOTS.append(fd)
+        return wid
+    raise Die(f"all {limit} worker slots are busy — pass an explicit --worker-id")
+
+
 @dataclass(frozen=True)
 class Config:
     """Resolved per-worker configuration (paths derived from the worker id)."""
@@ -2315,12 +2343,13 @@ examples:
   tauceti work --dry-run                show what it WOULD do; act on nothing
 
 multiple workers (share a host, coordinate through GitHub; a distinct id isolates each):
+  tauceti work --loop                   auto-assigns worker1, worker2, ... per terminal
   tauceti work --loop --worker-id alice --only review
   tauceti work --loop --worker-id bob   --only roadmap
 
 environment (flags win; see README.md for the full list):
   TAUCETI_AGENT          default for --agent
-  TAUCETI_WORKER_ID      default for --worker-id
+  TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_FOCUS  roadmap focus (unset = a fresh random area each round; "" = all areas)
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_STREAM=1       same as --stream
@@ -2367,8 +2396,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--worker-id", dest="worker_id", default=None, metavar="ID",
                    help="run an independent worker under this name: it namespaces the worker's state, "
                         "checkout, review store, and logs, and (for any id other than 'default') gives it "
-                        "its own $HOME so credential refreshes don't race. Use a distinct id per worker to "
-                        "share a host (default: $TAUCETI_WORKER_ID or 'default')")
+                        "its own $HOME so credential refreshes don't race. With neither this flag nor "
+                        "$TAUCETI_WORKER_ID, `work` auto-assigns the lowest free slot (worker1, worker2, "
+                        "...) so several terminals on one host coexist without hand-numbering")
     p.add_argument("--isolate-home", dest="isolate_home", action="store_true",
                    help="force the per-worker $HOME even for the 'default' worker id "
                         "(a distinct --worker-id already implies it)")
@@ -2613,15 +2643,24 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # children inherit it.
     if getattr(args, "stream", False):
         os.environ["TAUCETI_STREAM"] = "1"
+    # Resolve the worker id. An explicit --worker-id (or $TAUCETI_WORKER_ID, which loop children inherit)
+    # pins it; with neither, auto-assign the lowest free slot (worker1, worker2, ...) so several
+    # `work --loop` terminals on one host don't collide without the operator hand-numbering them. Pinning
+    # the chosen id in the env makes Config.resolve and loop children agree on it.
+    explicit = getattr(args, "worker_id", None) or os.environ.get("TAUCETI_WORKER_ID")
+    if explicit:
+        wid = sanitize_wid(explicit)
+    else:
+        wid = auto_assign_wid()
+        os.environ["TAUCETI_WORKER_ID"] = wid
+        log(f"auto-assigned worker slot {wid} (override with --worker-id)")
     # A distinct worker id implies its own $HOME (so several workers' credential refreshes don't race);
     # --isolate-home forces it even for the 'default' id. This must set $HOME BEFORE Config.resolve, so
     # cfg.home + credential paths point at the per-worker copy. isolate_home is a no-op when $HOME is
     # already the worker home, so loop children that inherit it don't re-isolate.
-    wid = sanitize_wid(getattr(args, "worker_id", None)
-                       or os.environ.get("TAUCETI_WORKER_ID", "default") or "default")
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
-    cfg = Config.resolve(getattr(args, "worker_id", None))
+    cfg = Config.resolve(wid)
     if getattr(args, "loop", False) and not one_round:
         return cmd_loop(args, cfg, only=only, agent=agent)
     dry = getattr(args, "dry_run", False)
