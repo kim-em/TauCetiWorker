@@ -56,7 +56,7 @@ REVIEW = "FormalFrontier/TauCetiReview"
 def me() -> str:
     """The GitHub login the worker is authenticated as (gh). Its PRs are the ones the worker tends
     (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
-    r = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True)
+    r = gh_run(["gh", "api", "user", "--jq", ".login"])   # waits out a rate limit rather than failing setup
     login = (r.stdout or "").strip()
     if not login:
         raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")
@@ -137,7 +137,7 @@ BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))   # cap on the e
 GH_MIN_BUDGET = int(os.environ.get("TAUCETI_GH_MIN_BUDGET", "200"))   # core requests a round needs to finish
 GH_INROUND_WAIT = int(os.environ.get("TAUCETI_GH_INROUND_WAIT", "900"))  # cap on gh_run's in-place wait (15 min)
 GH_SECONDARY_BASE = 60   # first secondary-limit sleep when no Retry-After is given (then exponential)
-_GH_PRIMARY_RE = re.compile(r"API rate limit exceeded", re.I)
+_GH_PRIMARY_RE = re.compile(r"(?:API )?rate limit exceeded|rate limit.*exceeded", re.I)
 _GH_SECONDARY_RE = re.compile(r"secondary rate limit|abuse detection", re.I)
 
 # Claims / scoreboard cache.
@@ -310,78 +310,83 @@ def _parse_iso8601(s: Optional[str]) -> Optional[int]:
 
 # ============================================================================
 # GitHub REST rate limits. A 403 mid-round wastes the agent's work, so we wait the limit out and retry
-# rather than failing the round (see GH_* constants). gh prints the limit kind on stderr; primary limits
-# clear at the hourly `core.reset`, secondary ("abuse") limits clear after a short, unspecified cooldown.
+# rather than failing the round (see GH_* constants). gh prints the limit kind on stdout/stderr.
+# Two kinds, handled differently because of the ROUND_TIMEOUT hard cap on a child round:
+#  - SECONDARY ("abuse") limits clear after a short, unspecified cooldown → wait IN PLACE and retry,
+#    bounded by GH_INROUND_WAIT so the wait can't blow the round timeout.
+#  - PRIMARY limits clear only at the hourly bucket reset → too long to wait under the round cap, so
+#    surface immediately and let the loop preflight (cmd_loop, no hard cap) wait the reset out before
+#    relaunching. (GitHub buckets core and graphql resets independently; the preflight watches both.)
 # ============================================================================
 
-def _gh_rate_kind(stderr: str) -> Optional[str]:
-    """Classify a failed `gh` call from its stderr: 'secondary' | 'primary' | None (not a rate limit).
-    Secondary first — its message also contains the word 'rate limit', so the primary regex would match."""
-    if _GH_SECONDARY_RE.search(stderr):
+def _gh_rate_kind(text: str) -> Optional[str]:
+    """Classify a failed `gh` call from its combined stdout+stderr: 'secondary' | 'primary' | None.
+    Secondary first — its message also contains 'rate limit', so the primary regex would match it too."""
+    if _GH_SECONDARY_RE.search(text):
         return "secondary"
-    if _GH_PRIMARY_RE.search(stderr):
+    if _GH_PRIMARY_RE.search(text):
         return "primary"
     return None
 
 
-def github_budget() -> Optional[tuple[int, int]]:
-    """(core_remaining, core_reset_epoch) from GitHub's rate_limit endpoint. That endpoint is itself
-    exempt from the core budget, so probing it is free. None on any read failure (caller proceeds
-    rather than block on a flaky probe)."""
+def github_budget() -> Optional[dict]:
+    """Per-bucket (remaining, reset_epoch) from GitHub's rate_limit endpoint, keyed 'core' and 'graphql'
+    — the two buckets a round spends (REST and the progress-guard GraphQL query). That endpoint is itself
+    exempt from the budget, so probing it is free. None on any read failure (caller proceeds rather than
+    block on a flaky probe)."""
     p = run(["gh", "api", "rate_limit", "--jq",
-             "[.resources.core.remaining, .resources.core.reset]"])
+             "{core:[.resources.core.remaining,.resources.core.reset],"
+             "graphql:[.resources.graphql.remaining,.resources.graphql.reset]}"])
     if p.returncode != 0:
         return None
     try:
-        rem, reset = json.loads(p.stdout)
-        return int(rem), int(reset)
-    except (ValueError, TypeError, json.JSONDecodeError):
+        d = json.loads(p.stdout)
+        return {k: (int(v[0]), int(v[1])) for k, v in d.items()}
+    except (ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError):
         return None
 
 
-def _gh_rate_wait(kind: str, stderr: str, attempt: int) -> int:
-    """Seconds to wait before retrying a rate-limited `gh` call. Primary: until the hourly core reset
-    (queried fresh; the endpoint is free). Secondary: honor a Retry-After if present, else exponential
-    from GH_SECONDARY_BASE. Always >= 1s and clamped so one wait can't exceed the in-round budget."""
-    if kind == "primary":
-        gb = github_budget()
-        if gb is not None:
-            nap = gb[1] - int(time.time()) + 5      # a beat past the reset to be safe
-        else:
-            nap = 300                                # reset unknown — a conservative fixed wait
-    else:
-        ra = _parse_retry_after(stderr_retry_after(stderr))
-        nap = int(ra) if ra is not None else GH_SECONDARY_BASE * (1 << min(attempt, 4))
+def _gh_secondary_wait(text: str, attempt: int) -> int:
+    """Seconds to wait before retrying a SECONDARY-limited `gh` call: honor a Retry-After if gh echoed
+    one, else exponential from GH_SECONDARY_BASE. >= 1s, clamped to the in-round budget."""
+    ra = _parse_retry_after(_gh_retry_after(text))
+    nap = int(ra) if ra is not None else GH_SECONDARY_BASE * (1 << min(attempt, 4))
     return max(1, min(nap, GH_INROUND_WAIT))
 
 
-def stderr_retry_after(stderr: str) -> Optional[str]:
+def _gh_retry_after(text: str) -> Optional[str]:
     """gh occasionally echoes a `Retry-After: N` line for a secondary limit. Pull the value if present."""
-    m = re.search(r"retry[- ]after:?\s*(\d+)", stderr, re.I)
+    m = re.search(r"retry[- ]after:?\s*(\d+)", text, re.I)
     return m.group(1) if m else None
 
 
 def gh_run(argv: list[str], *, cwd: Optional[Path] = None,
            max_wait: int = GH_INROUND_WAIT) -> subprocess.CompletedProcess:
-    """Run a `gh` command, waiting out any GitHub rate limit IN PLACE and retrying so the limit costs a
-    pause, not a discarded round. Bounded by max_wait so a primary limit (up to ~1h away) can't blow
-    ROUND_TIMEOUT — the loop-level preflight (cmd_loop) handles the long hourly waits where there is no
-    hard cap. A non-rate-limit failure is returned unchanged for the caller to handle as before."""
+    """Run a `gh` command, waiting out a SECONDARY GitHub rate limit IN PLACE and retrying so the limit
+    costs a pause, not a discarded round (bounded by max_wait so it can't blow ROUND_TIMEOUT). A PRIMARY
+    (hourly) limit is surfaced immediately — waiting an hour inside a round under the 90-min cap would
+    just be SIGKILLed; the loop preflight waits that reset out instead. Any non-rate-limit failure is
+    returned unchanged for the caller to handle as before."""
     waited = 0
     attempt = 0
     while True:
         p = run(argv, cwd=cwd)
         if p.returncode == 0:
             return p
-        kind = _gh_rate_kind(p.stderr or "")
+        text = (p.stderr or "") + "\n" + (p.stdout or "")
+        kind = _gh_rate_kind(text)
         if kind is None:
             return p
-        nap = _gh_rate_wait(kind, p.stderr or "", attempt)
-        if waited + nap > max_wait:
-            log(f"gh: {kind} rate limit, but the in-round wait budget is spent ({waited}s) — surfacing "
-                f"the error so the round backs off (the loop preflight waits out the reset)")
+        if kind == "primary":
+            log("gh: primary rate limit — surfacing so the round backs off and the loop preflight "
+                "waits out the hourly reset (waiting in-round would exceed the round timeout)")
             return p
-        log(f"gh: {kind} rate limit — waiting {nap}s for it to clear, then retrying ({' '.join(argv[1:3])})")
+        nap = _gh_secondary_wait(text, attempt)
+        if waited + nap > max_wait:
+            log(f"gh: secondary rate limit, but the in-round wait budget is spent ({waited}s) — "
+                f"surfacing the error so the round backs off")
+            return p
+        log(f"gh: secondary rate limit — waiting {nap}s for it to clear, then retrying ({' '.join(argv[1:3])})")
         time.sleep(nap)
         waited += nap
         attempt += 1
@@ -461,22 +466,34 @@ class GitHub:
         replacing a `pr view` plus two paginated REST comment fetches. The progress guard runs this twice
         per guarded round per PR, so collapsing ~5 REST calls into 1 GraphQL call is the bulk of the
         round's GitHub spend. None on any failure (caller treats that as 'can't tell'). Review threads are
-        capped at first:100 — far beyond any real PR, and the guard only needs comment-count *growth*."""
+        fetched first:100; on the rare PR with more, we fall back to the exact paginated REST count so the
+        guard never undercounts a comment that landed on a later thread."""
         owner, _, name = self.repo.partition("/")
         q = ("query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
              "pullRequest(number:$pr){headRefOid comments{totalCount}"
-             "reviewThreads(first:100){nodes{comments{totalCount}}}}}}")
+             "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}")
         p = self._gh(["api", "graphql", "-f", f"query={q}",
                       "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}"])
         if p.returncode != 0:
             return None
         try:
             d = json.loads(p.stdout)["data"]["repository"]["pullRequest"]
-            threads = d["reviewThreads"]["nodes"]
-            nc = d["comments"]["totalCount"] + sum(t["comments"]["totalCount"] for t in threads)
+            threads = d["reviewThreads"]
+            if threads["totalCount"] > 100:                 # beyond one page — get the exact count via REST
+                return self._pr_progress_state_rest(pr, d["headRefOid"])
+            nc = d["comments"]["totalCount"] + sum(t["comments"]["totalCount"] for t in threads["nodes"])
             return {"head": d["headRefOid"], "ncomments": nc}
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
+
+    def _pr_progress_state_rest(self, pr: int, head: str) -> Optional[dict]:
+        """Exact issue + review comment count via the paginated REST endpoints (the pre-GraphQL path),
+        for the rare PR with >100 review threads. None if either fetch fails."""
+        cs = self.issue_comments(pr)
+        rcs = self.review_comments(pr)
+        if cs is None or rcs is None:
+            return None
+        return {"head": head, "ncomments": len(cs) + len(rcs)}
 
     def api_jq(self, path: str, jq: str) -> Optional[str]:
         p = self._gh(["api", path, "--jq", jq])
@@ -2367,8 +2384,7 @@ def _sync_review_outbox(w: "Worker", pr: int) -> int:
     # are kept in the local outbox — an external review will count once contributor-publishing lands.
     # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
     # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
-    perm = subprocess.run(["gh", "api", "repos/FormalFrontier/TauCetiData", "--jq", ".permissions.push"],
-                          capture_output=True, text=True)
+    perm = gh_run(["gh", "api", "repos/FormalFrontier/TauCetiData", "--jq", ".permissions.push"])
     if perm.returncode == 0 and perm.stdout.strip() == "false":
         log(f"  review #{pr}: no write access to TauCetiData — review posted, records kept in "
             f"{outbox} (they won't count for auto-merge until contributor-publishing lands)")
@@ -2906,12 +2922,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             # 1b) GitHub budget preflight. A round does many gh calls AND launches the review engine,
             # whose own diff fetch 403s when GitHub is rate-limited — throwing away the agent's work.
             # The loop has no hard timeout, so this is where we wait out an hourly primary reset rather
-            # than launching expensive work that a mid-round 403 would discard. The rate_limit probe is
-            # itself exempt from the budget, so this costs nothing when we are flush.
+            # than launching expensive work that a mid-round 403 would discard. We watch BOTH buckets a
+            # round spends (REST core and the progress-guard graphql); either being low blocks launch
+            # until the later of their resets. The rate_limit probe is itself exempt, so this is free
+            # when we are flush.
             gb = github_budget()
-            if gb is not None and gb[0] < GH_MIN_BUDGET:
-                nap = max(POLL, min(gb[1] - int(time.time()) + 5, 3600))
-                log(f"github: REST budget low ({gb[0]} core remaining < {GH_MIN_BUDGET}) — "
+            low = {k: v for k, v in (gb or {}).items() if v[0] < GH_MIN_BUDGET}
+            if low:
+                reset = max(v[1] for v in low.values())
+                nap = max(POLL, min(reset - int(time.time()) + 5, 3600))
+                detail = ", ".join(f"{k}={gb[k][0]}" for k in low)
+                log(f"github: REST budget low ({detail} remaining < {GH_MIN_BUDGET}) — "
                     f"waiting {nap}s for the reset before launching a round")
                 time.sleep(nap)
                 continue
