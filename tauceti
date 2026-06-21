@@ -27,6 +27,7 @@ import atexit
 import dataclasses
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import random
@@ -699,19 +700,31 @@ class Quota:
         self.cfg = cfg
         self.cache_dir = cfg.quota_cache
 
-    def _cached_raw(self, provider: str) -> Optional[dict]:
+    @staticmethod
+    def _fingerprint(*parts: Optional[str]) -> Optional[str]:
+        """A short, stable id for the credentials a cache entry was fetched under. Returns None when there
+        is nothing to fingerprint (no creds), which never matches a stored fp, so the cache reads as a miss."""
+        raw = "|".join(p for p in parts if p)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else None
+
+    def _cached_raw(self, provider: str, fp: Optional[str]) -> Optional[dict]:
         p = self.cache_dir / f"quota-{provider}.json"
         d = _read_json_file(p)
         if not d:
+            return None
+        # A cache entry is only valid for the SAME account it was fetched under. When the operator rotates
+        # to a different account (or an external refresh swaps the token), fp changes ⇒ the stale entry is
+        # for the wrong account and must be re-fetched immediately, not served until the TTL lapses.
+        if d.get("fp") != fp:
             return None
         if time.time() - d.get("fetched_at", 0) > QUOTA_TTL[provider]:
             return None
         return d.get("payload")
 
-    def _store_raw(self, provider: str, payload: dict) -> None:
+    def _store_raw(self, provider: str, payload: dict, fp: Optional[str]) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / f"quota-{provider}.json").write_text(
-            json.dumps({"fetched_at": int(time.time()), "payload": payload}))
+            json.dumps({"fetched_at": int(time.time()), "fp": fp, "payload": payload}))
 
     # --- Codex -------------------------------------------------------------
     def _codex_creds(self) -> Optional[dict]:
@@ -737,7 +750,10 @@ class Quota:
         auth = self._codex_creds()
         if not auth:
             return Provider("codex", False, None, error="no ~/.codex/auth.json")
-        payload = self._cached_raw("codex")
+        # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
+        # token itself when no id is available.
+        fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
+        payload = self._cached_raw("codex", fp)
         if payload is None:
             tok = (auth.get("tokens") or {}).get("access_token")
             if not tok:
@@ -757,7 +773,7 @@ class Quota:
                 err = ("codex token expired; refresh left to the operator" if code == 401
                        else f"codex usage HTTP {code}")
                 return Provider("codex", False, None, error=err, retry_after=retry_after)
-            self._store_raw("codex", payload)
+            self._store_raw("codex", payload, fp)
         return self._codex_from_payload(payload)
 
     def _codex_from_payload(self, payload: dict) -> Provider:
@@ -806,7 +822,11 @@ class Quota:
             if sys.platform == "darwin":
                 err += ' (and no "Claude Code-credentials" Keychain entry)'
             return Provider("claude", False, None, error=err)
-        payload = self._cached_raw("claude")
+        # No stable account id is exposed in the oauth block, so fingerprint the access token: a rotation to
+        # a different account changes it (forcing a re-fetch); an external same-account refresh also changes
+        # it, which only costs one harmless extra fetch every several hours.
+        fp = self._fingerprint(oauth.get("accessToken"))
+        payload = self._cached_raw("claude", fp)
         if payload is None:
             tok = oauth.get("accessToken")
             if not tok:
@@ -825,7 +845,7 @@ class Quota:
                 err = ("claude token expired; refresh left to the operator" if code == 401
                        else f"claude usage HTTP {code}")
                 return Provider("claude", False, None, error=err, retry_after=retry_after)
-            self._store_raw("claude", payload)
+            self._store_raw("claude", payload, fp)
         return self._claude_from_payload(payload)
 
     def _claude_from_payload(self, payload: dict) -> Provider:
