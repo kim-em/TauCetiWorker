@@ -2302,12 +2302,14 @@ the cascade (priority order; a round does the first that applies):
   bump      adapt a red bump-mathlib PR (the worker never authors one)
   roadmap   open a new PR for a roadmap item
 
-  With no --only a round walks the whole cascade; --only pins it to a subset.
+  With no --only a round walks the whole cascade; --only pins it to a subset,
+  --skip drops a subset (and the two combine by subtraction).
 
 examples:
   tauceti work                          one round: auto agent, in a bubble
   tauceti work --loop                   the driver: keep picking the best job
   tauceti work --loop --only review     a focused reviewer
+  tauceti work --loop --skip roadmap    the whole cascade except authoring new PRs
   tauceti work --only roadmap --roadmap-focus ReductiveGroups
   tauceti work --agent claude --host    run Opus directly on the host
   tauceti work --dry-run                show what it WOULD do; act on nothing
@@ -2334,6 +2336,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--only", action="append", default=[], metavar="TASKS",
                    help="restrict the round to these work units, a comma list of: "
                         + ", ".join(ALLOWED_TASKS) + " (default: walk the whole cascade)")
+    p.add_argument("--skip", action="append", default=[], metavar="TASKS",
+                   help="drop these work units from the round (the inverse of --only); a comma list of "
+                        "the same names. Combines with --only by subtraction (--only review,fix --skip "
+                        "fix runs only review)")
     p.add_argument("--agent", choices=AGENTS, default=None,
                    help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
                         "or deepseek/minimax (pay-per-token OpenRouter, asked for by name) "
@@ -2370,16 +2376,32 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
                    help="survey + print the picker's decision; act on nothing")
 
 
-def parse_only(values: list[str]) -> list[str]:
-    """Flatten/validate --only (comma lists or repeats). Empty = the full cascade."""
+def parse_only(values: list[str], flag: str = "--only") -> list[str]:
+    """Flatten/validate a task flag (comma lists or repeats). Empty = the full cascade."""
     tasks: list[str] = []
     for v in values:
         for tok in v.replace(" ", "").split(","):
             if not tok:
                 continue
             if tok not in ALLOWED_TASKS:
-                raise SystemExit(f"unknown --only task '{tok}' (valid: {', '.join(ALLOWED_TASKS)})")  # exit 1; argparse uses 2
+                raise SystemExit(f"unknown {flag} task '{tok}' (valid: {', '.join(ALLOWED_TASKS)})")  # exit 1; argparse uses 2
             tasks.append(tok)
+    return tasks
+
+
+def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
+    """Fold --only and --skip into one effective allow-list. With no --skip the --only list passes
+    through unchanged (empty ⇒ the whole cascade); --skip materializes the complement, in cascade
+    order, so everything downstream — the loop child's argv, want(), the displayed --only — needs to
+    know about `only` alone. Combining them subtracts: `--only review,fix --skip fix` ⇒ ['review']."""
+    only = parse_only(only_vals, "--only")
+    skip = set(parse_only(skip_vals, "--skip"))
+    if not skip:
+        return only
+    allowed = set(only) if only else set(ALLOWED_TASKS)
+    tasks = [t for t in ALLOWED_TASKS if t in allowed and t not in skip]
+    if not tasks:
+        raise SystemExit("--only/--skip leave no work units enabled")
     return tasks
 
 
@@ -2431,7 +2453,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if cmd == "status":
         return cmd_status(args)
     if cmd in ("work", "_round"):
-        only = parse_only(getattr(args, "only", []))
+        only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
         agent = resolve_agent(args)
         return cmd_work(args, only=only, agent=agent, one_round=(cmd == "_round"))
     if cmd == "doctor":
