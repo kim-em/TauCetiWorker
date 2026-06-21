@@ -181,25 +181,31 @@ def sanitize_wid(raw: str) -> str:
 _HELD_SLOTS: list[int] = []
 
 
+def acquire_slot(wid: str) -> bool:
+    """Hold an instance lock on this worker slot for the life of the process, returning False if another
+    process already holds it. The lock auto-releases on exit/crash (the kernel drops the flock), so a
+    restart reclaims the slot — reusing its seeded $HOME and recognising its own leases. Mirrors
+    RoundContext's flock-NB pattern, one level up (per process, not per round)."""
+    state = HERE / "state" / wid
+    state.mkdir(parents=True, exist_ok=True)
+    fd = os.open(state / "instance.lock", os.O_CREAT | os.O_WRONLY, 0o644)
+    os.set_inheritable(fd, False)   # spawned rounds take their own round.lock; don't inherit this one
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    _HELD_SLOTS.append(fd)
+    return True
+
+
 def auto_assign_wid(limit: int = 64) -> str:
-    """Pick the lowest-numbered free worker slot (worker1, worker2, ...) and hold an instance lock on it
-    for the life of this process, so several `work --loop` terminals on one host get distinct ids without
-    the operator hand-numbering them. The lock auto-releases on exit/crash (the kernel drops the flock), so
-    a restart reclaims the SAME lowest free slot — reusing its seeded $HOME and recognising its own leases.
-    Mirrors RoundContext's flock-NB pattern, one level up (per process, not per round)."""
+    """Pick the lowest-numbered free worker slot (worker1, worker2, ...) and hold it, so several
+    `work --loop` terminals on one host get distinct ids without the operator hand-numbering them."""
     for n in range(1, limit + 1):
         wid = f"worker{n}"
-        state = HERE / "state" / wid
-        state.mkdir(parents=True, exist_ok=True)
-        fd = os.open(state / "instance.lock", os.O_CREAT | os.O_WRONLY, 0o644)
-        os.set_inheritable(fd, False)   # spawned rounds take their own round.lock; don't inherit this one
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            continue
-        _HELD_SLOTS.append(fd)
-        return wid
+        if acquire_slot(wid):
+            return wid
     raise Die(f"all {limit} worker slots are busy — pass an explicit --worker-id")
 
 
@@ -2648,8 +2654,16 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # `work --loop` terminals on one host don't collide without the operator hand-numbering them. Pinning
     # the chosen id in the env makes Config.resolve and loop children agree on it.
     explicit = getattr(args, "worker_id", None) or os.environ.get("TAUCETI_WORKER_ID")
+    is_loop_driver = getattr(args, "loop", False) and not one_round
     if explicit:
         wid = sanitize_wid(explicit)
+        # A top-level loop driver also reserves its slot, so an auto-assigned peer in another terminal
+        # can't pick the same id (e.g. you restart `--worker-id worker2` while others auto-assign). The
+        # _round children (which inherit this id) and one-shot rounds skip this; they arbitrate via the
+        # per-round round.lock instead, so reserving here would only make a child collide with its parent.
+        if is_loop_driver and not acquire_slot(wid):
+            warn_red(f"another loop already holds worker slot '{wid}'; they will contend on its state, "
+                     f"$HOME, and quota pacing — use a distinct --worker-id")
     else:
         wid = auto_assign_wid()
         os.environ["TAUCETI_WORKER_ID"] = wid
