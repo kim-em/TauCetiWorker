@@ -801,13 +801,27 @@ def _read_marker(p: Path) -> Optional[str]:
         return None
 
 
+# Written in place of the operator's real codex refresh token in mirrored worker auth.json. codex-cli
+# >=0.139 won't parse an auth.json missing `refresh_token`; with a valid access token it never uses it,
+# so this constant satisfies the parser while the worker still holds no token that could rotate the
+# operator's single-use credential. See _mirror_creds_file.
+CODEX_RT_PLACEHOLDER = "rt.0.tauceti-worker-placeholder-never-a-real-refresh-token"
+
+
 def _mirror_creds_file(src: Path, dst: Path, *, block_key: str, tok_key: str,
-                       rt_key: str, exp_key: Optional[str]) -> None:
-    """Copy src -> dst with the refresh token STRIPPED, iff src is fresher than dst. Freshness is keyed on
-    the access token changing (the operator's external writer only ever moves forward); a src whose expiry
-    is OLDER than dst's is treated as a torn read and skipped. A missing/unreadable src leaves dst
-    untouched — never blank a good copy. The refresh token is dropped so nothing in the worker (pacer or
-    spawned agent) can rotate the operator's single-use token and invalidate their copy."""
+                       rt_key: str, exp_key: Optional[str], rt_placeholder: Optional[str] = None) -> None:
+    """Copy src -> dst WITHOUT the operator's real refresh token, iff src is fresher than dst. Freshness is
+    keyed on the access token changing (the operator's external writer only ever moves forward); a src
+    whose expiry is OLDER than dst's is treated as a torn read and skipped. A missing/unreadable src leaves
+    dst untouched — never blank a good copy. The real refresh token is never copied through, so nothing in
+    the worker (pacer or spawned agent) can rotate the operator's single-use token and invalidate their
+    copy.
+
+    rt_placeholder: when None, the refresh-token field is omitted entirely (Claude). When set, the field is
+    written with this constant value instead — codex-cli >=0.139 refuses to parse an auth.json that lacks
+    `refresh_token`, but with a valid (frequently re-mirrored) access token it never reads or rotates it,
+    so a placeholder satisfies the parser while keeping the guarantee that the worker holds no real refresh
+    token. (Verified: codex runs read-only `exec` with a bogus refresh_token and leaves it untouched.)"""
     sd = _read_json_file(src)
     if not sd:
         return                                  # source unreadable this cycle — keep what we have
@@ -817,17 +831,20 @@ def _mirror_creds_file(src: Path, dst: Path, *, block_key: str, tok_key: str,
         return                                  # no usable source access token — nothing to mirror
     dd = _read_json_file(dst) or {}
     dblk = dd.get(block_key) or {}
-    if dblk.get(tok_key) == stok and not dblk.get(rt_key):
-        return                                  # already current AND already stripped — nothing to do
-    # else: a changed access token, or a still-present refresh token (e.g. the once-only isolate_home seed
-    # copied the full creds) — re-write, stripping the refresh token.
+    if dblk.get(tok_key) == stok and dblk.get(rt_key) == rt_placeholder:
+        return                                  # access token current AND refresh field already normalized
+    # else: a changed access token, or a real refresh token still present (e.g. the once-only isolate_home
+    # seed copied the full creds) — re-write, replacing the refresh token with the placeholder (or omitting).
     if exp_key:                                 # torn-read guard: don't move expiry backwards
         se, de = sblk.get(exp_key), dblk.get(exp_key)
         if isinstance(se, (int, float)) and isinstance(de, (int, float)) and se < de:
             return
     out = dict(sd)
     blk = dict(sblk)
-    blk.pop(rt_key, None)
+    if rt_placeholder is None:
+        blk.pop(rt_key, None)
+    else:
+        blk[rt_key] = rt_placeholder
     out[block_key] = blk
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -857,7 +874,7 @@ def mirror_creds(cfg: Config) -> None:
     if src_codex:                               # absent on homes seeded before this marker existed
         _mirror_creds_file(Path(src_codex) / "auth.json", cfg.home / ".codex" / "auth.json",
                            block_key="tokens", tok_key="access_token",
-                           rt_key="refresh_token", exp_key=None)
+                           rt_key="refresh_token", exp_key=None, rt_placeholder=CODEX_RT_PLACEHOLDER)
 
 
 class Quota:

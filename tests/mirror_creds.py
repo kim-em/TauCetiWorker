@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""mirror_creds: the worker mirrors the operator's externally-refreshed creds into the isolated home,
-stripping the refresh token (so nothing in the worker can rotate the operator's single-use token), and
-only when the source is fresher. Never refreshes, never blanks a good copy on a torn source read."""
+"""mirror_creds: the worker mirrors the operator's externally-refreshed creds into the isolated home
+WITHOUT the operator's real refresh token (so nothing in the worker can rotate the single-use token), and
+only when the source is fresher. Claude: the refresh field is dropped; codex: it is replaced by a constant
+placeholder (codex-cli >=0.139 won't parse auth.json without the field, but never uses it given a valid
+access token). Never refreshes, never blanks a good copy on a torn source read."""
 import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, types
 from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
@@ -54,7 +56,10 @@ try:
     check("claude: benign fields preserved", out_c.get("scopes"), ["s"])
     out_x = json.loads(dx.read_text())["tokens"]
     check("codex: stale dest gets the fresh access token", out_x["access_token"], "CNEW")
-    check("codex: refresh token stripped from the copy", "refresh_token" in out_x, False)
+    # codex-cli >=0.139 won't parse an auth.json without `refresh_token`, so the field is present but
+    # holds a constant PLACEHOLDER — never the operator's real token "R" (the worker can't rotate it).
+    check("codex: refresh token replaced by the placeholder", out_x.get("refresh_token"), tc.CODEX_RT_PLACEHOLDER)
+    check("codex: operator's real refresh token never copied", out_x.get("refresh_token") == "R", False)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -69,7 +74,7 @@ try:
     dx.write_text(json.dumps(codex_block("CSAME")))
     tc.mirror_creds(cfg)
     check("claude: unchanged token still gets stripped", "refreshToken" in json.loads(dc.read_text())["claudeAiOauth"], False)
-    check("codex: unchanged token still gets stripped", "refresh_token" in json.loads(dx.read_text())["tokens"], False)
+    check("codex: unchanged token's real refresh replaced by placeholder", json.loads(dx.read_text())["tokens"].get("refresh_token"), tc.CODEX_RT_PLACEHOLDER)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
