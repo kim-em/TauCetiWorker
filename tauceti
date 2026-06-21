@@ -2430,6 +2430,28 @@ def _sample(cands: list[Candidate], n: int = 3) -> str:
     return head + (f" +{len(nums) - n}" if len(nums) > n else "")
 
 
+def _unavail_reason(prov: Provider) -> tuple[bool, str]:
+    """Why an unavailable provider can't be used, and whether the block is *soft*.
+
+    A soft block means there is real quota left and we're only pausing to pace the burn (over-pace) —
+    distinct from a hard block where a window is exhausted or its usage is unknown (fail-closed). The
+    `weekly_sonnet` window never gates opus, so it is ignored here. Returns (soft, reason)."""
+    gating = [w for w in (prov.windows or []) if w.name != "weekly_sonnet"]
+    spent = [w for w in gating if w.status == "exhausted"]
+    if spent:
+        return False, ", ".join(f"{w.name} exhausted" for w in spent)
+    ahead = [w for w in gating if w.status == "over-pace"]
+    if ahead:
+        bits = []
+        for w in ahead:
+            left = "" if w.used is None else f", {max(0, round(100 - w.used))}% left"
+            bits.append(f"{w.name} ahead of pace{left}")
+        return True, "; ".join(bits)
+    if any(w.status == "unknown" for w in gating):
+        return False, "usage unknown"
+    return False, "unavailable"
+
+
 def quota_line(snap: dict) -> str:
     """One-line quota summary from a {provider: Provider} snapshot."""
     parts = []
@@ -2442,8 +2464,9 @@ def quota_line(snap: dict) -> str:
         elif prov.available:
             parts.append(f"{name} [green]✓[/] {prov.model}")
         else:
-            why = prov.model or "over-pace/exhausted"
-            parts.append(f"{name} [red]✗[/] ({why})")
+            soft, why = _unavail_reason(prov)
+            glyph = "[yellow]~[/]" if soft else "[red]✗[/]"
+            parts.append(f"{name} {glyph} ({why})")
     return "   ".join(parts) if parts else "quota: (not checked)"
 
 
