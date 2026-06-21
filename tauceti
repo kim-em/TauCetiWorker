@@ -1523,6 +1523,32 @@ def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
         p.wait()
 
 
+def reap_round_group(pgid: int, term_grace: float = 2.0) -> None:
+    """Sweep any processes still alive in a finished round's process group — the background poll-loops a
+    tool-using agent leaves behind. Claude Code's Bash tool, waiting on a backgrounded `lake build`,
+    synthesizes `until ... do sleep; done` (and, on a job-control quirk in non-interactive bash, a
+    `until ! kill -0 %1; do :; done` that busy-spins a whole core). When the agent exits 0 those loops
+    have no parent left and reparent to init, surviving forever. The round runs in its OWN session
+    (spawn_round's start_new_session ⇒ the group id equals the leader pid), so signalling `pgid` reaches
+    only the round's descendants — never the loop driver or the user's shell. Idempotent: a no-op when
+    the group is already empty (the clean, common case) or already torn down by kill_round_group."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return   # group empty — round left nothing behind
+    deadline = time.monotonic() + term_grace
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return   # stragglers died on SIGTERM
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)   # the busy-loop ignores SIGTERM's grace; SIGKILL it
+    except ProcessLookupError:
+        pass
+
+
 CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "scripts" / "claim.sh")
 
 
@@ -1618,6 +1644,7 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
     """Run one round as a child under a hard timeout; tear down the group on expiry. Used by the loop.
     Maps a timed-out round to rc 124, a SIGKILL-after-grace to 137 (matching the shell's `timeout`)."""
     p = spawn_round(argv_tail)
+    pgid = p.pid   # spawn_round's start_new_session ⇒ the round leads its own group; pgid == leader pid
     try:
         return p.wait(timeout)
     except subprocess.TimeoutExpired:
@@ -1628,6 +1655,17 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
     except KeyboardInterrupt:
         kill_round_group(p)
         raise
+    finally:
+        # Even a round that exits 0 can leave the agent's backgrounded build-waiters alive; the timeout
+        # path's kill_round_group never runs for it. Sweep the group on EVERY exit so a leaked poll-loop
+        # lives at most one round, not forever (a no-op once kill_round_group already cleared the group).
+        # Unlike kill_round_group (which signals while the leader PID is still live), p.wait() has already
+        # reaped the leader here, so the group is held open only by stragglers. The lone wrong-kill window
+        # — the freed leader PID being reused AND the reuser making itself a group leader before this line
+        # — is microseconds wide and needs a deliberate setsid; we accept it. (One-shot `tauceti work`
+        # runs the round in-process, not through here, so it is not swept; only the unbounded --loop leak
+        # is operationally damaging, so that scope gap is acceptable.)
+        reap_round_group(pgid)
 
 
 # ============================================================================
