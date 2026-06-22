@@ -236,6 +236,54 @@ def test_random_default():
         os.environ.pop("TAUCETI_REQUIRE_TARGET_MARKER", None)
 
 
+def test_skip_edge_cases():
+    """do_roadmap edge cases: an explicit --roadmap-only that overlaps --roadmap-skip must NOT tell
+    the agent to avoid its own pinned area (a contradiction), and skipping every known area in auto
+    mode must raise NoProgress rather than launch a doomed round."""
+    captured = {}
+    orig = {k: getattr(tc.work_units, k) for k in ("fetch_ref", "prepare_checkout", "run_agent_host", "roadmap_areas")}
+    tc.work_units.fetch_ref = lambda *a, **k: True
+    tc.work_units.prepare_checkout = lambda cfg: True
+    tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
+    tc.work_units.roadmap_areas = lambda gh: ["algebra", "topology"]
+    cfg = SimpleNamespace(
+        state=Path("/tmp/tauceti-test/state"), checkout=Path("/tmp/tauceti-test/co"), logdir=Path("/tmp/tauceti-test")
+    )
+    w = SimpleNamespace(cfg=cfg, gh=object())
+    opts = SimpleNamespace(agent_name="Claude Code", work_model="claude")
+    try:
+        # --roadmap-only algebra overlaps --roadmap-skip algebra → only wins, skip line drops algebra
+        os.environ["TAUCETI_ROADMAP_SKIP"] = "algebra,topology"
+        tc.do_roadmap(w, None, tc.Candidate(0, "", "algebra"), opts, False)
+        check("pinned area still drives the prompt", "`algebra`" in captured["prompt"])
+        check("pinned area not listed as skipped", "these areas: `topology`" in captured["prompt"])
+        # auto mode with every known area skipped → NoProgress (not a fallback to "any")
+        captured.clear()
+        raised = False
+        try:
+            tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
+        except tc.NoProgress:
+            raised = True
+        check("all-areas-skipped auto raises NoProgress", raised)
+        check("no doomed round launched", "prompt" not in captured)
+    finally:
+        for k, v in orig.items():
+            setattr(tc.work_units, k, v)
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        os.environ.pop("TAUCETI_REQUIRE_TARGET_MARKER", None)
+
+
+def test_launch_cmd_skip_tristate():
+    """launch_cmd embeds the raw skip value verbatim: omitted when None, but an explicit empty string
+    is preserved so a copied command clears an inherited TAUCETI_ROADMAP_SKIP."""
+    check("None skip omits the flag", "--roadmap-skip" not in tc.launch_cmd(None, "auto", False, False, None, None))
+    check("empty skip is preserved", tc.launch_cmd(None, "auto", False, False, None, "")[-2:] == ["--roadmap-skip", ""])
+    check(
+        "non-empty skip passed through",
+        tc.launch_cmd(None, "auto", False, False, None, "a,b")[-2:] == ["--roadmap-skip", "a,b"],
+    )
+
+
 def test_roadmap_skip_parse():
     """roadmap_skip() parses the comma-separated env into a deduped, sorted list (empties dropped)."""
     old = os.environ.get("TAUCETI_ROADMAP_SKIP")
@@ -334,6 +382,8 @@ async def run_all():
     await test_sticky_env_focus()
     test_load_token()
     test_random_default()
+    test_skip_edge_cases()
+    test_launch_cmd_skip_tristate()
     test_roadmap_skip_parse()
     test_bare_cli_ignores_prefs()
     test_dashboard_uses_saved_pref()

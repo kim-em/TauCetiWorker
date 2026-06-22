@@ -441,12 +441,17 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
     if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
-        areas = [a for a in roadmap_areas(w.gh) if a not in skip]
+        raw_areas = roadmap_areas(w.gh)
+        areas = [a for a in raw_areas if a not in skip]
+        if raw_areas and not areas:  # every known area is skipped — nothing to author (vs. an empty fetch)
+            raise NoProgress(f"roadmap: every area is in --roadmap-skip ({', '.join(skip)}) — nothing to author")
         only = random.choice(areas) if areas else "any"
         log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
         log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
-    skip_str = ", ".join(skip) or "none"
+    # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
+    # already excluded from the auto pick above, so this only matters for an explicit --roadmap-only.
+    skip_str = ", ".join(a for a in skip if a != only) or "none"
     refs = w.cfg.state / "refs"
     if not fetch_ref(ROADMAP, refs / "roadmap"):
         raise Die(f"fetch {ROADMAP} failed")

@@ -130,12 +130,13 @@ def launch_cmd(
     host: bool,
     loop: bool,
     roadmap_only: str | None = None,
-    roadmap_skip: list[str] | None = None,
+    roadmap_skip: str | None = None,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
-    `roadmap_only`/`roadmap_skip` (the current roadmap dials) are embedded as --roadmap-only/--roadmap-skip
-    so the copied/logged command reproduces what [o]/[x] set instead of silently reverting to the shell
-    default."""
+    `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
+    --roadmap-only/--roadmap-skip so the copied/logged command reproduces what [o]/[x] set instead of
+    silently reverting to the shell default. They are passed through verbatim (an explicit empty string
+    is meaningful and overrides an inherited env var), and only omitted when unset (None)."""
     cmd = entry_cmd() + ["work"]
     if loop:
         cmd.append("--loop")
@@ -147,8 +148,8 @@ def launch_cmd(
         cmd.append("--host")
     if roadmap_only is not None:
         cmd += ["--roadmap-only", roadmap_only]
-    if roadmap_skip:
-        cmd += ["--roadmap-skip", ",".join(roadmap_skip)]
+    if roadmap_skip is not None:
+        cmd += ["--roadmap-skip", roadmap_skip]
     return cmd
 
 
@@ -620,12 +621,9 @@ def _dashboard_app(cfg, loader=None):
 
         # ---- launch ---------------------------------------------------------------------------------
         def action_copy_cmd(self) -> None:
-            one = " ".join(
-                _shq(a) for a in launch_cmd(None, self.model_dial, self.host, False, roadmap_only(), roadmap_skip())
-            )
-            loop = " ".join(
-                _shq(a) for a in launch_cmd(None, self.model_dial, self.host, True, roadmap_only(), roadmap_skip())
-            )
+            skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
+            one = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.host, False, roadmap_only(), skip))
+            loop = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.host, True, roadmap_only(), skip))
             copied = True
             try:
                 self.copy_to_clipboard(one)
@@ -635,7 +633,8 @@ def _dashboard_app(cfg, loader=None):
 
         def _launch(self, *, loop: bool, only_selected: bool) -> None:
             only = ALLOWED_TASKS[self.sel] if only_selected else None
-            cmd = launch_cmd(only, self.model_dial, self.host, loop, roadmap_only(), roadmap_skip())
+            skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
+            cmd = launch_cmd(only, self.model_dial, self.host, loop, roadmap_only(), skip)
             if loop:  # detached: the TUI is a launcher, not a supervisor
                 pid, logf = _launch_detached(self.cfg, cmd)
                 self.notify(f"pid {pid}  →  {logf}\nstop it:  kill {pid}", title="loop launched", timeout=10)
