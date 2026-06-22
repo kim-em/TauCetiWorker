@@ -11,18 +11,20 @@ tuples and a stubbed sleep records the waits.
 
 Exit 0 = all cases agree; 1 = a mismatch.
 """
+
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
-
-import subprocess
 
 PRIMARY = "HTTP 403: API rate limit exceeded for user ID 477956"
 SECONDARY = "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
@@ -39,6 +41,7 @@ def check(name, got, want):
 
 class FakeRun:
     """Replays a scripted list of (returncode, stderr) for each tc.run() call; records argv seen."""
+
     def __init__(self, script):
         self.script = list(script)
         self.calls = []
@@ -56,7 +59,7 @@ def with_stubs(run_script, budget=None):
     slept = []
     tc.run = fr
     tc.time.sleep = lambda s: slept.append(s)
-    tc.github_budget = (lambda: budget)
+    tc.github_budget = lambda: budget
     return fr, slept
 
 
@@ -102,10 +105,15 @@ def main() -> int:
     class BudgetRun:
         def __call__(self, argv, **kw):
             return subprocess.CompletedProcess(
-                argv, 0, stdout='{"core":[4321,1750000000],"graphql":[4999,1750000100]}', stderr="")
+                argv, 0, stdout='{"core":[4321,1750000000],"graphql":[4999,1750000100]}', stderr=""
+            )
+
     tc.run = BudgetRun()
-    check("github_budget parses both buckets", tc.github_budget(),
-          {"core": (4321, 1750000000), "graphql": (4999, 1750000100)})
+    check(
+        "github_budget parses both buckets",
+        tc.github_budget(),
+        {"core": (4321, 1750000000), "graphql": (4999, 1750000100)},
+    )
 
     tc.run, tc.time.sleep, tc.github_budget = orig_run, orig_sleep, orig_budget
 
@@ -114,27 +122,46 @@ def main() -> int:
         def __init__(self, payload, rest_counts=None):
             super().__init__("owner/repo")
             self._payload, self._rest = payload, rest_counts
+
         def _gh(self, args):
             return subprocess.CompletedProcess(args, 0, stdout=__import__("json").dumps(self._payload), stderr="")
+
         def issue_comments(self, pr):
             return [{}] * self._rest[0] if self._rest else None
+
         def review_comments(self, pr):
             return [{}] * self._rest[1] if self._rest else None
 
     def payload(head, issue_n, thread_counts, thread_total=None):
-        return {"data": {"repository": {"pullRequest": {
-            "headRefOid": head, "comments": {"totalCount": issue_n},
-            "reviewThreads": {"totalCount": thread_total if thread_total is not None else len(thread_counts),
-                              "nodes": [{"comments": {"totalCount": c}} for c in thread_counts]}}}}}
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": head,
+                        "comments": {"totalCount": issue_n},
+                        "reviewThreads": {
+                            "totalCount": thread_total if thread_total is not None else len(thread_counts),
+                            "nodes": [{"comments": {"totalCount": c}} for c in thread_counts],
+                        },
+                    }
+                }
+            }
+        }
 
     gh = GHGraphql(payload("abc123", 3, [2, 1]))
-    check("pr_progress_state counts head+issue+thread comments",
-          gh.pr_progress_state(7), {"head": "abc123", "ncomments": 6})   # 3 + 2 + 1
+    check(
+        "pr_progress_state counts head+issue+thread comments",
+        gh.pr_progress_state(7),
+        {"head": "abc123", "ncomments": 6},
+    )  # 3 + 2 + 1
 
     # >100 threads: fall back to the exact paginated REST count (here 12 issue + 9 review = 21).
     gh = GHGraphql(payload("def456", 99, [], thread_total=101), rest_counts=(12, 9))
-    check("pr_progress_state falls back to REST past 100 threads",
-          gh.pr_progress_state(8), {"head": "def456", "ncomments": 21})
+    check(
+        "pr_progress_state falls back to REST past 100 threads",
+        gh.pr_progress_state(8),
+        {"head": "def456", "ncomments": 21},
+    )
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

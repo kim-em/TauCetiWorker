@@ -8,6 +8,7 @@ process). The engine's marker remains the real de-contention backstop; this only
 
 Exit 0 = all cases agree; 1 = a mismatch.
 """
+
 import importlib.machinery
 import importlib.util
 import random
@@ -15,7 +16,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)

@@ -10,15 +10,19 @@ the GitHub class; here we stub `reactions()` and assert the survey-time skip/fir
 
 Exit 0 = all cases agree; 1 = a mismatch.
 """
+
 import importlib.machinery
 import importlib.util
 import sys
+from datetime import UTC
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
@@ -27,12 +31,14 @@ NOW = int(tc.time.time())
 
 
 def iso(epoch: int) -> str:
-    from datetime import datetime, timezone
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    from datetime import datetime
+
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class FakeGitHub(tc.GitHub):
     """A GitHub whose reaction list is a fixture — every other method is the real one (unused here)."""
+
     def __init__(self, reactions):
         super().__init__("owner/repo")
         self._reactions = reactions
@@ -43,14 +49,17 @@ class FakeGitHub(tc.GitHub):
 
 # (name, reactions-fixture, want_claimed) — claimed => a peer holds it => this worker SKIPS.
 CASES = [
-    ("no reactions",            [],                                                            False),
-    ("fetch failed (fail-open)", None,                                                         False),
-    ("unrelated emoji only",    [{"content": "rocket", "created_at": iso(NOW - 5)}],           False),
-    ("fresh 👀",                [{"content": "eyes",   "created_at": iso(NOW - 5)}],           True),
-    ("👀 just under TTL",       [{"content": "eyes",   "created_at": iso(NOW - (tc.CONTEST_CLAIM_TTL - 30))}], True),
-    ("👀 expired past TTL",     [{"content": "eyes",   "created_at": iso(NOW - (tc.CONTEST_CLAIM_TTL + 30))}], False),
-    ("stale 👀 + a fresh one",  [{"content": "eyes",   "created_at": iso(NOW - 99999)},
-                                 {"content": "eyes",   "created_at": iso(NOW - 5)}],           True),
+    ("no reactions", [], False),
+    ("fetch failed (fail-open)", None, False),
+    ("unrelated emoji only", [{"content": "rocket", "created_at": iso(NOW - 5)}], False),
+    ("fresh 👀", [{"content": "eyes", "created_at": iso(NOW - 5)}], True),
+    ("👀 just under TTL", [{"content": "eyes", "created_at": iso(NOW - (tc.CONTEST_CLAIM_TTL - 30))}], True),
+    ("👀 expired past TTL", [{"content": "eyes", "created_at": iso(NOW - (tc.CONTEST_CLAIM_TTL + 30))}], False),
+    (
+        "stale 👀 + a fresh one",
+        [{"content": "eyes", "created_at": iso(NOW - 99999)}, {"content": "eyes", "created_at": iso(NOW - 5)}],
+        True,
+    ),
 ]
 
 
@@ -70,8 +79,8 @@ def main() -> int:
         print(f"[{'OK ' if ok else 'BAD'}] {name:<26} -> {verb} (want {'SKIP' if want else 'fire'})")
     # _parse_iso8601 round-trips GitHub's whole-second Z timestamps.
     assert tc._parse_iso8601("2026-06-19T08:03:48Z") == int(
-        __import__("datetime").datetime(2026, 6, 19, 8, 3, 48,
-                                        tzinfo=__import__("datetime").timezone.utc).timestamp())
+        __import__("datetime").datetime(2026, 6, 19, 8, 3, 48, tzinfo=__import__("datetime").timezone.utc).timestamp()
+    )
     assert tc._parse_iso8601(None) is None and tc._parse_iso8601("nonsense") is None
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0

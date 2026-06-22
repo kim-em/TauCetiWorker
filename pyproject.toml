@@ -23,3 +23,20 @@ bypass-selection = true
 "tauceti" = "tauceti_worker/__main__.py"
 "prompts" = "tauceti_worker/prompts"
 "scripts" = "tauceti_worker/scripts"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+# `tauceti` is the program but has no .py extension, so ruff won't pick it up by default.
+extend-include = ["tauceti"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501 (line length): the formatter owns code width; long inline comments/URLs are left intact.
+# UP031 (printf-format): the tests build jq/JSON filter strings with literal braces, where
+#   percent-format is clearer than f-strings that would have to escape every brace.
+ignore = ["E501", "UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# tauceti groups the pacer's urllib imports next to that section's code, by design.
+"tauceti" = ["E402"]

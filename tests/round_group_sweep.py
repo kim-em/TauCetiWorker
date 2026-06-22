@@ -11,6 +11,7 @@ and pins that the sweep clears it, plus a direct check that it reaches a whole m
 
 Exit 0 = swept as expected; 1 = a straggler survived.
 """
+
 import importlib.machinery
 import importlib.util
 import os
@@ -24,7 +25,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
@@ -89,7 +92,7 @@ else:
 
 print("== 2. reap_round_group is a no-op on an already-empty group ==")
 try:
-    tc.reap_round_group(leader.pid)   # leader and its group are gone now
+    tc.reap_round_group(leader.pid)  # leader and its group are gone now
     ok("no error sweeping an empty group")
 except Exception as e:
     no(f"raised on empty group: {e}")
@@ -101,11 +104,13 @@ WID = "sweep-test"
 env = dict(os.environ, TAUCETI_WORKER_ID=WID, TAUCETI_TEST_HOLD="300")
 round_proc = subprocess.Popen(
     [sys.executable, str(REPO / "tauceti"), "_round", "--worker-id", WID],
-    start_new_session=True, env=env,
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    start_new_session=True,
+    env=env,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
 )
 rc = round_proc.wait(60)
-group = round_proc.pid   # == pgid (own session)
+group = round_proc.pid  # == pgid (own session)
 time.sleep(0.3)
 if rc != 0:
     no(f"round exited rc={rc} (expected 0)")
@@ -134,7 +139,7 @@ orig_spawn = tc.spawn_round
 
 def spy_spawn(argv_tail):
     p = orig_spawn(argv_tail)
-    captured["pgid"] = p.pid   # == pgid (spawn_round uses start_new_session)
+    captured["pgid"] = p.pid  # == pgid (spawn_round uses start_new_session)
     return p
 
 

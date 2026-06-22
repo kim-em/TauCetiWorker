@@ -10,22 +10,25 @@ loop). The survey-time rule skips when the count is >= cap OR is the None sentin
 
 Exit 0 = all cases agree; 1 = a mismatch.
 """
+
 import importlib.machinery
 import importlib.util
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
 
-TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-YEST = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+TODAY = datetime.now(UTC).strftime("%Y-%m-%d")
+YEST = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
 CAP = tc.REVIEW_DAILY_CAP
 
 fails = 0
@@ -50,7 +53,9 @@ def skipped(count) -> bool:
 
 
 # Counting: today's rounds only; yesterday's are ignored (the cap resets at 00:00 UTC).
-mixed = [{"ts": f"{TODAY}T{h:02d}:00:00+00:00"} for h in range(CAP)] + [{"ts": f"{YEST}T0{i}:00:00+00:00"} for i in range(3)]
+mixed = [{"ts": f"{TODAY}T{h:02d}:00:00+00:00"} for h in range(CAP)] + [
+    {"ts": f"{YEST}T0{i}:00:00+00:00"} for i in range(3)
+]
 d = store_with(mixed)
 check("counts exactly today's rounds (ignores yesterday)", tc._review_rounds_today(d, 306), CAP)
 check("at cap -> skipped", skipped(tc._review_rounds_today(d, 306)), True)

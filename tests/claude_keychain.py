@@ -3,32 +3,53 @@
 keychain-first, marked from_keychain so the 401 path never refreshes a token shared with the operator's
 claude). For bubble rounds, where the in-container claude needs a .credentials.json, the credential is
 materialized from the Keychain INTO the configured CLAUDE_CONFIG_DIR when the file is missing/stale."""
-import importlib.machinery, importlib.util, json, os, sys, tempfile, types
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import types
 from pathlib import Path
+
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
-tc = importlib.util.module_from_spec(spec); sys.modules["tauceti"] = tc; spec.loader.exec_module(tc)
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
+tc = importlib.util.module_from_spec(spec)
+sys.modules["tauceti"] = tc
+spec.loader.exec_module(tc)
 
 fails = 0
+
+
 def check(name, got, expect):
     global fails
     ok = got == expect
     print(f"[{'OK ' if ok else 'XX '}] {name}: {got}")
     if not ok:
-        print(f"      expected: {expect}"); fails += 1
+        print(f"      expected: {expect}")
+        fails += 1
 
-OAUTH = {"claudeAiOauth": {"accessToken": "KC", "refreshToken": "R", "expiresAt": 1}}            # expiresAt in the past
+
+OAUTH = {"claudeAiOauth": {"accessToken": "KC", "refreshToken": "R", "expiresAt": 1}}  # expiresAt in the past
 FRESH = {"claudeAiOauth": {"accessToken": "F", "refreshToken": "R", "expiresAt": 9999999999999}}  # far future
+
 
 class FakeRun:
     """Stand-in for subprocess.run over `security`. Records the commands it saw and replays a scripted
     (returncode, stdout) per call, so we can assert the -a→service-only fallback and the unlock retry."""
+
     def __init__(self, results):
         self.results, self.calls, self.i = results, [], 0
+
     def __call__(self, cmd, *a, **k):
         self.calls.append(cmd)
-        rc, out = self.results[min(self.i, len(self.results) - 1)]; self.i += 1
+        rc, out = self.results[min(self.i, len(self.results) - 1)]
+        self.i += 1
         return types.SimpleNamespace(returncode=rc, stdout=out, stderr="")
+
 
 orig_run, orig_platform, orig_user = tc.subprocess.run, sys.platform, os.environ.get("USER")
 os.environ["USER"] = "alice"
@@ -38,13 +59,19 @@ try:
     # 1. The plain `-a $USER -w` hit parses to the same dict as the file would.
     tc.subprocess.run = FakeRun([(0, json.dumps(OAUTH))])
     check("keychain read parses the OAuth blob", tc._claude_keychain_creds(), OAUTH)
-    check("keychain read uses -s/-a/-w", tc.subprocess.run.calls[0],
-          ["security", "find-generic-password", "-s", "Claude Code-credentials", "-a", "alice", "-w"])
+    check(
+        "keychain read uses -s/-a/-w",
+        tc.subprocess.run.calls[0],
+        ["security", "find-generic-password", "-s", "Claude Code-credentials", "-a", "alice", "-w"],
+    )
 
     # 2. errSecItemNotFound (44) for the -a search falls back to the service-only search.
-    fr = FakeRun([(44, ""), (0, json.dumps(OAUTH))]); tc.subprocess.run = fr
+    fr = FakeRun([(44, ""), (0, json.dumps(OAUTH))])
+    tc.subprocess.run = fr
     check("falls back to service-only search", tc._claude_keychain_creds(), OAUTH)
-    check("fallback drops -a", fr.calls[1], ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"])
+    check(
+        "fallback drops -a", fr.calls[1], ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    )
 
     # 3. A locked Keychain (36) is treated as 'no creds', not an error (the pacer read is non-interactive).
     tc.subprocess.run = FakeRun([(36, "")])
@@ -82,7 +109,8 @@ try:
 
     # 8. Interactive read (for bubble seeding): a locked Keychain runs `security unlock-keychain`, then
     #    the retry succeeds. (-a→36, service-only→36, unlock, -a→blob.)
-    fr = FakeRun([(36, ""), (36, ""), (0, ""), (0, json.dumps(FRESH))]); tc.subprocess.run = fr
+    fr = FakeRun([(36, ""), (36, ""), (0, ""), (0, json.dumps(FRESH))])
+    tc.subprocess.run = fr
     check("interactive read unlocks then reads", tc._claude_keychain_creds_interactive(), FRESH)
     check("interactive read runs unlock-keychain", fr.calls[2], ["security", "unlock-keychain"])
 
@@ -97,7 +125,7 @@ try:
 
     # 10. macOS always re-mirrors from the authoritative Keychain (a stale refresh token in an unexpired
     #     file would fail mid-round), so an existing file is overwritten with the current Keychain blob.
-    target.write_text(json.dumps(OAUTH))   # a stale mirror
+    target.write_text(json.dumps(OAUTH))  # a stale mirror
     tc.subprocess.run = FakeRun([(0, json.dumps(FRESH))])
     tc._ensure_claude_creds_for_bubble(cfg2)
     check("existing file is re-mirrored from the keychain", json.loads(target.read_text()), FRESH)
@@ -110,7 +138,8 @@ try:
 
     # 12. Off darwin: a no-op (the file is the store there) — never reads a Keychain.
     tc.sys.platform = "linux"
-    fr = FakeRun([(0, json.dumps(FRESH))]); tc.subprocess.run = fr
+    fr = FakeRun([(0, json.dumps(FRESH))])
+    tc.subprocess.run = fr
     tc._ensure_claude_creds_for_bubble(types.SimpleNamespace(home=Path(tempfile.mkdtemp())))
     check("ensure is a no-op off darwin", fr.calls, [])
     tc.sys.platform = "darwin"
