@@ -1458,15 +1458,15 @@ def _review_rounds_today(store_dir: Path, pr: int) -> Optional[int]:
     return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
 
 
-def spread_review_candidates(candidates: list, rng=random) -> list:
-    """Return the review candidates in a randomized order so several workers starting together don't all
-    converge on the same (lowest-numbered) PR and collide on the reviewer's in-progress marker. The
-    survey has already dropped heads a peer is KNOWN to hold; this only varies which of the remaining,
-    apparently-free PRs each worker tries first — turning systematic startup collisions (every worker
-    picks the lowest, discovers the clash via a cheap engine yield, repeats) into rare, self-correcting
-    ones. Pure WORKER-side work-allocation: the engine's in-progress marker stays the authoritative
-    cross-fleet/cross-host de-contention; this just spreads the initial pick. Each worker is its own
-    process with independent RNG state, so concurrent workers shuffle differently. Returns a new list."""
+def spread_candidates(candidates: list, rng=random) -> list:
+    """Return a stage's candidates in a randomized order so several workers starting together don't all
+    converge on the same (lowest-numbered) PR and collide. The survey has already dropped work a peer is
+    KNOWN to hold; this only varies which of the remaining, apparently-free PRs each worker tries first —
+    turning systematic collisions (every worker picks the lowest, discovers the clash, repeats) into rare,
+    self-correcting ones. Pure WORKER-side work-allocation: the real de-contention is unchanged — the
+    review engine's in-progress marker for reviews, the branch claim for fix/fix-ci/rebase — this just
+    spreads the first pick. Each worker is its own process with independent RNG state, so concurrent
+    workers shuffle differently. Returns a new list."""
     out = list(candidates)
     rng.shuffle(out)
     return out
@@ -2331,11 +2331,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                  f"review it. Needs a human. https://github.com/{TAUCETI}/pull/{pr}")
         w.gh.ensure_stuck_issue(pr, f"its review has errored {n_err} times without posting a verdict")
 
-    # Spread concurrent workers across different PRs: shuffle the review candidates so workers starting
-    # together don't all pick the lowest-numbered PR and collide on the in-progress marker. Only review
-    # needs this — the other stages de-contend via branch claims (dispatch returns None when a peer holds
-    # the branch, so the cascade just tries the next candidate). The engine marker remains the backstop.
-    sv.reviewable.actionable = spread_review_candidates(sv.reviewable.actionable)
+    # Spread concurrent workers across different PRs: shuffle each CONTENDED stage's candidates so workers
+    # starting together don't all pick the lowest-numbered PR and probe the same target in lockstep
+    # (review collides on the in-progress marker; fix/fix-ci/rebase each cost a branch-claim round-trip to
+    # discover the clash). This only reorders WITHIN a stage — the cascade's stage priority below is
+    # unchanged — and the real de-contention (marker / branch claim) remains the authority and backstop.
+    for stage in ("rebase", "review", "fix-ci", "fix"):
+        sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
     # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
@@ -2571,9 +2573,14 @@ def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bo
             log(f"checkout failed for #{pr} — skipping this attempt")
             return 1
         co = w.cfg.checkout
-        if subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co)).returncode:
-            log(f"gh pr checkout #{pr} failed — skipping this attempt")
+        # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
+        # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
+        chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co),
+                             capture_output=True, text=True)
+        if chk.returncode:
+            log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({(chk.stderr or '').strip()[-200:]})")
             return 1
+        log(f"  {label} #{pr}: checked out @ {head[:12]}")
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         os.environ["TAUCETI_PUSH_EXPECT"] = (rev.stdout.strip() or head)   # CAS against what we checked out
         rc = run_agent_host(co, prompt, opts.work_model, w.cfg.logdir)
