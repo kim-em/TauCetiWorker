@@ -1458,6 +1458,20 @@ def _review_rounds_today(store_dir: Path, pr: int) -> Optional[int]:
     return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
 
 
+def spread_review_candidates(candidates: list, rng=random) -> list:
+    """Return the review candidates in a randomized order so several workers starting together don't all
+    converge on the same (lowest-numbered) PR and collide on the reviewer's in-progress marker. The
+    survey has already dropped heads a peer is KNOWN to hold; this only varies which of the remaining,
+    apparently-free PRs each worker tries first — turning systematic startup collisions (every worker
+    picks the lowest, discovers the clash via a cheap engine yield, repeats) into rare, self-correcting
+    ones. Pure WORKER-side work-allocation: the engine's in-progress marker stays the authoritative
+    cross-fleet/cross-host de-contention; this just spreads the initial pick. Each worker is its own
+    process with independent RNG state, so concurrent workers shuffle differently. Returns a new list."""
+    out = list(candidates)
+    rng.shuffle(out)
+    return out
+
+
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
            *, deep: bool = True) -> Survey:
     """Classify every open PR per work-kind. Read-only — performs no actions.
@@ -2316,6 +2330,12 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         warn_red(f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
                  f"review it. Needs a human. https://github.com/{TAUCETI}/pull/{pr}")
         w.gh.ensure_stuck_issue(pr, f"its review has errored {n_err} times without posting a verdict")
+
+    # Spread concurrent workers across different PRs: shuffle the review candidates so workers starting
+    # together don't all pick the lowest-numbered PR and collide on the in-progress marker. Only review
+    # needs this — the other stages de-contend via branch claims (dispatch returns None when a peer holds
+    # the branch, so the cascade just tries the next candidate). The engine marker remains the backstop.
+    sv.reviewable.actionable = spread_review_candidates(sv.reviewable.actionable)
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
     # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
