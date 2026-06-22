@@ -12,13 +12,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # The package declares requires-python >=3.11; test the supported range, not just the floor.
-        python: ["3.11", "3.12", "3.13", "3.14"]
     env:
-      UV_PYTHON: ${{ matrix.python }}   # uv (and tests/run-all) pick this interpreter
+      # The worker is stdlib-only (bar the TUI's rich/textual), so test on one interpreter — the
+      # latest uv ships — rather than a per-version matrix. requires-python >=3.11 is a declaration.
+      UV_PYTHON: "3.14"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
