@@ -5,13 +5,16 @@ A reply/partial round re-runs only some rubrics, so `runs` can show an approve w
 still blocking in `states` (the #229 stranding bug). The fix stage's eligibility reads this, and it
 must agree with CI's close (which also reads `states`). Dependency-free.
 """
+
 import importlib.machinery
 import importlib.util
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
@@ -19,6 +22,7 @@ spec.loader.exec_module(tc)
 
 class FakeRS:
     """Just enough of ReviewState to call the real ledger_blocking with a crafted meta."""
+
     def __init__(self, data):
         self._data = data
 
@@ -33,18 +37,35 @@ def blocking(data, head="H"):
 HEAD = "H"
 cases = [
     # (name, meta, expected)
-    ("states blocking while runs approve (the #229 bug)",
-     {"head_sha": HEAD, "runs": [{"rubric": "naming", "verdict": "approve"}],
-      "states": {"naming": "green", "documentation": "blocking_request"}}, True),
-    ("states all green/stale → not blocking",
-     {"head_sha": HEAD, "runs": [{"rubric": "x", "verdict": "request_changes"}],
-      "states": {"a": "green", "b": "stale"}}, False),
-    ("head mismatch → not blocking",
-     {"head_sha": "OTHER", "states": {"a": "blocking_request"}}, False),
-    ("no states map → fall back to runs (blocking)",
-     {"head_sha": HEAD, "runs": [{"rubric": "x", "verdict": "request_changes"}]}, True),
-    ("no states map → fall back to runs (clean)",
-     {"head_sha": HEAD, "runs": [{"rubric": "x", "verdict": "approve"}]}, False),
+    (
+        "states blocking while runs approve (the #229 bug)",
+        {
+            "head_sha": HEAD,
+            "runs": [{"rubric": "naming", "verdict": "approve"}],
+            "states": {"naming": "green", "documentation": "blocking_request"},
+        },
+        True,
+    ),
+    (
+        "states all green/stale → not blocking",
+        {
+            "head_sha": HEAD,
+            "runs": [{"rubric": "x", "verdict": "request_changes"}],
+            "states": {"a": "green", "b": "stale"},
+        },
+        False,
+    ),
+    ("head mismatch → not blocking", {"head_sha": "OTHER", "states": {"a": "blocking_request"}}, False),
+    (
+        "no states map → fall back to runs (blocking)",
+        {"head_sha": HEAD, "runs": [{"rubric": "x", "verdict": "request_changes"}]},
+        True,
+    ),
+    (
+        "no states map → fall back to runs (clean)",
+        {"head_sha": HEAD, "runs": [{"rubric": "x", "verdict": "approve"}]},
+        False,
+    ),
 ]
 
 fails = 0

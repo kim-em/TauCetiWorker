@@ -6,6 +6,7 @@ entry on a credential fingerprint makes a rotation read as a cache miss immediat
 stale numbers until the (1-hour, for claude) TTL lapses, which used to leave workers sleeping on another
 account's exhausted-looking quota. Dependency-free; no network.
 """
+
 import importlib.machinery
 import importlib.util
 import sys
@@ -14,7 +15,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
+spec = importlib.util.spec_from_loader(
+    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
+)
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
