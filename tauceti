@@ -2336,7 +2336,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # (review collides on the in-progress marker; fix/fix-ci/rebase each cost a branch-claim round-trip to
     # discover the clash). This only reorders WITHIN a stage — the cascade's stage priority below is
     # unchanged — and the real de-contention (marker / branch claim) remains the authority and backstop.
-    for stage in ("rebase", "review", "fix-ci", "fix"):
+    for stage in ("rebase", "review", "fix-ci", "fix", "bump"):
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
@@ -2578,11 +2578,13 @@ def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bo
         chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co),
                              capture_output=True, text=True)
         if chk.returncode:
-            log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({(chk.stderr or '').strip()[-200:]})")
+            detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
+            log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
             return 1
-        log(f"  {label} #{pr}: checked out @ {head[:12]}")
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
-        os.environ["TAUCETI_PUSH_EXPECT"] = (rev.stdout.strip() or head)   # CAS against what we checked out
+        checked = rev.stdout.strip() or head
+        os.environ["TAUCETI_PUSH_EXPECT"] = checked   # CAS against what we actually checked out
+        log(f"  {label} #{pr}: checked out @ {checked[:12]}")
         rc = run_agent_host(co, prompt, opts.work_model, w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
