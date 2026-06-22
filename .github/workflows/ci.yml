@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         # The package declares requires-python >=3.11; test the supported range, not just the floor.
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     env:
       UV_PYTHON: ${{ matrix.python }}   # uv (and tests/run-all) pick this interpreter
     steps:

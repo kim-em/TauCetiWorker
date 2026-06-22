@@ -3,7 +3,7 @@
 # Read-only: uses the TAUCETI_TEST_* hooks, never touches GitHub. Run from the repo root.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-PY=$(command -v python3)
+PY="${PY:-$(command -v python3)}"   # run-all injects the matrix interpreter; fall back to system python3
 WID="lifecycle-test"
 export TAUCETI_WORKER_ID="$WID"
 pass=0; fail=0

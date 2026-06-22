@@ -85,6 +85,10 @@ done
 run parity_selectors.py uv run python tests/parity_selectors.py tests/fixtures/pr_selectors.json
 run dashboard.py uv run --script tests/dashboard.py
 
+# lifecycle.sh resolves its own python; hand it the uv-selected interpreter so the matrix
+# actually covers it (otherwise it would always use the runner's default python3).
+PY="$(uv run python -c 'import sys; print(sys.executable)')"
+export PY
 for t in "${RUN_SH[@]}"; do
   run "$t" bash "tests/$t"
 done
