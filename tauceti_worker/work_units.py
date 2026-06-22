@@ -20,7 +20,7 @@ from .agents import (
     run_in_bubble,
     run_to_logfile,
 )
-from .config import Config, Die, NoProgress, log, roadmap_areas, warn_red
+from .config import Config, Die, NoProgress, log, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
     AGENT_NAMES,
     CONTEST_CLAIM_TTL,
@@ -128,7 +128,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     if want(opts.only, "roadmap"):
         if sv.roadmap_backpressure:
             raise NoProgress(f"roadmap: {sv.n_mine_open} open PRs (>= {MAX_OPEN_PRS}) — backpressure, not authoring")
-        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_focus), opts)
+        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
             return rc
 
@@ -213,7 +213,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if c.pr:
         what = f"PR #{c.pr}  https://github.com/{TAUCETI}/pull/{c.pr}"
     elif stage == "roadmap":
-        what = f"new PR (focus: {c.reason or 'any'})"
+        what = f"new PR (area: {c.reason or 'any'})"
     else:
         what = c.reason or (c.head[:12] if c.head else "")
     log(f"→ {stage.upper()}: {what}   [agent={opts.work_model}, sandbox={where}]")
@@ -438,11 +438,15 @@ def do_bump(w, sv, c, opts, bubble) -> int | None:
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
-    focus = c.reason or "any"
-    if focus == "auto":  # no focus set: pick a fresh random area this round (per-round, in-child)
-        areas = roadmap_areas(w.gh)
-        focus = random.choice(areas) if areas else "any"
-        log(f"→ ROADMAP focus: {focus} (auto-picked from {len(areas)} areas)")
+    only = c.reason or "any"
+    skip = roadmap_skip()
+    if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
+        areas = [a for a in roadmap_areas(w.gh) if a not in skip]
+        only = random.choice(areas) if areas else "any"
+        log(f"→ ROADMAP area: {only} (auto-picked from {len(areas)} areas, skipping {len(skip)})")
+    elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
+        log(f"→ ROADMAP area: {only} (--roadmap-only overrides --roadmap-skip)")
+    skip_str = ", ".join(skip) or "none"
     refs = w.cfg.state / "refs"
     if not fetch_ref(ROADMAP, refs / "roadmap"):
         raise Die(f"fetch {ROADMAP} failed")
@@ -455,7 +459,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             TAUCETI,
             fill_prompt(
                 HERE / "prompts" / "roadmap.md",
-                FOCUS=focus,
+                ONLY=only,
+                SKIP=skip_str,
                 AGENT=opts.agent_name,
                 ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
                 REVIEW_DIR="/opt/review",
@@ -467,7 +472,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         raise Die("checkout failed")
     prompt = fill_prompt(
         HERE / "prompts" / "roadmap.md",
-        FOCUS=focus,
+        ONLY=only,
+        SKIP=skip_str,
         AGENT=opts.agent_name,
         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
         REVIEW_DIR=str(refs / "review"),

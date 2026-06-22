@@ -5,7 +5,7 @@
 # ///
 """Headless smoke for the Textual dashboard: build the app with a STUB survey loader (no GitHub, no
 tty) and drive it with App.run_test(). Covers the lag fix (cursor/dials are local state), expand/
-collapse, the launch follow-up, the roadmap-focus picker (exercises the OptionList.OptionSelected
+collapse, the launch follow-up, the roadmap-only picker (exercises the OptionList.OptionSelected
 path end-to-end, so attribute-name drift across textual versions is caught), the stale roadmap-row
 redraw, prefs persistence + env-override precedence, and the stale-survey load-token guard.
 Exit 0 = all checks pass, 1 = a failure."""
@@ -22,7 +22,8 @@ from types import SimpleNamespace
 # Isolate the prefs file: persistence must land here, not in the operator's real ~/.config.
 _CFGDIR = tempfile.mkdtemp(prefix="tauceti-prefs-")
 os.environ["XDG_CONFIG_HOME"] = _CFGDIR
-os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)  # start from a known (unset) focus state
+os.environ.pop("TAUCETI_ROADMAP_ONLY", None)  # start from a known (unset) area state
+os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -59,8 +60,9 @@ def fake_survey(next_stage="review"):
     sv.n_open_nondraft = 2
     sv.n_reviewable = 2
     sv.reviewable.actionable = [tc.Candidate(101, "x"), tc.Candidate(102, "x")]
-    _f = tc.roadmap_focus()  # mirror survey()'s sanitization: None → "auto"
-    sv.roadmap_focus = "auto" if _f is None else (_f or "any")
+    _f = tc.roadmap_only()  # mirror survey()'s sanitization: None → "auto"
+    sv.roadmap_only = "auto" if _f is None else (_f or "any")
+    sv.roadmap_skip = tc.roadmap_skip()
     sv.next_auto_stage = next_stage
     return sv
 
@@ -107,16 +109,16 @@ async def test_dashboard():
         await pilot.press("left")
         check("collapse removed them", table.row_count == before)
 
-        # roadmap focus picker: open, move to "topology", select. Drives OptionList end-to-end so a
+        # roadmap-only picker: open, move to "topology", select. Drives OptionList end-to-end so a
         # textual rename of the OptionSelected attribute would fail here, not silently at runtime.
-        await pilot.press("f")
+        await pilot.press("o")
         await pilot.pause(0.15)
         await pilot.press("down")  # (all areas) -> algebra
         await pilot.press("down")  # algebra -> topology
         await pilot.press("enter")
         await pilot.pause(0.1)
-        check("focus picker set env focus to topology", os.environ.get("TAUCETI_ROADMAP_FOCUS") == "topology")
-        check("roadmap row focus updated immediately (no stale redraw)", app.sv.roadmap_focus == "topology")
+        check("only picker set env area to topology", os.environ.get("TAUCETI_ROADMAP_ONLY") == "topology")
+        check("roadmap row area updated immediately (no stale redraw)", app.sv.roadmap_only == "topology")
 
         # a digit jumps the cursor to that kind and launches a one-round follow-up (then exits)
         await pilot.press("2")
@@ -131,7 +133,7 @@ async def test_dashboard():
     saved = json.loads(prefs_file.read_text())
     check("prefs persisted model=codex", saved.get("model") == "codex")
     check("prefs persisted host=True", saved.get("host") is True)
-    check("prefs persisted user-chosen focus=topology", saved.get("roadmap_focus") == "topology")
+    check("prefs persisted user-chosen only=topology", saved.get("roadmap_only") == "topology")
 
     app2 = tc._dashboard_app(CFG, loader=loader)
     async with app2.run_test() as pilot:
@@ -160,23 +162,23 @@ async def test_cursor_before_load():
 
 
 async def test_sticky_env_focus():
-    """#5: a transient TAUCETI_ROADMAP_FOCUS override must NOT be written into prefs by an unrelated
+    """#5: a transient TAUCETI_ROADMAP_ONLY override must NOT be written into prefs by an unrelated
     dial change, or it becomes sticky on later runs that have no env override."""
     cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-env-")
     os.environ["XDG_CONFIG_HOME"] = cfgdir
-    os.environ["TAUCETI_ROADMAP_FOCUS"] = "EnvOnly"
+    os.environ["TAUCETI_ROADMAP_ONLY"] = "EnvOnly"
     try:
         cfg = SimpleNamespace(logdir=Path("/tmp/x"), home=Path(cfgdir), state=Path(cfgdir) / "state")
         app = tc._dashboard_app(cfg, loader=loader)
         async with app.run_test() as pilot:
             await await_survey(app, pilot)
-            await pilot.press("m")  # change model only — must not persist the env focus
+            await pilot.press("m")  # change model only — must not persist the env area
             await pilot.pause(0.05)
         saved = json.loads(tc._prefs_path(cfg).read_text())
         check("model-only change saved the model", saved.get("model") == "codex")
-        check("env-only focus NOT persisted as sticky", saved.get("roadmap_focus") != "EnvOnly")
+        check("env-only area NOT persisted as sticky", saved.get("roadmap_only") != "EnvOnly")
     finally:
-        os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+        os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
         os.environ["XDG_CONFIG_HOME"] = _CFGDIR
 
 
@@ -190,9 +192,10 @@ def test_load_token():
 
 
 def test_random_default():
-    """The new default: with no focus set, do_roadmap resolves "auto" to a random roadmap area
-    (and falls back to "all areas" when the area list can't be fetched). Stub the IO so only the
-    focus-resolution + prompt substitution runs."""
+    """The new default: with no area pinned, do_roadmap resolves "auto" to a random roadmap area
+    (and falls back to "all areas" when the area list can't be fetched). --roadmap-skip removes
+    areas from the random pick and is injected into the prompt. Stub the IO so only the
+    area-resolution + prompt substitution runs."""
     captured = {}
     orig = {k: getattr(tc.work_units, k) for k in ("fetch_ref", "prepare_checkout", "run_agent_host", "roadmap_areas")}
     orig_choice = tc.random.choice
@@ -207,10 +210,19 @@ def test_random_default():
     try:
         # areas available → a random area is chosen and substituted into the prompt
         tc.work_units.roadmap_areas = lambda gh: ["algebra", "topology"]
-        tc.random.choice = lambda seq: seq[1]  # deterministic: "topology"
+        tc.random.choice = lambda seq: seq[-1]  # deterministic: the last remaining area
         tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
-        check("auto leaves no __FOCUS__ placeholder", "__FOCUS__" not in captured["prompt"])
+        check("auto leaves no __ONLY__ placeholder", "__ONLY__" not in captured["prompt"])
+        check("auto leaves no __SKIP__ placeholder", "__SKIP__" not in captured["prompt"])
         check("auto picked the area from the list", "`topology`" in captured["prompt"])
+        check("no skip set → prompt says none", "`none`" in captured["prompt"])
+        # --roadmap-skip excludes an area from the random pick (so only "topology" remains)
+        captured.clear()
+        os.environ["TAUCETI_ROADMAP_SKIP"] = "algebra"
+        tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
+        check("auto skips the excluded area", "`topology`" in captured["prompt"])
+        check("skipped area named in the prompt", "algebra" in captured["prompt"])
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
         # no areas (fetch failed) → fall back to all areas ("any")
         captured.clear()
         tc.work_units.roadmap_areas = lambda gh: []
@@ -220,41 +232,100 @@ def test_random_default():
         for k, v in orig.items():
             setattr(tc.work_units, k, v)
         tc.random.choice = orig_choice
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
         os.environ.pop("TAUCETI_REQUIRE_TARGET_MARKER", None)
 
 
+def test_roadmap_skip_parse():
+    """roadmap_skip() parses the comma-separated env into a deduped, sorted list (empties dropped)."""
+    old = os.environ.get("TAUCETI_ROADMAP_SKIP")
+    try:
+        os.environ["TAUCETI_ROADMAP_SKIP"] = " topology , algebra ,, topology "
+        check("skip parsed, deduped, sorted", tc.roadmap_skip() == ["algebra", "topology"])
+        os.environ["TAUCETI_ROADMAP_SKIP"] = ""
+        check("blank skip → empty list", tc.roadmap_skip() == [])
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        check("unset skip → empty list", tc.roadmap_skip() == [])
+    finally:
+        if old is None:
+            os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        else:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old
+
+
 def test_bare_cli_ignores_prefs():
-    """Requirement 1: a saved dashboard pref must NOT be read by a bare CLI run. roadmap_focus()
-    consults only the env, so with a prefs file present but the env unset it stays None (auto)."""
+    """Requirement 1: a saved dashboard pref must NOT be read by a bare CLI run. roadmap_only()/
+    roadmap_skip() consult only the env, so with a prefs file present but the env unset they stay
+    at their unset defaults."""
     cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-cli-")
-    old_xdg, old_env = os.environ.get("XDG_CONFIG_HOME"), os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    old_only = os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+    old_skip = os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
     os.environ["XDG_CONFIG_HOME"] = cfgdir
     try:
         cfg = SimpleNamespace(home=Path(cfgdir))
-        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": False, "roadmap_focus": "SavedArea"})
-        check("bare CLI focus is None (auto), ignoring the saved pref", tc.roadmap_focus() is None)
+        tc.save_dashboard_prefs(
+            cfg, {"model": "auto", "host": False, "roadmap_only": "SavedArea", "roadmap_skip": "SkipArea"}
+        )
+        check("bare CLI only is None (auto), ignoring the saved pref", tc.roadmap_only() is None)
+        check("bare CLI skip is empty, ignoring the saved pref", tc.roadmap_skip() == [])
     finally:
         os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
-        if old_env is not None:
-            os.environ["TAUCETI_ROADMAP_FOCUS"] = old_env
+        if old_only is not None:
+            os.environ["TAUCETI_ROADMAP_ONLY"] = old_only
+        if old_skip is not None:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
 def test_dashboard_uses_saved_pref():
-    """Requirement 1 (other half): the dashboard DOES apply the saved focus — on init it seeds the
+    """Requirement 1 (other half): the dashboard DOES apply the saved only/skip — on init it seeds the
     process env (so its display and any launched round inherit it) when the env is unset."""
     cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-dash-")
-    old_xdg, old_env = os.environ.get("XDG_CONFIG_HOME"), os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    old_only = os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+    old_skip = os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
     os.environ["XDG_CONFIG_HOME"] = cfgdir
     try:
         cfg = SimpleNamespace(home=Path(cfgdir), state=Path(cfgdir) / "state", logdir=Path("/tmp/x"))
-        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": False, "roadmap_focus": "topology"})
+        tc.save_dashboard_prefs(
+            cfg, {"model": "auto", "host": False, "roadmap_only": "topology", "roadmap_skip": "algebra"}
+        )
         tc._dashboard_app(cfg, loader=loader)  # runs the saved-pref restore
-        check("dashboard applied the saved focus to the env", os.environ.get("TAUCETI_ROADMAP_FOCUS") == "topology")
+        check("dashboard applied the saved only to the env", os.environ.get("TAUCETI_ROADMAP_ONLY") == "topology")
+        check("dashboard applied the saved skip to the env", os.environ.get("TAUCETI_ROADMAP_SKIP") == "algebra")
     finally:
-        os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)
+        os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
         os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
-        if old_env is not None:
-            os.environ["TAUCETI_ROADMAP_FOCUS"] = old_env
+        if old_only is not None:
+            os.environ["TAUCETI_ROADMAP_ONLY"] = old_only
+        if old_skip is not None:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
+
+
+async def test_skip_dashboard():
+    """The [x] skip control: the TextPrompt sets a normalized TAUCETI_ROADMAP_SKIP, updates the
+    survey row immediately, and persists the user-chosen skip to prefs."""
+    cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-skip-")
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    old_skip = os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+    os.environ["XDG_CONFIG_HOME"] = cfgdir
+    try:
+        cfg = SimpleNamespace(logdir=Path("/tmp/x"), home=Path(cfgdir), state=Path(cfgdir) / "state")
+        app = tc._dashboard_app(cfg, loader=loader)
+        async with app.run_test() as pilot:
+            await await_survey(app, pilot)
+            app._apply_skip("topology, algebra,, topology")  # exercise the apply path directly
+            await pilot.pause(0.05)
+        check("skip env normalized (deduped, sorted)", os.environ.get("TAUCETI_ROADMAP_SKIP") == "algebra,topology")
+        check("roadmap row skip updated immediately", app.sv.roadmap_skip == ["algebra", "topology"])
+        saved = json.loads(tc._prefs_path(cfg).read_text())
+        check("prefs persisted user-chosen skip", saved.get("roadmap_skip") == "algebra,topology")
+    finally:
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
+        if old_skip is not None:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
 async def run_all():
@@ -263,8 +334,10 @@ async def run_all():
     await test_sticky_env_focus()
     test_load_token()
     test_random_default()
+    test_roadmap_skip_parse()
     test_bare_cli_ignores_prefs()
     test_dashboard_uses_saved_pref()
+    await test_skip_dashboard()
 
 
 asyncio.run(run_all())

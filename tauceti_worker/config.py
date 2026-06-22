@@ -14,27 +14,43 @@ from .constants import ROADMAP
 from .paths import HERE
 
 
-def roadmap_focus() -> str | None:
-    """The roadmap area the worker steers toward, as the operator set it — read live from the env
-    each call so the TUI's [f] key can change it and have both the survey display and any launched
-    round pick it up (children inherit TAUCETI_ROADMAP_FOCUS). Tri-state: None = unset, so a fresh
+def roadmap_only() -> str | None:
+    """The single roadmap area the worker steers toward, as the operator set it — read live from the
+    env each call so the TUI's [o] key can change it and have both the survey display and any launched
+    round pick it up (children inherit TAUCETI_ROADMAP_ONLY). Tri-state: None = unset, so a fresh
     random area is picked per round (see do_roadmap); "" = all areas; else the area name. There is
     deliberately no baked-in default, and nothing here consults the dashboard prefs — a bare CLI run
     resolves only from the env + the live area list, never from a saved dashboard preference."""
-    return os.environ.get("TAUCETI_ROADMAP_FOCUS")
+    return os.environ.get("TAUCETI_ROADMAP_ONLY")
 
 
-def _focus_label(sv=None) -> str:
-    """Friendly render of the roadmap focus for the status bar. Prefers the survey's sanitized value
-    ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""
-    v = sv.roadmap_focus if (sv is not None and sv.roadmap_focus) else roadmap_focus()
+def roadmap_skip() -> list[str]:
+    """Roadmap areas to exclude from selection (so concurrent workers can divide the roadmap), read
+    live from the env each call — the TUI's [x] key and any launched round both see changes (children
+    inherit TAUCETI_ROADMAP_SKIP). Comma-separated; whitespace and empty entries are dropped; the
+    result is deduped and sorted. Returns [] when unset/blank. Shapes the auto-random pick and the
+    "all areas" (any) case; an explicit --roadmap-only area takes precedence over it (see do_roadmap)."""
+    raw = os.environ.get("TAUCETI_ROADMAP_SKIP", "")
+    return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
+
+
+def _only_label(sv=None) -> str:
+    """Friendly render of the roadmap-only area for the status bar. Prefers the survey's sanitized
+    value ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""
+    v = sv.roadmap_only if (sv is not None and sv.roadmap_only) else roadmap_only()
     if v is None or v == "auto":
         return "auto (random each round)"
     return "all areas" if v in ("", "any") else v
 
 
+def _skip_label(sv=None) -> str:
+    """Friendly render of the skipped roadmap areas for the status bar."""
+    areas = sv.roadmap_skip if (sv is not None and sv.roadmap_skip) else roadmap_skip()
+    return ", ".join(areas) if areas else "none"
+
+
 def roadmap_areas(gh) -> list[str]:
-    """The roadmap focus areas a user can steer toward: the subdirectories of the roadmap repo (each
+    """The roadmap areas a user can steer toward: the subdirectories of the roadmap repo (each
     holds a README.md + Targets.lean). Listed over the API so the TUI can offer a picker. Returns []
     if it can't be fetched (the picker then falls back to free-text entry)."""
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')

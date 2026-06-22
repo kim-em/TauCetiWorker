@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
 
-from .config import Config, log, roadmap_focus
+from .config import Config, log, roadmap_only, roadmap_skip
 from .constants import (
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
@@ -136,7 +136,8 @@ class Survey:
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
     red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
-    roadmap_focus: str = ""
+    roadmap_only: str = ""
+    roadmap_skip: list[str] = field(default_factory=list)
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
     next_auto_stage: str | None = None
@@ -206,12 +207,16 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
     always uses deep=True.
     """
-    _f = roadmap_focus()
-    # Keep sv.roadmap_focus a non-None string: "auto" = unset (a round will pick a random area),
+    _f = roadmap_only()
+    # Keep sv.roadmap_only a non-None string: "auto" = unset (a round will pick a random area),
     # "any" = all areas, else the chosen area. The concrete random area is resolved later, in
     # do_roadmap (once per authoring round) — not here, since survey() re-runs read-only for status
-    # and every ~90s in the dashboard, which would re-roll and flicker the displayed focus.
-    sv = Survey(worker_id=cfg.wid, roadmap_focus=("auto" if _f is None else (_f or "any")))
+    # and every ~90s in the dashboard, which would re-roll and flicker the displayed area.
+    sv = Survey(
+        worker_id=cfg.wid,
+        roadmap_only=("auto" if _f is None else (_f or "any")),
+        roadmap_skip=roadmap_skip(),
+    )
     try:
         raw = gh.pr_list(
             [

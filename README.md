@@ -43,20 +43,20 @@ re-queries GitHub. It reacts to single keypresses (no Enter):
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` (or `k` / `j`) | move the cursor between kinds |
-| `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the focus areas) |
+| `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the areas) |
 | `Enter` | run one round of the selected kind |
 | `1`–`6` | run one round of that numbered kind directly |
 | `l` / `L` | loop the auto cascade / loop just the selected kind |
-| `f` | pick the roadmap focus from the available areas |
+| `o` / `x` | pick the single roadmap area (`--roadmap-only`) / edit the skipped areas (`--roadmap-skip`) |
 | `m` / `s` | cycle the agent / toggle the sandbox (bubble ↔ host) |
 | `r` / `c` / `q` | refresh / copy the launch command to the clipboard / quit |
 
-The agent, sandbox, and roadmap focus you pick are remembered between runs in
+The agent, sandbox, and roadmap area dials you pick are remembered between runs in
 `$XDG_CONFIG_HOME/tauceti/dashboard.json` (default `~/.config/tauceti/`), so the
-dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_FOCUS` in
-the environment still overrides the saved focus. The saved focus is dashboard-only:
-a bare `tauceti work` never reads it (rounds launched from the dashboard carry it via
-an explicit `--roadmap-focus`). The file is a user config dir, not
+dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_ONLY` /
+`TAUCETI_ROADMAP_SKIP` in the environment still overrides the saved value. The saved
+values are dashboard-only: a bare `tauceti work` never reads them (rounds launched from
+the dashboard carry them via explicit `--roadmap-only` / `--roadmap-skip`). The file is a user config dir, not
 the per-worker `state/`, so it is shared whether you run `./tauceti` from a clone or
 the `uv tool install`ed `tauceti`, and survives upgrades.
 
@@ -99,11 +99,15 @@ tauceti work --loop --only bump       # only adapt broken bump-mathlib PRs
 
 The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
 
-Roadmap rounds steer toward one focus area (a subdirectory of the
-[roadmap](https://github.com/FormalFrontier/TauCetiRoadmap)). Set it with
-`--roadmap-focus <area>` (or `TAUCETI_ROADMAP_FOCUS`, or the dashboard's `f`
+Roadmap rounds steer toward one area (a subdirectory of the
+[roadmap](https://github.com/FormalFrontier/TauCetiRoadmap)). Pin it with
+`--roadmap-only <area>` (or `TAUCETI_ROADMAP_ONLY`, or the dashboard's `o`
 key); an empty value means "all areas". With nothing set, each round picks a
 fresh random area (so an unpinned `--loop` roams the whole roadmap over time).
+To stay out of areas other contributors are working on, exclude them with
+`--roadmap-skip <area>[,<area>...]` (or `TAUCETI_ROADMAP_SKIP`, or the dashboard's
+`x` key): skipped areas drop out of the random pick and the all-areas case.
+`--roadmap-only` wins if it names a skipped area.
 
 ### Which agent: `--agent`
 
@@ -236,7 +240,8 @@ is in `tauceti work -h`.
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax` — see the agent table above. |
 | `--host` | Opt out of the bubble sandbox and run the agent directly on the host. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
-| `--roadmap-focus AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
 | `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its `$HOME`. |
@@ -251,7 +256,8 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | --- | --- | --- |
 | `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
 | `TAUCETI_WORKER_ID` | `default` | Default for `--worker-id`. |
-| `TAUCETI_ROADMAP_FOCUS` | _(unset)_ | Roadmap focus for `--roadmap-focus`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
+| `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
+| `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |

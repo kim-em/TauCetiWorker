@@ -66,7 +66,8 @@ examples:
   tauceti work --loop                   the driver: keep picking the best job
   tauceti work --loop --only review     a focused reviewer
   tauceti work --loop --skip roadmap    the whole cascade except authoring new PRs
-  tauceti work --only roadmap --roadmap-focus ReductiveGroups
+  tauceti work --only roadmap --roadmap-only ReductiveGroups
+  tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
   tauceti work --agent claude --host    run Opus directly on the host
   tauceti work --dry-run                show what it WOULD do; act on nothing
 
@@ -78,7 +79,8 @@ multiple workers (share a host, coordinate through GitHub; a distinct id isolate
 environment (flags win; see README.md for the full list):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
-  TAUCETI_ROADMAP_FOCUS  roadmap focus (unset = a fresh random area each round; "" = all areas)
+  TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
+  TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_STREAM=1       same as --stream
   CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
@@ -132,16 +134,27 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "default redirects it to a file under logs/ and prints the path (or $TAUCETI_STREAM=1)",
     )
     p.add_argument(
-        "--roadmap-focus",
-        dest="roadmap_focus",
+        "--roadmap-only",
+        dest="roadmap_only",
         default=None,
         metavar="AREA",
         help="for roadmap rounds, the single roadmap area to steer toward: a subdirectory of "
         "the TauCetiRoadmap repo. List them by opening the dashboard (bare `tauceti`) and "
         "expanding the roadmap row, or browse github.com/FormalFrontier/TauCetiRoadmap. "
-        "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_FOCUS "
+        "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_ONLY "
         "unset) to pick a fresh random area each round. Overrides "
-        "$TAUCETI_ROADMAP_FOCUS for this run",
+        "$TAUCETI_ROADMAP_ONLY for this run",
+    )
+    p.add_argument(
+        "--roadmap-skip",
+        dest="roadmap_skip",
+        default=None,
+        metavar="AREA[,AREA...]",
+        help="for roadmap rounds, a comma-separated list of roadmap areas to exclude from "
+        "selection (so concurrent workers can divide the roadmap) — e.g. "
+        "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
+        "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
+        "$TAUCETI_ROADMAP_SKIP for this run",
     )
     p.add_argument(
         "--ignore-quota",
@@ -295,10 +308,14 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
-    # --roadmap-focus overrides the env for this run (and is inherited by loop children, which read it
-    # live via roadmap_focus()). Empty string is a meaningful value: "all areas".
-    if getattr(args, "roadmap_focus", None) is not None:
-        os.environ["TAUCETI_ROADMAP_FOCUS"] = args.roadmap_focus
+    # --roadmap-only overrides the env for this run (and is inherited by loop children, which read it
+    # live via roadmap_only()). Empty string is a meaningful value: "all areas".
+    if getattr(args, "roadmap_only", None) is not None:
+        os.environ["TAUCETI_ROADMAP_ONLY"] = args.roadmap_only
+    # --roadmap-skip likewise overrides the env and is inherited by loop children (read live via
+    # roadmap_skip()).
+    if getattr(args, "roadmap_skip", None) is not None:
+        os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
     # --stream restores live agent output (default redirects it to a log file). Set in the env so loop
     # children inherit it.
     if getattr(args, "stream", False):
