@@ -12,8 +12,6 @@ and pins that the sweep clears it, plus a direct check that it reaches a whole m
 Exit 0 = swept as expected; 1 = a straggler survived.
 """
 
-import importlib.machinery
-import importlib.util
 import os
 import shutil
 import signal
@@ -25,12 +23,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 pass_ = 0
 fail = 0
@@ -134,7 +128,7 @@ print("== 4. run_round_subprocess sweeps the group on a normal (rc 0) return =="
 # actually invokes it on the happy path. Spy on spawn_round to capture the round's pgid, drive a real
 # round that leaks a grandchild (TAUCETI_TEST_HOLD), and assert the group is gone once the call returns.
 captured = {}
-orig_spawn = tc.spawn_round
+orig_spawn = tc.round.spawn_round  # patch where run_round_subprocess looks it up
 
 
 def spy_spawn(argv_tail):
@@ -143,12 +137,12 @@ def spy_spawn(argv_tail):
     return p
 
 
-tc.spawn_round = spy_spawn
+tc.round.spawn_round = spy_spawn
 os.environ["TAUCETI_TEST_HOLD"] = "300"
 try:
     rc = tc.run_round_subprocess(["--worker-id", WID])
 finally:
-    tc.spawn_round = orig_spawn
+    tc.round.spawn_round = orig_spawn
     os.environ.pop("TAUCETI_TEST_HOLD", None)
 
 pgid4 = captured.get("pgid")

@@ -11,8 +11,6 @@ redraw, prefs persistence + env-override precedence, and the stale-survey load-t
 Exit 0 = all checks pass, 1 = a failure."""
 
 import asyncio
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sys
@@ -27,12 +25,8 @@ os.environ["XDG_CONFIG_HOME"] = _CFGDIR
 os.environ.pop("TAUCETI_ROADMAP_FOCUS", None)  # start from a known (unset) focus state
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 fails = 0
 
@@ -200,11 +194,11 @@ def test_random_default():
     (and falls back to "all areas" when the area list can't be fetched). Stub the IO so only the
     focus-resolution + prompt substitution runs."""
     captured = {}
-    orig = {k: getattr(tc, k) for k in ("fetch_ref", "prepare_checkout", "run_agent_host", "roadmap_areas")}
+    orig = {k: getattr(tc.work_units, k) for k in ("fetch_ref", "prepare_checkout", "run_agent_host", "roadmap_areas")}
     orig_choice = tc.random.choice
-    tc.fetch_ref = lambda *a, **k: True
-    tc.prepare_checkout = lambda cfg: True
-    tc.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
+    tc.work_units.fetch_ref = lambda *a, **k: True
+    tc.work_units.prepare_checkout = lambda cfg: True
+    tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir: (captured.update(prompt=prompt), 0)[1]
     cfg = SimpleNamespace(
         state=Path("/tmp/tauceti-test/state"), checkout=Path("/tmp/tauceti-test/co"), logdir=Path("/tmp/tauceti-test")
     )
@@ -212,19 +206,19 @@ def test_random_default():
     opts = SimpleNamespace(agent_name="Claude Code", work_model="claude")
     try:
         # areas available → a random area is chosen and substituted into the prompt
-        tc.roadmap_areas = lambda gh: ["algebra", "topology"]
+        tc.work_units.roadmap_areas = lambda gh: ["algebra", "topology"]
         tc.random.choice = lambda seq: seq[1]  # deterministic: "topology"
         tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
         check("auto leaves no __FOCUS__ placeholder", "__FOCUS__" not in captured["prompt"])
         check("auto picked the area from the list", "`topology`" in captured["prompt"])
         # no areas (fetch failed) → fall back to all areas ("any")
         captured.clear()
-        tc.roadmap_areas = lambda gh: []
+        tc.work_units.roadmap_areas = lambda gh: []
         tc.do_roadmap(w, None, tc.Candidate(0, "", "auto"), opts, False)
         check("auto falls back to all areas when the list is empty", "`any`" in captured["prompt"])
     finally:
         for k, v in orig.items():
-            setattr(tc, k, v)
+            setattr(tc.work_units, k, v)
         tc.random.choice = orig_choice
         os.environ.pop("TAUCETI_REQUIRE_TARGET_MARKER", None)
 

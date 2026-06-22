@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """M8: verify the host agent argv is byte-for-byte what round.sh's run_agent builds."""
 
-import importlib.machinery
-import importlib.util
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 P = "DO THE WORK"
 fails = 0
@@ -44,18 +38,18 @@ print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 
 # $TAUCETI_CLAUDE_CMD wraps/replaces the host claude executable; the standard flags are still appended,
 # and an empty / whitespace-only value falls back to bare `claude` rather than a broken argv.
-_saved = tc.CLAUDE_CMD
-tc.CLAUDE_CMD = "my-wrapper --flag claude"
+_saved = tc.agents.CLAUDE_CMD
+tc.agents.CLAUDE_CMD = "my-wrapper --flag claude"
 a, _ = tc.host_agent_argv(P, "claude")
 check(
     "claude override",
     a,
     ["my-wrapper", "--flag", "claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"],
 )
-tc.CLAUDE_CMD = "   "
+tc.agents.CLAUDE_CMD = "   "
 a, _ = tc.host_agent_argv(P, "claude")
 check("claude override blank falls back", a, ["claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
-tc.CLAUDE_CMD = _saved
+tc.agents.CLAUDE_CMD = _saved
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
 

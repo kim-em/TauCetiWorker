@@ -11,8 +11,6 @@ the GitHub class; here we stub `reactions()` and assert the survey-time skip/fir
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
-import importlib.machinery
-import importlib.util
 import sys
 from datetime import UTC
 from pathlib import Path
@@ -20,12 +18,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 NOW = int(tc.time.time())
 

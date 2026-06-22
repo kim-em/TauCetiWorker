@@ -13,8 +13,6 @@ Usage:
 Exit 0 = all selectors agree; 1 = a mismatch (prints the diff).
 """
 
-import importlib.machinery
-import importlib.util
 import json
 import subprocess
 import sys
@@ -24,12 +22,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
 # Load the `tauceti` single-file program as a module (no .py extension; main() is guarded).
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc  # dataclasses resolves annotations via sys.modules[cls.__module__]
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 FIELDS = [
     "number",

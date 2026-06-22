@@ -11,8 +11,6 @@ loop). The survey-time rule skips when the count is >= cap OR is the None sentin
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
-import importlib.machinery
-import importlib.util
 import json
 import sys
 import tempfile
@@ -20,12 +18,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 TODAY = datetime.now(UTC).strftime("%Y-%m-%d")
 YEST = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
