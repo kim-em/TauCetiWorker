@@ -42,7 +42,13 @@ FIELDS = [
     "author",
     "mergeable",
 ]
-ME = tc.me()
+try:
+    ME = tc.me()
+except tc.Die:
+    # This harness compares jq-vs-Python agreement, not specific PRs, so it holds for any login.
+    # When `gh` isn't authenticated (e.g. in CI), fall back to a placeholder so it still runs; the
+    # bot/fork/bump partitions of the fixture are exercised regardless of who ME is.
+    ME = "tauceti-ci-placeholder"
 TAUCETI = tc.TAUCETI
 
 
