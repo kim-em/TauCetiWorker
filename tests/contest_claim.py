@@ -13,6 +13,7 @@ Exit 0 = all cases agree; 1 = a mismatch.
 import importlib.machinery
 import importlib.util
 import sys
+from datetime import UTC
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -27,8 +28,8 @@ NOW = int(tc.time.time())
 
 
 def iso(epoch: int) -> str:
-    from datetime import datetime, timezone
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    from datetime import datetime
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class FakeGitHub(tc.GitHub):

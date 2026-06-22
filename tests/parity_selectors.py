@@ -39,7 +39,7 @@ def jq(data, expr, args=None):
     p = subprocess.run(cmd, input=json.dumps(data), text=True, capture_output=True)
     if p.returncode != 0:
         raise SystemExit(f"jq failed: {p.stderr}")
-    return [json.loads(l) for l in p.stdout.splitlines() if l.strip()]
+    return [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
 
 
 def fetch_live():

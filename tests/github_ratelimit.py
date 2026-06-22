@@ -13,6 +13,7 @@ Exit 0 = all cases agree; 1 = a mismatch.
 """
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,8 +22,6 @@ spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFile
 tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
-
-import subprocess
 
 PRIMARY = "HTTP 403: API rate limit exceeded for user ID 477956"
 SECONDARY = "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."

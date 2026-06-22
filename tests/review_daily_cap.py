@@ -15,7 +15,7 @@ import importlib.util
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -24,8 +24,8 @@ tc = importlib.util.module_from_spec(spec)
 sys.modules["tauceti"] = tc
 spec.loader.exec_module(tc)
 
-TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-YEST = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+TODAY = datetime.now(UTC).strftime("%Y-%m-%d")
+YEST = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
 CAP = tc.REVIEW_DAILY_CAP
 
 fails = 0

@@ -38,7 +38,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
 
 # ============================================================================
 # Config — every literal/budget/path. Mirrors the head of round.sh / loop.sh.
@@ -95,7 +94,7 @@ BUMP_HEAD_PREFIX = "bump-mathlib/"   # branch prefix the review bot opens its ma
 MAX_OPEN_PRS = 8            # backpressure: don't author new roadmap PRs while this many of ours are open
 
 
-def roadmap_focus() -> Optional[str]:
+def roadmap_focus() -> str | None:
     """The roadmap area the worker steers toward, as the operator set it — read live from the env
     each call so the TUI's [f] key can change it and have both the survey display and any launched
     round pick it up (children inherit TAUCETI_ROADMAP_FOCUS). Tri-state: None = unset, so a fresh
@@ -244,7 +243,7 @@ class Config:
         return self.store_dir / "ledger.json"
 
     @staticmethod
-    def resolve(worker_id: Optional[str] = None, home: Optional[Path] = None) -> "Config":
+    def resolve(worker_id: str | None = None, home: Path | None = None) -> Config:
         wid = sanitize_wid(worker_id or os.environ.get("TAUCETI_WORKER_ID", "default") or "default")
         # Export the resolved id so claim.sh (acquire / heartbeat-renew / git-safe-push's lease check)
         # all share ONE stable owner identity. Without this it falls back to `hostname-$$`, a different
@@ -269,7 +268,7 @@ _LOG_FH = None                              # set by set_log_file(): tee log() t
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")    # strip color codes from the on-disk copy
 
 
-def set_log_file(logdir: "Path") -> None:
+def set_log_file(logdir: Path) -> None:
     """Tee log() output to a per-worker file so a worker's activity is readable ON DISK, not only on the
     terminal it was launched from (a loop run directly in a shell otherwise leaves no log to inspect).
     The loop driver picks ONE timestamped file and exports its path so every round child appends to the
@@ -324,15 +323,15 @@ class GitHubError(Exception):
     """A `gh` call failed (distinct from 'ran fine, returned no rows')."""
 
 
-def run(argv: list[str], *, cwd: Optional[Path] = None, env: Optional[dict] = None,
-        capture: bool = True, check: bool = False, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
+def run(argv: list[str], *, cwd: Path | None = None, env: dict | None = None,
+        capture: bool = True, check: bool = False, input_text: str | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         argv, cwd=str(cwd) if cwd else None, env=env, text=True,
         capture_output=capture, input=input_text, check=check,
     )
 
 
-def _parse_iso8601(s: Optional[str]) -> Optional[int]:
+def _parse_iso8601(s: str | None) -> int | None:
     """ISO 8601 (e.g. GitHub's '2026-06-19T08:03:48Z') → epoch seconds, or None on a bad value."""
     if not s:
         return None
@@ -354,7 +353,7 @@ def _parse_iso8601(s: Optional[str]) -> Optional[int]:
 #    relaunching. (GitHub buckets core and graphql resets independently; the preflight watches both.)
 # ============================================================================
 
-def _gh_rate_kind(text: str) -> Optional[str]:
+def _gh_rate_kind(text: str) -> str | None:
     """Classify a failed `gh` call from its combined stdout+stderr: 'secondary' | 'primary' | None.
     Secondary first — its message also contains 'rate limit', so the primary regex would match it too."""
     if _GH_SECONDARY_RE.search(text):
@@ -364,7 +363,7 @@ def _gh_rate_kind(text: str) -> Optional[str]:
     return None
 
 
-def github_budget() -> Optional[dict]:
+def github_budget() -> dict | None:
     """Per-bucket (remaining, reset_epoch) from GitHub's rate_limit endpoint, keyed 'core' and 'graphql'
     — the two buckets a round spends (REST and the progress-guard GraphQL query). That endpoint is itself
     exempt from the budget, so probing it is free. None on any read failure (caller proceeds rather than
@@ -389,13 +388,13 @@ def _gh_secondary_wait(text: str, attempt: int) -> int:
     return max(1, min(nap, GH_INROUND_WAIT))
 
 
-def _gh_retry_after(text: str) -> Optional[str]:
+def _gh_retry_after(text: str) -> str | None:
     """gh occasionally echoes a `Retry-After: N` line for a secondary limit. Pull the value if present."""
     m = re.search(r"retry[- ]after:?\s*(\d+)", text, re.I)
     return m.group(1) if m else None
 
 
-def gh_run(argv: list[str], *, cwd: Optional[Path] = None,
+def gh_run(argv: list[str], *, cwd: Path | None = None,
            max_wait: int = GH_INROUND_WAIT) -> subprocess.CompletedProcess:
     """Run a `gh` command, waiting out a SECONDARY GitHub rate limit IN PLACE and retrying so the limit
     costs a pause, not a discarded round (bounded by max_wait so it can't blow ROUND_TIMEOUT). A PRIMARY
@@ -438,7 +437,7 @@ class GitHub:
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         return gh_run(["gh", *args])
 
-    def pr_list(self, fields: list[str], *, author: Optional[str] = None, state: str = "open") -> list[dict]:
+    def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
         args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200",
                 "--json", ",".join(fields)]
         if author:
@@ -448,7 +447,7 @@ class GitHub:
             raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
         return json.loads(p.stdout or "[]")
 
-    def pr_view(self, pr: int, fields: list[str]) -> Optional[dict]:
+    def pr_view(self, pr: int, fields: list[str]) -> dict | None:
         p = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", ",".join(fields)])
         if p.returncode != 0:
             return None
@@ -475,7 +474,7 @@ class GitHub:
         except Exception:
             pass
 
-    def issue_comments(self, pr: int) -> Optional[list[dict]]:
+    def issue_comments(self, pr: int) -> list[dict] | None:
         """All issue comments for a PR (paginated). None on fetch failure (distinct from empty)."""
         p = self._gh(["api", "--paginate", f"/repos/{self.repo}/issues/{pr}/comments?per_page=100"])
         if p.returncode != 0:
@@ -485,7 +484,7 @@ class GitHub:
         except json.JSONDecodeError:
             return None
 
-    def review_comments(self, pr: int) -> Optional[list[dict]]:
+    def review_comments(self, pr: int) -> list[dict] | None:
         """All review (inline / thread) comments for a PR — distinct from issue_comments. A contested
         fix replies on a review thread, so the progress guard must count these too. None on failure."""
         p = self._gh(["api", "--paginate", f"/repos/{self.repo}/pulls/{pr}/comments?per_page=100"])
@@ -496,7 +495,7 @@ class GitHub:
         except json.JSONDecodeError:
             return None
 
-    def pr_progress_state(self, pr: int) -> Optional[dict]:
+    def pr_progress_state(self, pr: int) -> dict | None:
         """{'head': <headRefOid>, 'ncomments': <issue + review-thread comments>} in ONE GraphQL request,
         replacing a `pr view` plus two paginated REST comment fetches. The progress guard runs this twice
         per guarded round per PR, so collapsing ~5 REST calls into 1 GraphQL call is the bulk of the
@@ -521,7 +520,7 @@ class GitHub:
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
 
-    def _pr_progress_state_rest(self, pr: int, head: str) -> Optional[dict]:
+    def _pr_progress_state_rest(self, pr: int, head: str) -> dict | None:
         """Exact issue + review comment count via the paginated REST endpoints (the pre-GraphQL path),
         for the rare PR with >100 review threads. None if either fetch fails."""
         cs = self.issue_comments(pr)
@@ -530,13 +529,13 @@ class GitHub:
             return None
         return {"head": head, "ncomments": len(cs) + len(rcs)}
 
-    def api_jq(self, path: str, jq: str) -> Optional[str]:
+    def api_jq(self, path: str, jq: str) -> str | None:
         p = self._gh(["api", path, "--jq", jq])
         if p.returncode != 0:
             return None
         return p.stdout.strip()
 
-    def reactions(self, comment_id: int) -> Optional[list[dict]]:
+    def reactions(self, comment_id: int) -> list[dict] | None:
         """Reactions on a pull-request review (thread) comment. Each carries {content, created_at
         (whole-second ISO 8601), user, id}. None on fetch failure (distinct from no reactions)."""
         p = self._gh(["api", "--paginate",
@@ -548,7 +547,7 @@ class GitHub:
         except json.JSONDecodeError:
             return None
 
-    def fresh_claim_age(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> Optional[int]:
+    def fresh_claim_age(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> int | None:
         """Seconds since the newest `emoji` reaction on this comment, or None if there is none (or the
         fetch failed — fail OPEN: a transient API error must not let a stale claim block work forever,
         and the worst case of a missed claim is a rare double-review, which we've accepted)."""
@@ -627,6 +626,7 @@ class Counters:
 import base64
 import urllib.error
 import urllib.request
+from datetime import UTC
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -639,9 +639,9 @@ QUOTA_TTL = {"codex": 600, "claude": 3600}
 @dataclass
 class Window:
     name: str
-    used: Optional[float]       # percent 0..100 (None = unknown)
-    elapsed: Optional[float]    # percent 0..100 (None = unknown)
-    resets_at: Optional[float]  # epoch seconds
+    used: float | None       # percent 0..100 (None = unknown)
+    elapsed: float | None    # percent 0..100 (None = unknown)
+    resets_at: float | None  # epoch seconds
     status: str                 # under-pace | over-pace | exhausted | unknown
 
 
@@ -649,16 +649,16 @@ class Window:
 class Provider:
     name: str                   # codex | claude
     available: bool             # all windows under pace (and a usable model)
-    model: Optional[str]        # gpt-5 | opus | sonnet | None
+    model: str | None        # gpt-5 | opus | sonnet | None
     windows: list[Window] = field(default_factory=list)
-    error: Optional[str] = None
-    next_eligible: Optional[float] = None  # epoch when a blocking window should free
-    retry_after: Optional[float] = None    # seconds the endpoint asked us to back off (HTTP 429); NOT a
+    error: str | None = None
+    next_eligible: float | None = None  # epoch when a blocking window should free
+    retry_after: float | None = None    # seconds the endpoint asked us to back off (HTTP 429); NOT a
                                            # quota reset — must not be classified as exhausted/next_eligible
 
 
-def _classify_window(name: str, used: Optional[float], elapsed: Optional[float],
-                     resets_at: Optional[float], limit_reached: bool) -> Window:
+def _classify_window(name: str, used: float | None, elapsed: float | None,
+                     resets_at: float | None, limit_reached: bool) -> Window:
     # Fail CLOSED on missing data. These endpoints are reverse-engineered: a schema drift that drops
     # `used` or the reset clock must read as 'unknown' (⇒ provider unavailable), NEVER as fresh /
     # under-pace, so it can't silently unlock spending. Clamp both percentages to [0,100].
@@ -672,13 +672,13 @@ def _classify_window(name: str, used: Optional[float], elapsed: Optional[float],
     return Window(name, used, e, resets_at, st)
 
 
-def _parse_retry_after(raw: Optional[str]) -> Optional[float]:
+def _parse_retry_after(raw: str | None) -> float | None:
     """A `Retry-After` header is either delta-seconds or an HTTP-date; return seconds-from-now, clamped to
     [0, 3600] (the server can send bogus/huge/negative values). Returns None when absent/unparseable."""
     if not raw:
         return None
     raw = raw.strip()
-    secs: Optional[float] = None
+    secs: float | None = None
     try:
         secs = float(raw)
     except ValueError:
@@ -692,7 +692,7 @@ def _parse_retry_after(raw: Optional[str]) -> Optional[float]:
     return max(0.0, min(3600.0, secs))
 
 
-def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict, Optional[float]]:
+def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict, float | None]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -700,10 +700,10 @@ def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dic
     except urllib.error.HTTPError as e:
         return e.code, {}, _parse_retry_after(e.headers.get("Retry-After"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-        raise GitHubError(f"usage fetch failed: {e}")
+        raise GitHubError(f"usage fetch failed: {e}") from e
 
 
-def _read_json_file(path: Path) -> Optional[dict]:
+def _read_json_file(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -723,7 +723,7 @@ def _claude_keychain_attempts() -> list[list[str]]:
     return attempts
 
 
-def _claude_keychain_creds() -> Optional[dict]:
+def _claude_keychain_creds() -> dict | None:
     """macOS only: read Claude Code's OAuth blob from the login Keychain, where the CLI keeps creds
     instead of <config>/.credentials.json. Returns the same {"claudeAiOauth": {…}} dict as the file,
     or None when absent / locked / malformed.
@@ -762,7 +762,7 @@ def _claude_keychain_creds() -> Optional[dict]:
     return None
 
 
-def _claude_keychain_creds_interactive() -> Optional[dict]:
+def _claude_keychain_creds_interactive() -> dict | None:
     """macOS only: read the Claude OAuth blob from the login Keychain, INTERACTIVELY. Unlike the pacer's
     read this allows the GUI access prompt (long timeout, not 15s) and, if the Keychain is locked
     (errSecInteractionNotAllowed), runs `security unlock-keychain` once (it prompts for the login
@@ -829,7 +829,7 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         raise
 
 
-def _read_marker(p: Path) -> Optional[str]:
+def _read_marker(p: Path) -> str | None:
     try:
         return p.read_text().strip() or None
     except OSError:
@@ -844,7 +844,7 @@ CODEX_RT_PLACEHOLDER = "rt.0.tauceti-worker-placeholder-never-a-real-refresh-tok
 
 
 def _mirror_creds_file(src: Path, dst: Path, *, block_key: str, tok_key: str,
-                       rt_key: str, exp_key: Optional[str], rt_placeholder: Optional[str] = None) -> None:
+                       rt_key: str, exp_key: str | None, rt_placeholder: str | None = None) -> None:
     """Copy src -> dst WITHOUT the operator's real refresh token, iff src is fresher than dst. Freshness is
     keyed on the access token changing (the operator's external writer only ever moves forward); a src
     whose expiry is OLDER than dst's is treated as a torn read and skipped. A missing/unreadable src leaves
@@ -918,13 +918,13 @@ class Quota:
         self.cache_dir = cfg.quota_cache
 
     @staticmethod
-    def _fingerprint(*parts: Optional[str]) -> Optional[str]:
+    def _fingerprint(*parts: str | None) -> str | None:
         """A short, stable id for the credentials a cache entry was fetched under. Returns None when there
         is nothing to fingerprint (no creds), which never matches a stored fp, so the cache reads as a miss."""
         raw = "|".join(p for p in parts if p)
         return hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else None
 
-    def _cached_raw(self, provider: str, fp: Optional[str]) -> Optional[dict]:
+    def _cached_raw(self, provider: str, fp: str | None) -> dict | None:
         p = self.cache_dir / f"quota-{provider}.json"
         d = _read_json_file(p)
         if not d:
@@ -938,16 +938,16 @@ class Quota:
             return None
         return d.get("payload")
 
-    def _store_raw(self, provider: str, payload: dict, fp: Optional[str]) -> None:
+    def _store_raw(self, provider: str, payload: dict, fp: str | None) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / f"quota-{provider}.json").write_text(
             json.dumps({"fetched_at": int(time.time()), "fp": fp, "payload": payload}))
 
     # --- Codex -------------------------------------------------------------
-    def _codex_creds(self) -> Optional[dict]:
+    def _codex_creds(self) -> dict | None:
         return _read_json_file(self.cfg.home / ".codex" / "auth.json")
 
-    def _codex_account_id(self, auth: dict) -> Optional[str]:
+    def _codex_account_id(self, auth: dict) -> str | None:
         tok = auth.get("tokens") or {}
         if tok.get("account_id"):
             return tok["account_id"]
@@ -1012,7 +1012,7 @@ class Quota:
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 
     # --- Claude ------------------------------------------------------------
-    def _claude_creds(self) -> tuple[Optional[dict], bool]:
+    def _claude_creds(self) -> tuple[dict | None, bool]:
         """Returns (oauth_block, from_keychain). The block is Claude Code's {accessToken, refreshToken,
         expiresAt, ...}. On macOS the login Keychain is authoritative (the CLI stores creds there, not in
         a file), so we read it FIRST and only fall back to a file; from_keychain marks creds we must NOT
@@ -1091,7 +1091,7 @@ class Quota:
         return Provider("claude", avail, model, [session, weekly, sonnet], None, nxt)
 
     @staticmethod
-    def _parse_iso(s: Optional[str]) -> Optional[float]:
+    def _parse_iso(s: str | None) -> float | None:
         if not s:
             return None
         try:
@@ -1101,13 +1101,13 @@ class Quota:
             return None
 
     @staticmethod
-    def _next_eligible(windows: list[Window]) -> Optional[float]:
+    def _next_eligible(windows: list[Window]) -> float | None:
         # Earliest reset among windows that are currently blocking (over-pace/exhausted).
         blocked = [w.resets_at for w in windows if w.status in ("over-pace", "exhausted") and w.resets_at]
         return min(blocked) if blocked else None
 
     # --- selection ---------------------------------------------------------
-    def choose(self, forced: Optional[str]) -> tuple[Optional[str], dict]:
+    def choose(self, forced: str | None) -> tuple[str | None, dict]:
         """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
 
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
@@ -1153,12 +1153,12 @@ class ReviewState:
         self.cfg = cfg
         self.gh = gh
         self.sbcache = cfg.sbcache
-        self._comments: dict[int, tuple[float, Optional[list[dict]]]] = {}
+        self._comments: dict[int, tuple[float, list[dict] | None]] = {}
 
     def _cache_path(self, pr: int) -> Path:
         return self.sbcache / f"{pr}.json"
 
-    def _issue_comments(self, pr: int) -> Optional[list[dict]]:
+    def _issue_comments(self, pr: int) -> list[dict] | None:
         """A PR's issue comments, memoized briefly so the two readers in one survey pass — the scoreboard
         meta and the in-flight review marker — share ONE fetch (a cold meta read plus a marker check
         would otherwise double-read the same paginated endpoint). The window is a few seconds: long
@@ -1337,7 +1337,7 @@ class PRInfo:
     title: str = ""
 
     @staticmethod
-    def from_json(d: dict) -> "PRInfo":
+    def from_json(d: dict) -> PRInfo:
         rollup = d.get("statusCheckRollup") or []
         builds = [c for c in rollup if c.get("name") == "build"]
         return PRInfo(
@@ -1393,7 +1393,7 @@ class Survey:
     roadmap_focus: str = ""
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
-    next_auto_stage: Optional[str] = None
+    next_auto_stage: str | None = None
     github_failed: bool = False
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
@@ -1414,7 +1414,7 @@ class Survey:
                 "fix-ci": self.red_ci, "bump": self.bump}[name]
 
 
-def inflight_review_providers(comments: Optional[list[dict]], head: str, now: int) -> set[str]:
+def inflight_review_providers(comments: list[dict] | None, head: str, now: int) -> set[str]:
     """Providers named by any UNEXPIRED in-progress review marker on this EXACT head (a new push is a
     new unit, so the head must match). Mirrors the review engine's de-contention read so the worker can
     skip a head a peer already holds before launching the engine. Empty set when none apply; a fetch
@@ -1438,7 +1438,7 @@ def inflight_review_providers(comments: Optional[list[dict]], head: str, now: in
     return cov
 
 
-def _review_rounds_today(store_dir: Path, pr: int) -> Optional[int]:
+def _review_rounds_today(store_dir: Path, pr: int) -> int | None:
     """Count this PR's review rounds recorded TODAY (UTC) in the worker's LOCAL engine ledger — the exact
     quantity the engine caps at REVIEW_DAILY_CAP (mirrors review.py's today()-prefixed count over
     prs.<pr>.rounds). Returns 0 when the ledger or PR entry is simply absent (a never-reviewed PR is
@@ -1452,8 +1452,8 @@ def _review_rounds_today(store_dir: Path, pr: int) -> Optional[int]:
     except (OSError, ValueError):
         log(f"review cap: cannot read {led} — skipping review this round (fail-closed)")
         return None
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    from datetime import datetime
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     rounds = (((d.get("prs") or {}).get(str(pr)) or {}).get("rounds")) or []
     return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
 
@@ -1646,7 +1646,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
 
 
 
-def _next_auto_stage(sv: Survey) -> Optional[str]:
+def _next_auto_stage(sv: Survey) -> str | None:
     if sv.rebaseable.actionable:
         return "rebase"
     if sv.reviewable.actionable:
@@ -1679,11 +1679,11 @@ class RoundContext:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._fd: Optional[int] = None
+        self._fd: int | None = None
         self._cleanups: list = []
         self._done = False
 
-    def __enter__(self) -> "RoundContext":
+    def __enter__(self) -> RoundContext:
         self.cfg.state.mkdir(parents=True, exist_ok=True)
         path = self.cfg.state / "round.lock"
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
@@ -1692,7 +1692,7 @@ class RoundContext:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
-            raise Die(f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time")
+            raise Die(f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time") from None
         self._fd = fd
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
@@ -1789,12 +1789,12 @@ class Claims:
     SIGKILL), never runs the round's cleanup, and never holds the round.lock fd (pass_fds keeps only
     the pipe; the lock fd is non-inheritable + closed by close_fds)."""
 
-    def __init__(self, cfg: Config, ctx: "RoundContext"):
+    def __init__(self, cfg: Config, ctx: RoundContext):
         self.cfg = cfg
         self.ctx = ctx
-        self.held: Optional[str] = None
-        self._hb: Optional[subprocess.Popen] = None
-        self._hb_wfd: Optional[int] = None
+        self.held: str | None = None
+        self._hb: subprocess.Popen | None = None
+        self._hb_wfd: int | None = None
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -1972,7 +1972,7 @@ def run_agent_host(cwd: Path, prompt: str, work_model: str, logdir: Path) -> int
 
 
 def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str,
-                   cwd: Optional[Path] = None) -> int:
+                   cwd: Path | None = None) -> int:
     """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
     by default we redirect it to a timestamped file under logdir and print only the path, so the round
     output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
@@ -2145,9 +2145,9 @@ def _ensure_claude_creds_for_bubble(cfg: Config) -> None:
               'the Keychain and retry, or run with --host (the host claude reads the Keychain itself).')
 
 
-def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
-                  mounts: Optional[list[str]] = None, *,
-                  inner_cmd: Optional[str] = None, cred_model: Optional[str] = None) -> int:
+def run_in_bubble(w: Worker, target: str, prompt: str, opts: RoundOpts,
+                  mounts: list[str] | None = None, *,
+                  inner_cmd: str | None = None, cred_model: str | None = None) -> int:
     """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
     work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
     something else in the same sandbox (e.g. the review engine — see review_in_bubble)."""
@@ -2221,7 +2221,7 @@ def run_in_bubble(w: "Worker", target: str, prompt: str, opts: "RoundOpts",
     return rc
 
 
-def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "RoundOpts") -> int:
+def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
@@ -2283,7 +2283,7 @@ class RoundOpts:
     sandbox_host: bool    # True = --host (opt out of bubble)
     dry_run: bool
     ignore_quota: bool = False
-    quota_cmd: Optional[str] = None
+    quota_cmd: str | None = None
 
     @property
     def agent_name(self) -> str:
@@ -2296,8 +2296,8 @@ class Worker:
     gh: GitHub
     rs: ReviewState
     counters: Counters
-    rc: "RoundContext"
-    claims: "Claims"
+    rc: RoundContext
+    claims: Claims
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
@@ -2365,14 +2365,14 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
 
 
-def _open_pr_numbers(w: Worker) -> Optional[set[int]]:
+def _open_pr_numbers(w: Worker) -> set[int] | None:
     try:
         return {p["number"] for p in w.gh.pr_list(["number"], state="open")}
     except GitHubError:
         return None
 
 
-def _progress_snapshot(w: Worker, c: Candidate) -> Optional[dict]:
+def _progress_snapshot(w: Worker, c: Candidate) -> dict | None:
     """Capture just enough GitHub state to tell, after the round, whether the agent actually changed
     anything. Returns None if we can't snapshot — then the guard is skipped (never block a real
     success on a flaky query)."""
@@ -2385,7 +2385,7 @@ def _progress_snapshot(w: Worker, c: Candidate) -> Optional[dict]:
     return {"prs": nums} if nums is not None else None
 
 
-def _progressed(w: Worker, c: Candidate, pre: Optional[dict]) -> bool:
+def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool:
     """True if the round left an observable mark (push / new PR / new issue-or-review comment).
     Conservative: any query failure or ambiguity returns True, so we never falsely discard real work."""
     if pre is None:
@@ -2413,7 +2413,7 @@ def _progressed(w: Worker, c: Candidate, pre: Optional[dict]) -> bool:
     return False
 
 
-def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> Optional[int]:
+def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
     bubble = _bubble(stage, opts)
@@ -2509,7 +2509,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 f"{CONTEST_CLAIM_TTL // 60}m")
 
 
-def _sync_review_outbox(w: "Worker", pr: int) -> int:
+def _sync_review_outbox(w: Worker, pr: int) -> int:
     """Drain the worker's review outbox into TauCetiData using the host's gh/git creds. Reviews run
     with --no-sync (a bubble can't push to TauCetiData), so the host publishes here. Returns the
     engine rc: nonzero means the push failed after archive.sync's retries (the outbox is preserved
@@ -2556,7 +2556,7 @@ def _sync_review_outbox(w: "Worker", pr: int) -> int:
 
 
 def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool,
-                *, prompt_file: str, label: str) -> Optional[int]:
+                *, prompt_file: str, label: str) -> int | None:
     """Shared shape for fix / fix-ci / rebase: take the branch claim, then run the agent against the PR
     branch — in bubble (it checks out the PR inside the container) or on the host checkout."""
     pr, head = c.pr, c.head
@@ -2591,25 +2591,25 @@ def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bo
     return rc
 
 
-def do_fix(w, sv, c, opts, bubble) -> Optional[int]:
+def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
     w.counters.incr(f"fix-{pr}-{head[:12]}")   # count up front (an un-checkout-able PR mustn't loop)
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix")
 
 
-def do_fix_ci(w, sv, c, opts, bubble) -> Optional[int]:
+def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
     w.counters.incr(f"ci-{pr}-{head[:12]}")
     w.counters.incr(f"ci-pr-{pr}")
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci")
 
 
-def do_rebase(w, sv, c, opts, bubble) -> Optional[int]:
+def do_rebase(w, sv, c, opts, bubble) -> int | None:
     w.counters.incr(f"rebase-pr-{c.pr}")
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase")
 
 
-def do_bump(w, sv, c, opts, bubble) -> Optional[int]:
+def do_bump(w, sv, c, opts, bubble) -> int | None:
     """Adapt a red bump-mathlib PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
@@ -2800,7 +2800,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cmd = args.cmd
@@ -2871,16 +2871,16 @@ def quota_line(snap: dict) -> str:
     return "   ".join(parts) if parts else "quota: (not checked)"
 
 
-def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
-                  selected: Optional[str] = None, expanded: Optional[set] = None,
-                  areas: Optional[list] = None) -> None:
+def render_survey(sv: Survey, console, quota_snap: dict | None = None,
+                  selected: str | None = None, expanded: set | None = None,
+                  areas: list | None = None) -> None:
     """Render the survey table. `selected` (a kind name) is highlighted as the arrow-key cursor;
     `expanded` (a set of kind names) get their candidate PRs listed beneath them, one per row, with
     the PR title — and an expanded `roadmap` lists the focus `areas` instead. Pass None for all
     (e.g. from `tauceti status`) for the plain table."""
-    from rich.table import Table
+    from rich.markup import escape  # PR titles / focus / errors are external text — escape before markup
     from rich.panel import Panel
-    from rich.markup import escape   # PR titles / focus / errors are external text — escape before markup
+    from rich.table import Table
 
     if sv.github_failed:
         console.print(Panel("[bold red]GitHub fetch failed[/] — survey unavailable.\n"
@@ -3113,7 +3113,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             if only:
                 tail += ["--only", ",".join(only)]
             if model:
-                tail += [f"--agent", model, "--ignore-quota"]   # loop already paced; child must not re-pace
+                tail += ["--agent", model, "--ignore-quota"]   # loop already paced; child must not re-pace
             if host:
                 tail.append("--host")
             rc = run_round_subprocess(tail)
@@ -3207,7 +3207,7 @@ def isolate_home(wid: str) -> Path:
     return home
 
 
-def choose_model(cfg: Config, agent: str, quota_cmd: Optional[str]) -> tuple[Optional[str], dict]:
+def choose_model(cfg: Config, agent: str, quota_cmd: str | None) -> tuple[str | None, dict]:
     """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
     command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
     `<quota_cmd> <agent>`; its first stdout token is the model to run (codex/claude/deepseek/minimax)
@@ -3222,7 +3222,7 @@ def choose_model(cfg: Config, agent: str, quota_cmd: Optional[str]) -> tuple[Opt
 
 
 def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool,
-                       quota_cmd: Optional[str] = None) -> str:
+                       quota_cmd: str | None = None) -> str:
     """Turn the --agent dial into the concrete model to run. 'auto' consults the pacer (or --quota-cmd);
     codex preferred, opus fallback. OpenRouter agents are pay-per-token (no pacing). Dry-run symbolic."""
     if dry:
@@ -3239,8 +3239,8 @@ def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool
     return chosen
 
 
-def launch_cmd(only: Optional[str], model_dial: str, host: bool, loop: bool,
-               focus: Optional[str] = None) -> list[str]:
+def launch_cmd(only: str | None, model_dial: str, host: bool, loop: bool,
+               focus: str | None = None) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `focus` (the current roadmap focus) is embedded as --roadmap-focus so the copied/logged command
     reproduces the focus set with [f] instead of silently reverting to the shell default."""
@@ -3286,6 +3286,8 @@ def _dashboard_app(cfg, loader=None):
     App.run_test(); `loader` (a callable returning (survey, quota_snap, areas)) defaults to a live
     GitHub fetch but is stubbed in tests. ALL Textual imports live here so every non-TUI path stays
     stdlib + rich only — the same lazy-import discipline `rich` already follows."""
+    from rich.panel import Panel
+    from rich.text import Text
     from textual import work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
@@ -3293,8 +3295,6 @@ def _dashboard_app(cfg, loader=None):
     from textual.screen import ModalScreen
     from textual.widgets import DataTable, Footer, Input, Label, OptionList, Static
     from textual.widgets.option_list import Option
-    from rich.panel import Panel
-    from rich.text import Text
 
     MODELS = ["auto", "codex", "claude", "deepseek", "minimax"]
 
@@ -3774,7 +3774,7 @@ def cmd_doctor(args) -> int:
     return 1 if bad else 0
 
 
-def preflight(cfg: Config, opts: "RoundOpts") -> None:
+def preflight(cfg: Config, opts: RoundOpts) -> None:
     """Fail a round early if its chosen mode can't run, rather than partway through. bubble and the
     review engine are fetched on demand, so we don't require them on PATH (only uvx + a runtime)."""
     for t in ("gh", "git", "uvx"):

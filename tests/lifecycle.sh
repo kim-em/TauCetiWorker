@@ -2,11 +2,10 @@
 # Lifecycle tests (plan milestone 6) — flock, fd-leak negative test, timeout teardown, signal codes.
 # Read-only: uses the TAUCETI_TEST_* hooks, never touches GitHub. Run from the repo root.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 PY=$(command -v python3)
 WID="lifecycle-test"
 export TAUCETI_WORKER_ID="$WID"
-LOCK="state/$WID/round.lock"
 pass=0; fail=0
 ok()  { echo "  [PASS] $1"; pass=$((pass+1)); }
 no()  { echo "  [FAIL] $1"; fail=$((fail+1)); }

@@ -2,8 +2,16 @@
 """Honor $CLAUDE_CONFIG_DIR: the pacer reads Claude creds from it, isolation copies from there and
 repoints it at the per-worker copy, and the bubble path does not block a non-default value
 (bubble honors the var itself)."""
-import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, types
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import tempfile
+import types
 from pathlib import Path
+
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
 tc = importlib.util.module_from_spec(spec); sys.modules["tauceti"] = tc; spec.loader.exec_module(tc)
