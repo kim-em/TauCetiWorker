@@ -1991,6 +1991,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     if os.environ.get("TAUCETI_STREAM"):
         return subprocess.run(argv).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
+    log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
         rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
     if rc != 0:
@@ -2243,6 +2244,7 @@ def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "Rou
     inner = ("env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
              f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
              f"--no-mathlib --no-sync --store /opt/review-store --post "
+             f"--max-rounds-per-day {REVIEW_DAILY_CAP} "       # match the survey prefilter; no engine/worker drift
              f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}")
     # target is the PR so bubble checks it out; prompt unused by the engine.
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts,
@@ -2300,7 +2302,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for pr, providers in sv.review_inflight:
         log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
     for pr, count in sv.review_capped:
-        log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
+        if count.startswith("?"):
+            log(f"  review #{pr}: local ledger unreadable — skipping review (fail-closed); fix the ledger")
+        else:
+            log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
 
     # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
     # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
@@ -2445,7 +2450,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
-            log(f"  review #{pr}: engine output → {logf}  (run with --stream to watch live)")
             rc = run_to_logfile(
                 ["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
                  str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
