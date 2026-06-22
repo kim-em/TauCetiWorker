@@ -2244,6 +2244,7 @@ def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "Rou
     inner = ("env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
              f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
              f"--no-mathlib --no-sync --store /opt/review-store --post "
+             f"--max-rounds-per-day {REVIEW_DAILY_CAP} "    # one value drives the survey prefilter + engine
              f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}")
     # target is the PR so bubble checks it out; prompt unused by the engine.
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts,
@@ -2452,7 +2453,8 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             rc = run_to_logfile(
                 ["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
                  str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
-                 "--reviewer", reviewers, "--expect-head", head, "--submitted-by", me()],
+                 "--reviewer", reviewers, "--expect-head", head,
+                 "--max-rounds-per-day", str(REVIEW_DAILY_CAP), "--submitted-by", me()],
                 logf, f"review #{pr}")
         log(f"  review #{pr}: engine rc={rc}")
         if rc == 0:
