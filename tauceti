@@ -75,6 +75,11 @@ MAX_REVIEW_ERRORS = 3       # per PR: after this many review rounds that ERROR w
 MAX_REVIEW_CONTESTS = 10    # per-PR lifetime cap on author-contest re-reviews (no-bar: anyone may
                             # reply, so this bounds spend; separate from the review-round budget)
 MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't starve the PR's budget
+# The review ENGINE enforces a per-PR daily round cap (its --max-rounds-per-day, default 12); once hit it
+# refuses to review but still exits 0 after re-posting the scoreboard. The worker mirrors that number so it
+# can SKIP a capped PR during the survey — before launching the engine (and its expensive clones) — instead
+# of re-selecting it every round and tight-looping. MUST stay in sync with the engine default (review.py).
+REVIEW_DAILY_CAP = int(os.environ.get("TAUCETI_REVIEW_DAILY_CAP", "12"))
 CONTEST_CLAIM_TTL = 3600    # seconds a 👀 on the contested reply claims an in-flight contest re-review.
                             # The claim lives on GitHub (a reaction on the reply comment), so it dedups
                             # ACROSS the fleet — unlike a per-worker counter, which can't coordinate
@@ -260,8 +265,38 @@ class Config:
         )
 
 
+_LOG_FH = None                              # set by set_log_file(): tee log() to a per-worker file
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")    # strip color codes from the on-disk copy
+
+
+def set_log_file(logdir: "Path") -> None:
+    """Tee log() output to a per-worker file so a worker's activity is readable ON DISK, not only on the
+    terminal it was launched from (a loop run directly in a shell otherwise leaves no log to inspect).
+    The loop driver picks ONE timestamped file and exports its path so every round child appends to the
+    SAME file — one continuous session log per worker; a standalone round with no parent makes its own.
+    Idempotent and best-effort: a failure to open the file just leaves logging at stderr-only."""
+    global _LOG_FH
+    if _LOG_FH is not None:
+        return
+    path = os.environ.get("TAUCETI_LOG_FILE")
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+        if not path:
+            path = str(logdir / f"work-{time.strftime('%Y%m%d-%H%M%S')}.log")
+            os.environ["TAUCETI_LOG_FILE"] = path   # children inherit and append to the same file
+        _LOG_FH = open(path, "a", buffering=1)       # line-buffered: each log line flushes on its newline
+    except OSError:
+        _LOG_FH = None
+
+
 def log(msg: str) -> None:
-    print(f"{time.strftime('%F %T')} tauceti: {msg}", file=sys.stderr, flush=True)
+    line = f"{time.strftime('%F %T')} tauceti: {msg}"
+    print(line, file=sys.stderr, flush=True)
+    if _LOG_FH is not None:
+        try:
+            _LOG_FH.write(_ANSI_RE.sub("", line) + "\n")
+        except (OSError, ValueError):
+            pass
 
 
 _RED, _RESET = "\033[1;31m", "\033[0m"
@@ -1369,6 +1404,10 @@ class Survey:
     # exact head). Skipped this round so the worker neither pays the engine's launch cost just to have
     # it skip nor busy-loops on the one PR a peer holds. (pr, providers) for a one-line status note.
     review_inflight: list[tuple[int, str]] = field(default_factory=list)
+    # PRs at the engine's per-PR daily review cap (REVIEW_DAILY_CAP rounds today in this worker's local
+    # ledger). Skipped this round — reviewing them would only make the engine clone repos then refuse,
+    # which is the tight loop we hit. (pr, "n/cap") for a one-line status note; resets at 00:00 UTC.
+    review_capped: list[tuple[int, str]] = field(default_factory=list)
 
     def kind(self, name: str) -> WorkKind:
         return {"rebase": self.rebaseable, "review": self.reviewable, "fix": self.needs_fix,
@@ -1397,6 +1436,26 @@ def inflight_review_providers(comments: Optional[list[dict]], head: str, now: in
             continue
         cov.update(p for p in (d.get("providers") or []) if isinstance(p, str))
     return cov
+
+
+def _review_rounds_today(store_dir: Path, pr: int) -> Optional[int]:
+    """Count this PR's review rounds recorded TODAY (UTC) in the worker's LOCAL engine ledger — the exact
+    quantity the engine caps at REVIEW_DAILY_CAP (mirrors review.py's today()-prefixed count over
+    prs.<pr>.rounds). Returns 0 when the ledger or PR entry is simply absent (a never-reviewed PR is
+    reviewable). Returns None — a fail-CLOSED sentinel the caller treats as 'skip' — when the ledger
+    exists but can't be read/parsed, so a torn file can never silently re-enable the capped-PR tight loop."""
+    led = store_dir / "ledger.json"
+    if not led.exists():
+        return 0
+    try:
+        d = json.loads(led.read_text())
+    except (OSError, ValueError):
+        log(f"review cap: cannot read {led} — skipping review this round (fail-closed)")
+        return None
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rounds = (((d.get("prs") or {}).get(str(pr)) or {}).get("rounds")) or []
+    return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
@@ -1469,6 +1528,15 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters,
             if c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
                 sv.review_stuck.append(p.number)     # can't be reviewed → escalate (warn + issue)
+                continue
+            # Daily review cap: past REVIEW_DAILY_CAP rounds today the engine refuses but would still clone
+            # repos first, then exit 0 re-posting the scoreboard — the tight loop we hit. Mirror the
+            # engine's count from our LOCAL ledger and skip the PR here, before any launch/clone. Resets at
+            # 00:00 UTC. Fail-CLOSED (None) on a corrupt ledger so a torn file can't re-enable the loop.
+            today_rounds = _review_rounds_today(cfg.store_dir, p.number)
+            if today_rounds is None or today_rounds >= REVIEW_DAILY_CAP:
+                shown = "?" if today_rounds is None else str(today_rounds)
+                sv.review_capped.append((p.number, f"{shown}/{REVIEW_DAILY_CAP}"))
                 continue
             # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
             # the same call the engine's coordinate() would make after a full build+launch. Doing it
@@ -1914,6 +1982,28 @@ def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str,
     return rc
 
 
+def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
+    """Run a subprocess with stdout+stderr redirected to logf, keeping the worker's MAIN log clean. Used
+    for the review engine, which prints a lot (git clones, the full scoreboard dump, per-rubric lines) —
+    detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
+    streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
+    silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
+    if os.environ.get("TAUCETI_STREAM"):
+        return subprocess.run(argv).returncode
+    logf.parent.mkdir(parents=True, exist_ok=True)
+    log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
+    with open(logf, "ab") as f:
+        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
+    if rc != 0:
+        log(f"{label}: exited {rc}; last lines of {logf.name}:")
+        try:
+            for line in logf.read_text(errors="replace").splitlines()[-20:]:
+                log("    " + line)
+        except OSError:
+            pass
+    return rc
+
+
 def _shq(s: str) -> str:
     import shlex
     return shlex.quote(s)
@@ -2154,6 +2244,7 @@ def review_in_bubble(w: "Worker", pr: int, head: str, reviewers: str, opts: "Rou
     inner = ("env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
              f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
              f"--no-mathlib --no-sync --store /opt/review-store --post "
+             f"--max-rounds-per-day {REVIEW_DAILY_CAP} "       # match the survey prefilter; no engine/worker drift
              f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}")
     # target is the PR so bubble checks it out; prompt unused by the engine.
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts,
@@ -2210,6 +2301,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
     for pr, providers in sv.review_inflight:
         log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
+    for pr, count in sv.review_capped:
+        if count.startswith("?"):
+            log(f"  review #{pr}: local ledger unreadable — skipping review (fail-closed); fix the ledger")
+        else:
+            log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
 
     # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
     # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
@@ -2353,10 +2449,14 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts)        # M9b
         else:
-            rc = subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
-                                 str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
-                                 "--reviewer", reviewers, "--expect-head", head,
-                                 "--submitted-by", me()]).returncode
+            logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+            rc = run_to_logfile(
+                ["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
+                 str(pr), "--store", str(w.cfg.store_dir), "--post", "--no-sync",
+                 "--reviewer", reviewers, "--expect-head", head,
+                 "--max-rounds-per-day", str(REVIEW_DAILY_CAP), "--submitted-by", me()],
+                logf, f"review #{pr}")
+        log(f"  review #{pr}: engine rc={rc}")
         if rc == 0:
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
@@ -2776,6 +2876,8 @@ def render_survey(sv: Survey, console, quota_snap: Optional[dict] = None,
         wk = sv.kind(name)
         ready = str(wk.count) if wk.count else "—"
         extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
+        if name == "review" and sv.review_capped:
+            extra += f"  ({len(sv.review_capped)} daily-capped: {','.join('#'+str(p) for p, _ in sv.review_capped[:5])})"
         note = (_sample(wk.actionable) or "") + extra
         if name == "bump" and not wk.actionable and not wk.suppressed:
             note = "no broken bump-mathlib PR"
@@ -2848,6 +2950,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
+    # Tee this process's log() output to a per-worker file so a `work --loop` started in a bare terminal
+    # still leaves an on-disk record to monitor. The loop driver picks one session file and exports its
+    # path; the _round children it spawns inherit TAUCETI_LOG_FILE and append to the SAME file.
+    set_log_file(cfg.logdir)
     if getattr(args, "loop", False) and not one_round:
         return cmd_loop(args, cfg, only=only, agent=agent)
     dry = getattr(args, "dry_run", False)
