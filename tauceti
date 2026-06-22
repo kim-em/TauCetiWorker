@@ -2508,10 +2508,29 @@ def _sync_review_outbox(w: "Worker", pr: int) -> int:
         return 0
     eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")   # a local engine checkout, for pre-merge tests
     if eng:
-        return subprocess.run([sys.executable, str(Path(eng) / "runner" / "cli.py"),
-                               str(pr), "--sync-only", "--store", str(w.cfg.store_dir)]).returncode
-    return subprocess.run(["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
-                           str(pr), "--sync-only", "--store", str(w.cfg.store_dir)]).returncode
+        argv = [sys.executable, str(Path(eng) / "runner" / "cli.py"),
+                str(pr), "--sync-only", "--store", str(w.cfg.store_dir)]
+    else:
+        argv = ["uvx", "--from", f"git+https://github.com/{REVIEW}", "tauceti-review",
+                str(pr), "--sync-only", "--store", str(w.cfg.store_dir)]
+    # The sync echoes a full `$ …python …/archive.py sync --store … --data-dir …` command line and a
+    # "synced N file(s)" line. Capture it so that noise stays out of the main log, surfacing only a
+    # one-line summary; keep the detail in a subsidiary file only when the sync FAILS (the diagnosable case).
+    if os.environ.get("TAUCETI_STREAM"):
+        return subprocess.run(argv).returncode
+    p = subprocess.run(argv, capture_output=True, text=True)
+    if p.returncode == 0:
+        m = re.search(r"synced (\d+) file", (p.stdout or "") + (p.stderr or ""))
+        log(f"  review #{pr}: synced {m.group(1) if m else '?'} record(s) to TauCetiData")
+    else:
+        logf = w.cfg.logdir / f"sync-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        try:
+            w.cfg.logdir.mkdir(parents=True, exist_ok=True)
+            logf.write_text((p.stdout or "") + (p.stderr or ""))
+            log(f"  review #{pr}: TauCetiData sync FAILED (rc={p.returncode}); detail → {logf}")
+        except OSError:
+            log(f"  review #{pr}: TauCetiData sync FAILED (rc={p.returncode})")
+    return p.returncode
 
 
 def _do_fixlike(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool,
