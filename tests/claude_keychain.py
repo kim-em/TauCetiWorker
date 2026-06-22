@@ -4,8 +4,6 @@ keychain-first, marked from_keychain so the 401 path never refreshes a token sha
 claude). For bubble rounds, where the in-container claude needs a .credentials.json, the credential is
 materialized from the Keychain INTO the configured CLAUDE_CONFIG_DIR when the file is missing/stale."""
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sys
@@ -14,12 +12,8 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 fails = 0
 

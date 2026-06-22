@@ -6,18 +6,12 @@ still blocking in `states` (the #229 stranding bug). The fix stage's eligibility
 must agree with CI's close (which also reads `states`). Dependency-free.
 """
 
-import importlib.machinery
-import importlib.util
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 
 class FakeRS:

@@ -1,0 +1,505 @@
+"""tauceti_worker.agents — split from the monolithic worker (behaviour-preserving)."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
+    from .work_units import RoundOpts, Worker
+
+from .config import Config, Die, log
+from .constants import CLAUDE_CMD, OPENROUTER_MODELS, PI_RUN, REVIEW, REVIEW_DAILY_CAP, ROADMAP, TAUCETI
+from .github import me
+from .paths import HERE
+from .quota import _claude_keychain_creds_interactive, _read_json_file, _write_json_atomic, claude_dir, mirror_creds
+
+# ============================================================================
+# Agents — prompt filling, the host checkout, and the byte-for-byte agent launch.
+# The host argv lists reproduce round.sh's run_agent exactly (the `( cd … ) 9>&-`
+# and `env -u` mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh /
+# git-safe-push / gh-safe-pr-create are put on the agent's PATH so it can push.
+# ============================================================================
+
+
+def fill_prompt(path: Path, **subs) -> str:
+    out = Path(path).read_text()
+    for k, v in subs.items():
+        out = out.replace(f"__{k}__", str(v))
+    return out
+
+
+def prepare_checkout(cfg: Config) -> bool:
+    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
+    co = cfg.checkout
+    if not (co / ".git").is_dir():
+        co.parent.mkdir(parents=True, exist_ok=True)
+        log(f"cloning {TAUCETI} → {co} (first run)")
+        if subprocess.run(["git", "clone", "-q", f"https://github.com/{TAUCETI}", str(co)]).returncode:
+            return False
+
+    def g(*a) -> int:
+        return subprocess.run(["git", "-C", str(co), *a]).returncode
+
+    if g("fetch", "-q", "origin"):
+        return False
+    # -f discards a prior round's leftover edits and lands us on main in one step; a plain
+    # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on
+    # the old branch with only main's content. Bail if even the forced checkout fails.
+    if g("checkout", "-q", "-f", "-B", "main", "origin/main"):
+        return False
+    g("clean", "-fdxq", "-e", ".lake")
+    return True
+
+
+def fetch_ref(repo: str, dir: Path) -> bool:
+    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+    if (dir / ".git").is_dir():
+        ok = (
+            subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"]).returncode == 0
+            and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0
+        )
+        subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"])
+        return ok
+    import shutil
+
+    shutil.rmtree(dir, ignore_errors=True)
+    dir.parent.mkdir(parents=True, exist_ok=True)
+    return (
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"https://github.com/{repo}", str(dir)]).returncode == 0
+    )
+
+
+def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
+    """The exact argv + env for the host work agent (round.sh run_agent). HERE is on PATH so the agent
+    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
+    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    if work_model == "codex":
+        argv = ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+    elif work_model in OPENROUTER_MODELS:
+        argv = [PI_RUN, "openrouter", OPENROUTER_MODELS[work_model], "--prompt", prompt]
+    else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
+        env.pop("ANTHROPIC_API_KEY", None)
+        base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
+        argv = [*base, "-p", prompt, "--model", "opus", "--dangerously-skip-permissions"]
+    return argv, env
+
+
+def run_agent_host(cwd: Path, prompt: str, work_model: str, logdir: Path) -> int:
+    argv, env = host_agent_argv(prompt, work_model)
+    if os.environ.get("TAUCETI_AGENT_ECHO"):
+        print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
+        return 0
+    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{work_model}")
+
+
+def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None) -> int:
+    """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
+    by default we redirect it to a timestamped file under logdir and print only the path, so the round
+    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
+    On a non-zero exit we always tail the log so failures aren't silent."""
+    cwds = str(cwd) if cwd is not None else None
+    if os.environ.get("TAUCETI_STREAM"):
+        return subprocess.run(argv, cwd=cwds, env=env).returncode
+    logdir.mkdir(parents=True, exist_ok=True)
+    logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    log(f"{label}: output → {logf}  (run with --stream to watch live)")
+    with open(logf, "ab") as f:
+        rc = subprocess.run(argv, cwd=cwds, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
+    if rc != 0:
+        log(f"{label}: exited {rc}; last lines of {logf.name}:")
+        try:
+            tail = logf.read_text(errors="replace").splitlines()[-20:]
+            for line in tail:
+                print("    " + line)
+        except OSError:
+            pass
+    return rc
+
+
+def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
+    """Run a subprocess with stdout+stderr redirected to logf, keeping the worker's MAIN log clean. Used
+    for the review engine, which prints a lot (git clones, the full scoreboard dump, per-rubric lines) —
+    detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
+    streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
+    silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
+    if os.environ.get("TAUCETI_STREAM"):
+        return subprocess.run(argv).returncode
+    logf.parent.mkdir(parents=True, exist_ok=True)
+    log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
+    with open(logf, "ab") as f:
+        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
+    if rc != 0:
+        log(f"{label}: exited {rc}; last lines of {logf.name}:")
+        try:
+            for line in logf.read_text(errors="replace").splitlines()[-20:]:
+                log("    " + line)
+        except OSError:
+            pass
+    return rc
+
+
+def _shq(s: str) -> str:
+    import shlex
+
+    return shlex.quote(s)
+
+
+# ===== Bubble authoring path (default for model modes; --host opts out) =======
+# The checkout, lake build, and every git/gh call happen IN a repo-scoped bubble
+# container. GitHub goes through bubble's auth proxy (the host gh token never
+# enters); only the one credential the work model needs is seeded; no host config
+# crosses the boundary. Byte-for-byte the same agent invocation as round.sh.
+
+BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
+
+
+def bubble_cmd() -> list[str]:
+    """The bubble CLI. Fetched on demand via uvx when not installed, so the operator never has to
+    preinstall it (uvx caches the build after first use). $TAUCETI_BUBBLE overrides the executable."""
+    import shutil
+
+    override = os.environ.get("TAUCETI_BUBBLE")
+    if override:
+        return shlex_split(override)
+    if shutil.which("bubble"):
+        return ["bubble"]
+    return ["uvx", "--from", BUBBLE_REPO, "bubble"]
+
+
+def shlex_split(s: str) -> list[str]:
+    import shlex
+
+    return shlex.split(s)
+
+
+def bubble_name(cfg: Config) -> str:
+    return f"tauceti-worker-{cfg.wid}"
+
+
+def bubble_home(cfg: Config) -> Path:
+    env = os.environ.get("TAUCETI_BUBBLE_HOME")
+    return Path(env) if env else (cfg.home / ".cache" / "tauceti-worker" / cfg.wid / "bubble")
+
+
+def ensure_bubble_home(cfg: Config) -> dict:
+    """One-time hardening of the private bubble home (read-only shared Mathlib cache + per-round
+    overlay). Returns the env (with BUBBLE_HOME set) for bubble subprocesses."""
+    home = bubble_home(cfg)
+    env = {**os.environ, "BUBBLE_HOME": str(home)}
+    if (home / ".worker-init").exists():
+        return env
+    home.mkdir(parents=True, exist_ok=True)
+    subprocess.run([*bubble_cmd(), "security", "set", "shared-cache", "overlay"], env=env, capture_output=True)
+    (home / ".worker-init").touch()
+    return env
+
+
+def agent_cred_flags(work_model: str) -> list[str]:
+    """Bubble flags seeding ONLY the work model's credential; all config and other models' creds stay out."""
+    if work_model == "codex":
+        return ["--codex-credentials", "--no-codex-config", "--no-claude-credentials", "--no-claude-config"]
+    if work_model in OPENROUTER_MODELS:
+        return ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+    return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+
+
+def _codex_model() -> str:
+    """The codex model to run in the bubble. $TAUCETI_CODEX_MODEL wins; else the host's configured
+    model from ~/.codex/config.toml (what host rounds use); else a safe default."""
+    m = os.environ.get("TAUCETI_CODEX_MODEL")
+    if m:
+        return m
+    try:
+        for ln in (Path.home() / ".codex" / "config.toml").read_text().splitlines():
+            s = ln.strip()
+            if s.startswith("model") and "=" in s:
+                return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "gpt-5"
+
+
+def agent_inner_cmd(work_model: str) -> str:
+    """The command bubble runs INSIDE the container (bash -lc). Byte-for-byte round.sh's agent_inner_cmd:
+    the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force subscription auth."""
+    import shlex
+
+    if work_model == "codex":
+        # Pin the model explicitly: the bubble seeds codex *credentials* but NOT host config
+        # (--no-codex-config, for isolation), so in-container codex would otherwise fall back to its
+        # built-in default (e.g. gpt-5.3-codex), which a ChatGPT-subscription account may not support.
+        # shlex.quote the model id: it comes from env / ~/.codex/config.toml, not a literal, and is
+        # spliced into a bash -lc string inside a credential-seeded, repo-write container.
+        return (
+            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {shlex.quote(_codex_model())} "
+            '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
+        )
+    if work_model in OPENROUTER_MODELS:
+        return (
+            'env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY="$(cat /opt/round/openrouter.key)" '
+            f"pi --provider openrouter --model {shlex.quote(OPENROUTER_MODELS[work_model])} --print "
+            '"$(cat /opt/round/prompt.txt)"'
+        )
+    return (
+        'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
+        "--dangerously-skip-permissions --model opus"
+    )
+
+
+def _bubble_pop(cfg: Config, env: dict) -> None:
+    subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
+
+
+def _ensure_claude_creds_for_bubble(cfg: Config) -> None:
+    """bubble seeds the in-container claude from <CLAUDE_CONFIG_DIR>/.credentials.json (it can't read the
+    macOS Keychain). On Linux that file is the store, so leave it to bubble. On macOS, where Claude Code
+    keeps creds in the Keychain, write the credential INTO the configured dir from the Keychain, every
+    round: the Keychain is authoritative and may hold a token rotated by a host claude since we last
+    wrote, and re-mirroring it keeps both the access AND refresh token current (a stale refresh token in
+    an unexpired-looking mirror would fail mid-round). The read is interactive (unlock if locked). The
+    pacer reads the Keychain directly (keychain-first), so it never refreshes this mirror. If the Keychain
+    can't be read but a credentials file already exists, fall back to it; otherwise Die."""
+    if sys.platform != "darwin":
+        return  # Linux/Windows: the file is the store; bubble seeds it (or reports none)
+    f = claude_dir(cfg.home) / ".credentials.json"
+    blob = _claude_keychain_creds_interactive()
+    if blob and blob.get("claudeAiOauth"):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(f, blob)  # 0600, temp + atomic rename (no partial-read or perms window)
+        return
+    if (_read_json_file(f) or {}).get("claudeAiOauth"):
+        return  # Keychain unreadable but a credentials file exists; let bubble use it
+    raise Die(
+        "no Claude credentials to seed the bubble: none in "
+        f'{f} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
+        "the Keychain and retry, or run with --host (the host claude reads the Keychain itself)."
+    )
+
+
+def run_in_bubble(
+    w: Worker,
+    target: str,
+    prompt: str,
+    opts: RoundOpts,
+    mounts: list[str] | None = None,
+    *,
+    inner_cmd: str | None = None,
+    cred_model: str | None = None,
+) -> int:
+    """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
+    work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
+    something else in the same sandbox (e.g. the review engine — see review_in_bubble)."""
+    import shlex
+
+    cfg, wm = w.cfg, opts.work_model
+    cred_model = cred_model or wm
+    # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
+    # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
+    # bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317), reading it
+    # from this subprocess's inherited env, so the in-bubble claude and the pacer agree on the account
+    # with no extra plumbing here.
+    env = ensure_bubble_home(cfg)
+    rounddir = cfg.state / "bubble-round"
+    import shutil
+
+    shutil.rmtree(rounddir, ignore_errors=True)
+    rounddir.mkdir(parents=True, exist_ok=True)
+    (rounddir / "prompt.txt").write_text(prompt)
+    # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
+    # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
+    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+        shutil.copy(HERE / "scripts" / f, rounddir / f)
+        os.chmod(rounddir / f, 0o755)
+    if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
+        keyf = rounddir / "openrouter.key"
+        keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
+        os.chmod(keyf, 0o600)
+
+    _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
+
+    mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    for m in mounts or []:
+        mount_flags += ["--mount", m]
+
+    # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
+    # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
+    # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
+    # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    tcenv = "env PATH=/opt/round:$PATH"
+    for var in (
+        "TAUCETI_PUSH_REF",
+        "TAUCETI_PUSH_EXPECT",
+        "TAUCETI_PUSH_REMOTE",
+        "TAUCETI_TARGET_MARKER",
+        "TAUCETI_REQUIRE_TARGET_MARKER",
+    ):
+        val = os.environ.get(var)
+        if val:
+            tcenv += f" {var}={shlex.quote(val)}"
+    command = f"{tcenv} {inner_cmd or agent_inner_cmd(wm)}"
+
+    argv = [
+        *bubble_cmd(),
+        "open",
+        target,
+        "--shell",
+        "--local",
+        "--name",
+        bubble_name(cfg),
+        "--ephemeral",
+        "--github-security",
+        "allowlist-write-graphql",
+        *mount_flags,
+        *agent_cred_flags(cred_model),
+        "--command",
+        command,
+    ]
+
+    if os.environ.get("TAUCETI_AGENT_ECHO"):
+        print("BUBBLE " + " ".join(_shq(a) for a in argv))
+        return 0
+
+    # Re-mirror the operator's fresh creds into the isolated home at the last moment before bubble seeds
+    # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that
+    # never call the pacer). No-op when not isolated or on macOS.
+    mirror_creds(cfg)
+    # On macOS, Claude Code keeps creds in the Keychain, not a file; make sure the configured
+    # CLAUDE_CONFIG_DIR holds a current credentials file so bubble can seed it (done after the echo path
+    # so a dry-run never prompts the Keychain).
+    if cred_model == "claude":
+        _ensure_claude_creds_for_bubble(cfg)
+    w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
+    try:
+        if inner_cmd is None:  # the work agent — quiet/log it like the host path
+            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+        else:  # review engine / probe — leave its output inline
+            rc = subprocess.run(argv, env=env).returncode
+    finally:
+        _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+    return rc
+
+
+def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
+    """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
+    reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
+    model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
+    engine would otherwise fetch and run it OFFLINE: the engine itself, the roadmap, and the review
+    store are host→container mounts; `--no-sync` makes the engine archive review records to the mounted
+    outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
+    TauCetiData host-side afterwards. The only traffic that
+    crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
+    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
+    Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
+
+    The store is mounted READ-WRITE from the worker's persistent store_dir (not /tmp): it holds the
+    scoreboard/thread comment ids the next round edits in place — an ephemeral store would post a
+    duplicate scoreboard. The engine mount keeps its `.git` so the engine never falls back to a
+    cross-repo `gh api` for its own rev. TAUCETI_REVIEW_ENGINE_DIR pins a local engine checkout
+    (operator override / pre-merge testing); otherwise a shallow REVIEW clone is staged."""
+    cfg = w.cfg
+    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
+    engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
+    if not eng and not fetch_ref(REVIEW, engine_dir):  # keeps .git (no cross-repo rev fallback)
+        raise Die(f"fetch {REVIEW} failed")
+    roadmap_dir = cfg.state / "refs" / "roadmap"
+    if not fetch_ref(ROADMAP, roadmap_dir):
+        raise Die(f"fetch {ROADMAP} failed")
+    store = cfg.store_dir
+    store.mkdir(parents=True, exist_ok=True)
+    mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro", f"{store}:/opt/review-store:rw"]
+    # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
+    # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
+    # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
+    # `cd` shell builtin — carry the engine on PYTHONPATH instead of cwd (cwd is irrelevant: the engine
+    # uses --repo-dir for its files and an absolute temp workdir).
+    inner = (
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
+        f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
+        f"--no-mathlib --no-sync --store /opt/review-store --post "
+        f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
+        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
+    )
+    # target is the PR so bubble checks it out; prompt unused by the engine.
+    return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers)
+
+
+def isolate_home(wid: str) -> Path:
+    """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
+    review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface from the real
+    config dir; copies the mutable Claude/Codex auth files in ONCE, then records the source dirs in
+    .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher access token whenever the
+    operator's external refresher rotates it. The worker itself never refreshes (never touches the
+    single-use refresh token). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is repointed
+    there, so both the pacer and the spawned claude read the isolated creds even when the operator's real
+    config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
+
+    macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
+    Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
+    repointing is a no-op there: the spawned claude reads the shared Keychain regardless, and the pacer's
+    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature."""
+    import shutil
+
+    home = HERE / "state" / wid / "home"
+    if Path(os.environ.get("HOME", "")) == home:
+        return home  # already isolated (a loop child inherits the parent's $HOME) — don't re-copy or warn
+    real = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
+    iso_claude = home / ".claude"
+    iso_claude.mkdir(parents=True, exist_ok=True)
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
+        src, dst = real_claude / item, iso_claude / item
+        if src.exists() and not dst.exists():
+            try:
+                dst.symlink_to(src)
+            except OSError:
+                pass
+    for f in (".credentials.json", ".gist-id", ".gist-encryption-key"):
+        src, dst = real_claude / f, iso_claude / f
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+    # The initial copy is once-only; thereafter mirror_creds() RE-MIRRORS a fresher access token from the
+    # source whenever the operator's external refresher rotates it (the worker never refreshes its own
+    # tokens). So a reused --worker-id stays pinned to whatever account it was first seeded from. Record the
+    # source and warn if it changes, rather than silently pacing/running the stale account.
+    marker = iso_claude / ".tauceti-creds-source"
+    if marker.exists():
+        if marker.read_text().strip() != str(real_claude):
+            log(
+                f"WARNING: worker '{wid}' keeps Claude creds first copied from {marker.read_text().strip()} "
+                f"(not {real_claude}); use a fresh --worker-id to switch accounts."
+            )
+    else:
+        marker.write_text(str(real_claude))
+    real_codex, iso_codex = real / ".codex", home / ".codex"
+    src, dst = real_codex / "auth.json", iso_codex / "auth.json"
+    if src.exists() and not dst.exists():
+        shutil.copy2(src, dst)
+    # Record the real ~/.codex so mirror_creds() can re-mirror the codex token too (the Claude marker only
+    # names the Claude source). Written unconditionally so homes seeded before this marker existed get it
+    # backfilled on their next isolate_home() run.
+    codex_marker = iso_codex / ".tauceti-creds-source"
+    if not codex_marker.exists():
+        try:
+            codex_marker.write_text(str(real_codex))
+        except OSError:
+            pass
+    # Keep host-side gh and git working under the isolated $HOME: the survey's `gh pr list` and host
+    # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
+    # point them back at the operator's real config rather than an empty isolated one. Respect a value
+    # the operator already exported. Children inherit these, so the early-return path above is covered.
+    gh_cfg = real / ".config" / "gh"
+    if gh_cfg.is_dir():
+        os.environ.setdefault("GH_CONFIG_DIR", str(gh_cfg))
+    git_cfg = real / ".gitconfig"
+    if git_cfg.exists():
+        os.environ.setdefault("GIT_CONFIG_GLOBAL", str(git_cfg))
+    os.environ["HOME"] = str(home)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)  # so claude_dir() + the spawned claude agree
+    log(f"isolated HOME={home} (worker '{wid}')")
+    return home

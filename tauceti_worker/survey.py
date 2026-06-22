@@ -1,0 +1,413 @@
+"""tauceti_worker.survey — split from the monolithic worker (behaviour-preserving)."""
+
+from __future__ import annotations
+
+import json
+import random
+import re
+from dataclasses import dataclass, field
+from datetime import UTC
+from pathlib import Path
+
+from .config import Config, log, roadmap_focus
+from .constants import (
+    BUMP_HEAD_PREFIX,
+    CONTEST_CLAIM_TTL,
+    MAX_BUMP_ATTEMPTS,
+    MAX_BUMP_PR_ATTEMPTS,
+    MAX_CI_ATTEMPTS,
+    MAX_CI_PR_ATTEMPTS,
+    MAX_FIX_ATTEMPTS,
+    MAX_OPEN_PRS,
+    MAX_REBASE_ATTEMPTS,
+    MAX_REVIEW_CONTESTS,
+    MAX_REVIEW_CONTESTS_PER_RUBRIC,
+    MAX_REVIEW_ERRORS,
+    REVIEW_DAILY_CAP,
+    TAUCETI_OWNER,
+)
+from .github import GitHub, GitHubError, me
+from .review_state import ReviewState
+
+# ============================================================================
+# Counters — state/<wid>/... single-integer files (round.sh `counter`).
+# ============================================================================
+
+
+class Counters:
+    def __init__(self, cfg: Config):
+        self.state = cfg.state
+
+    def read(self, name: str) -> int:
+        try:
+            txt = (self.state / name).read_text().strip()
+        except OSError:
+            return 0
+        return int(txt) if txt.isdigit() else 0
+
+    def write(self, name: str, value: int) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / name).write_text(str(value))
+
+    def incr(self, name: str) -> int:
+        v = self.read(name) + 1
+        self.write(name, v)
+        return v
+
+
+# ============================================================================
+# Survey — the shared read-only core. Classifies all open PRs per work-kind
+# without acting. The picker, `status`, and the TUI all consume this one object.
+# ============================================================================
+
+BUILD_FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+
+TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 \{[^}]*\}-->")
+
+TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
+
+
+@dataclass(frozen=True)
+class PRInfo:
+    number: int
+    head_oid: str
+    head_ref: str
+    head_owner: str
+    head_repo: str
+    is_draft: bool
+    mergeable: str  # MERGEABLE | CONFLICTING | UNKNOWN
+    author: str
+    build_success: bool
+    build_failed: bool
+    author_is_bot: bool = False  # a GitHub App / bot author (e.g. the review bot's bump PRs)
+    title: str = ""
+
+    @staticmethod
+    def from_json(d: dict) -> PRInfo:
+        rollup = d.get("statusCheckRollup") or []
+        builds = [c for c in rollup if c.get("name") == "build"]
+        return PRInfo(
+            number=d["number"],
+            title=d.get("title", ""),
+            head_oid=d.get("headRefOid", ""),
+            head_ref=d.get("headRefName", ""),
+            head_owner=(d.get("headRepositoryOwner") or {}).get("login", ""),
+            head_repo=(d.get("headRepository") or {}).get("name", ""),
+            is_draft=bool(d.get("isDraft")),
+            mergeable=d.get("mergeable", "UNKNOWN"),
+            author=(d.get("author") or {}).get("login", ""),
+            author_is_bot=bool((d.get("author") or {}).get("is_bot")),
+            build_success=any(c.get("conclusion") == "SUCCESS" for c in builds),
+            build_failed=any(c.get("conclusion") in BUILD_FAIL for c in builds),
+        )
+
+
+@dataclass
+class Candidate:
+    pr: int
+    head: str
+    reason: str = ""
+    attempts: int = 0
+    budget: int = 0
+    provenance: str = "fresh"
+    contest: str = ""  # set to the contested rubric when this is an author-contest re-review
+    contest_reply_id: int = 0  # the review-comment id of the contesting reply (the 👀 claim anchor)
+
+
+@dataclass
+class WorkKind:
+    name: str
+    actionable: list[Candidate] = field(default_factory=list)
+    suppressed: list[Candidate] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.actionable)
+
+
+@dataclass
+class Survey:
+    worker_id: str
+    open_prs: list[PRInfo] = field(default_factory=list)
+    n_open_nondraft: int = 0
+    n_reviewable: int = 0
+    rebaseable: WorkKind = field(default_factory=lambda: WorkKind("rebase"))
+    reviewable: WorkKind = field(default_factory=lambda: WorkKind("review"))
+    needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
+    red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
+    bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
+    roadmap_focus: str = ""
+    n_mine_open: int = 0
+    roadmap_backpressure: bool = False
+    next_auto_stage: str | None = None
+    github_failed: bool = False
+    errors: list[str] = field(default_factory=list)
+    # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
+    # can't review them and CI's round cap can't catch them (rounds never advance), so each round
+    # escalates — a loud warning + a tracking issue — rather than stranding them silently.
+    review_stuck: list[int] = field(default_factory=list)
+    # Heads a peer reviewer is actively reviewing right now (an unexpired in-progress marker on the
+    # exact head). Skipped this round so the worker neither pays the engine's launch cost just to have
+    # it skip nor busy-loops on the one PR a peer holds. (pr, providers) for a one-line status note.
+    review_inflight: list[tuple[int, str]] = field(default_factory=list)
+    # PRs at the engine's per-PR daily review cap (REVIEW_DAILY_CAP rounds today in this worker's local
+    # ledger). Skipped this round — reviewing them would only make the engine clone repos then refuse,
+    # which is the tight loop we hit. (pr, "n/cap") for a one-line status note; resets at 00:00 UTC.
+    review_capped: list[tuple[int, str]] = field(default_factory=list)
+
+    def kind(self, name: str) -> WorkKind:
+        return {
+            "rebase": self.rebaseable,
+            "review": self.reviewable,
+            "fix": self.needs_fix,
+            "fix-ci": self.red_ci,
+            "bump": self.bump,
+        }[name]
+
+
+def _review_rounds_today(store_dir: Path, pr: int) -> int | None:
+    """Count this PR's review rounds recorded TODAY (UTC) in the worker's LOCAL engine ledger — the exact
+    quantity the engine caps at REVIEW_DAILY_CAP (mirrors review.py's today()-prefixed count over
+    prs.<pr>.rounds). Returns 0 when the ledger or PR entry is simply absent (a never-reviewed PR is
+    reviewable). Returns None — a fail-CLOSED sentinel the caller treats as 'skip' — when the ledger
+    exists but can't be read/parsed, so a torn file can never silently re-enable the capped-PR tight loop."""
+    led = store_dir / "ledger.json"
+    if not led.exists():
+        return 0
+    try:
+        d = json.loads(led.read_text())
+    except (OSError, ValueError):
+        log(f"review cap: cannot read {led} — skipping review this round (fail-closed)")
+        return None
+    from datetime import datetime
+
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    rounds = (((d.get("prs") or {}).get(str(pr)) or {}).get("rounds")) or []
+    return sum(1 for r in rounds if isinstance(r, dict) and (r.get("ts") or "").startswith(today))
+
+
+def spread_candidates(candidates: list, rng=random) -> list:
+    """Return a stage's candidates in a randomized order so several workers starting together don't all
+    converge on the same (lowest-numbered) PR and collide. The survey has already dropped work a peer is
+    KNOWN to hold; this only varies which of the remaining, apparently-free PRs each worker tries first —
+    turning systematic collisions (every worker picks the lowest, discovers the clash, repeats) into rare,
+    self-correcting ones. Pure WORKER-side work-allocation: the real de-contention is unchanged — the
+    review engine's in-progress marker for reviews, the branch claim for fix/fix-ci/rebase — this just
+    spreads the first pick. Each worker is its own process with independent RNG state, so concurrent
+    workers shuffle differently. Returns a new list."""
+    out = list(candidates)
+    rng.shuffle(out)
+    return out
+
+
+def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
+    """Classify every open PR per work-kind. Read-only — performs no actions.
+
+    `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
+    always uses deep=True.
+    """
+    _f = roadmap_focus()
+    # Keep sv.roadmap_focus a non-None string: "auto" = unset (a round will pick a random area),
+    # "any" = all areas, else the chosen area. The concrete random area is resolved later, in
+    # do_roadmap (once per authoring round) — not here, since survey() re-runs read-only for status
+    # and every ~90s in the dashboard, which would re-roll and flicker the displayed focus.
+    sv = Survey(worker_id=cfg.wid, roadmap_focus=("auto" if _f is None else (_f or "any")))
+    try:
+        raw = gh.pr_list(
+            [
+                "number",
+                "title",
+                "headRefOid",
+                "headRefName",
+                "headRepositoryOwner",
+                "headRepository",
+                "isDraft",
+                "statusCheckRollup",
+                "author",
+                "mergeable",
+            ]
+        )
+    except GitHubError as e:
+        sv.github_failed = True
+        sv.errors.append(str(e))
+        return sv
+    prs = [PRInfo.from_json(d) for d in raw]
+    sv.open_prs = prs
+    nondraft = [p for p in prs if not p.is_draft]
+    me_login = me()
+    mine = [p for p in nondraft if p.author == me_login]
+    # PRs the worker tends with its maintenance stages (rebase/fix/fix-ci): its own, plus FIRST-PARTY
+    # bot automation — a bot-authored PR whose head branch lives in the base repo (the review bot's
+    # bump PRs). Requiring the head in-repo keeps the worker off a fork or an external/unrelated bot's
+    # branch (which it either can't push to, or shouldn't touch); a human contributor's PR is neither
+    # ours nor a first-party bot's, so it is left alone. Roadmap backpressure still counts only `mine`:
+    # it bounds how many PRs WE author, which a bot's PRs don't.
+    tended = [p for p in nondraft if p.author == me_login or (p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
+    sv.n_open_nondraft = len(nondraft)
+    sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
+    sv.n_mine_open = len(mine)
+    sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
+
+    # 1) rebase: tended (ours or bot-authored), CONFLICTING, under the per-PR rebase-attempt budget.
+    #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver
+    #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
+    #    is rebased until it merges or CI retires it.
+    for p in tended:
+        if p.mergeable != "CONFLICTING":
+            continue
+        c = Candidate(p.number, p.head_oid, "conflicting")
+        c.attempts = counters.read(f"rebase-pr-{p.number}")
+        c.budget = MAX_REBASE_ATTEMPTS
+        (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
+
+    # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
+    #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
+    #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
+    #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
+    #    review keeps erroring without posting a verdict is escalated, not silently dropped.
+    for p in nondraft:
+        if not p.build_success:
+            continue
+        if not deep:
+            sv.reviewable.actionable.append(Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed"))
+            continue
+        m = rs.gh_meta(p.number)
+        if rs.ledger_clean_head(p.number) != p.head_oid:
+            # normal review path: the head moved or the last round errored.
+            c = Candidate(
+                p.number,
+                p.head_oid,
+                "build-green, head not cleanly reviewed",
+                provenance=m.provenance,
+                attempts=counters.read(f"review-err-{p.number}"),
+                budget=MAX_REVIEW_ERRORS,
+            )
+            if c.attempts >= c.budget:
+                sv.reviewable.suppressed.append(c)
+                sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
+                continue
+            # Daily review cap: past REVIEW_DAILY_CAP rounds today the engine refuses but would still clone
+            # repos first, then exit 0 re-posting the scoreboard — the tight loop we hit. Mirror the
+            # engine's count from our LOCAL ledger and skip the PR here, before any launch/clone. Resets at
+            # 00:00 UTC. Fail-CLOSED (None) on a corrupt ledger so a torn file can't re-enable the loop.
+            today_rounds = _review_rounds_today(cfg.store_dir, p.number)
+            if today_rounds is None or today_rounds >= REVIEW_DAILY_CAP:
+                shown = "?" if today_rounds is None else str(today_rounds)
+                sv.review_capped.append((p.number, f"{shown}/{REVIEW_DAILY_CAP}"))
+                continue
+            # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
+            # the same call the engine's coordinate() would make after a full build+launch. Doing it
+            # here keeps the loop off the one PR a peer is reviewing instead of re-selecting it every
+            # round and spending ~25s per pass to have the engine skip. Fail-open (a fetch failure
+            # reads as 'not held'); the engine's own claim is still the authoritative backstop.
+            cov = rs.inflight_review(p.number, p.head_oid)
+            if cov:
+                sv.review_inflight.append((p.number, ",".join(sorted(cov))))
+                continue
+            sv.reviewable.actionable.append(c)
+            continue
+        # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
+        # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
+        # reply with a higher id is one no review round has answered yet — precise (monotonic id),
+        # with no second-resolution ambiguity, and self-clearing (the contest round advances
+        # replies_through past it).
+        reply = rs.newest_contest_reply(p.number)
+        if not reply:
+            continue
+        through = m.data.get("replies_through")
+        through = through if isinstance(through, int) else 0
+        if reply["id"] <= through:
+            continue  # already adjudicated by some review round
+        # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
+        # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
+        # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.
+        age = gh.fresh_claim_age(reply["id"])
+        if age is not None and age < CONTEST_CLAIM_TTL:
+            continue
+        rubric = reply["rubric"]
+        c = Candidate(
+            p.number,
+            p.head_oid,
+            f"author contest on {rubric}",
+            provenance=m.provenance,
+            contest=rubric,
+            contest_reply_id=reply["id"],
+            attempts=counters.read(f"review-contest-{p.number}"),
+            budget=MAX_REVIEW_CONTESTS,
+        )
+        if (
+            counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
+            or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
+            or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
+        ):
+            sv.reviewable.suppressed.append(c)
+        else:
+            sv.reviewable.actionable.append(c)
+
+    if deep:
+        # 3) fix: tended (ours or bot-authored), reviewed-at-head, latest rubric blocking, under
+        #    budgets. Bump PRs get reviewed like any other, so a blocking rubric on one is ours to fix
+        #    (orthogonal to the bump stage, which only adapts a RED build).
+        for p in tended:
+            if rs.ledger_head(p.number) != p.head_oid:
+                continue
+            if not rs.ledger_blocking(p.number, p.head_oid):
+                continue
+            c = Candidate(p.number, p.head_oid, "blocking review at head")
+            per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
+            c.attempts, c.budget = per_head, MAX_FIX_ATTEMPTS
+            if per_head >= MAX_FIX_ATTEMPTS:
+                sv.needs_fix.suppressed.append(c)
+            else:
+                sv.needs_fix.actionable.append(c)
+
+    # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
+    #    the bump stage's job (its adaptation prompt knows mathlib moved), so fix-ci defers those to
+    #    bump; it picks up only non-bump red PRs (ours, or any other bot-authored one).
+    for p in tended:
+        if not p.build_failed or p.head_ref.startswith(BUMP_HEAD_PREFIX):
+            continue
+        c = Candidate(p.number, p.head_oid, "build failed at head")
+        per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
+        per_pr = counters.read(f"ci-pr-{p.number}")
+        c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
+        if per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
+            sv.red_ci.suppressed.append(c)
+        else:
+            sv.red_ci.actionable.append(c)
+
+    # 5) bump: a bump-mathlib PR (opened by the review bot) whose build is RED — mathlib moved
+    #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
+    #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
+    #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
+    #    fix still owns its review findings).
+    for p in nondraft:
+        if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
+            continue
+        c = Candidate(p.number, p.head_oid, "bump-mathlib, build red")
+        per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
+        per_pr = counters.read(f"bump-pr-{p.number}")
+        c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
+        if per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS:
+            sv.bump.suppressed.append(c)
+        else:
+            sv.bump.actionable.append(c)
+
+    sv.next_auto_stage = _next_auto_stage(sv)
+    return sv
+
+
+def _next_auto_stage(sv: Survey) -> str | None:
+    if sv.rebaseable.actionable:
+        return "rebase"
+    if sv.reviewable.actionable:
+        return "review"
+    if sv.red_ci.actionable:
+        return "fix-ci"
+    if sv.needs_fix.actionable:
+        return "fix"
+    if sv.bump.actionable:
+        return "bump"
+    if not sv.roadmap_backpressure:
+        return "roadmap"
+    return None

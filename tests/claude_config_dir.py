@@ -3,8 +3,6 @@
 repoints it at the per-worker copy, and the bubble path does not block a non-default value
 (bubble honors the var itself)."""
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import shutil
@@ -14,12 +12,8 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader(
-    "tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti"))
-)
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 fails = 0
 
@@ -87,7 +81,7 @@ class PastGuard(Exception):
     pass
 
 
-tc.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(PastGuard())  # the first call after the removed guard
+tc.agents.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(PastGuard())  # the first call after the removed guard
 w = types.SimpleNamespace(cfg=types.SimpleNamespace(home=Path("/home/example"), state=Path("/tmp"), wid="w"))
 opts = types.SimpleNamespace(work_model="claude")
 

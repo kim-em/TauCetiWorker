@@ -27,8 +27,8 @@ tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / 
 tauceti work --loop                # fully automatic: keep picking the most useful job
 ```
 
-From a clone of this repo you can also just run `./tauceti` (it's a single `uv`
-script), and every command above works the same. Either way, Ctrl-C stops the
+From a clone of this repo you can also just run `./tauceti` (a small PEP 723 `uv`
+shim that runs the `tauceti_worker` package), and every command above works the same. Either way, Ctrl-C stops the
 current round and exits, and `tauceti doctor` checks your environment and tells
 you what's missing.
 
@@ -287,12 +287,15 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 
 ## What's in the repo
 
-- `tauceti`: the worker, one Python file ([PEP 723](https://peps.python.org/pep-0723/);
-  `uv` resolves its dependencies, `rich` and `textual`, both used only by the dashboard).
+- `tauceti_worker/`: the worker package, split by concern — `constants`, `config`, `paths`,
+  `github`, `quota`, `review_state`, `survey`, `round`, `agents`, `work_units`, `loop`, `tui`,
+  and `cli` (the entry point). `rich`/`textual` are imported lazily and only by `tui`.
+- `tauceti`: a small PEP 723 `uv` shim ([PEP 723](https://peps.python.org/pep-0723/)) so
+  `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
+  `tauceti` console script (`tauceti_worker.cli:cli_main`).
 - `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
-  these on `PATH` inside a round, so they stay shell.
+  these on `PATH` inside a round, so they stay shell. (The wheel bundles them into the package.)
 - `prompts/*.md`: the per-task agent prompts.
-- `tests/`: `parity_selectors.py`, `lifecycle.sh`, `agent_cmds.py`, `claude_config_dir.py`,
-  `claude_keychain.py`, `contest_claim.py`, `inflight_review.py`, `ledger_blocking.py`,
-  `dashboard.py`, `mirror_creds.py`, `round_group_sweep.py`.
+- `tests/`: plain `python3 tests/<name>.py` scripts (`dashboard.py` runs under `uv run`), driven
+  by `tests/run-all`; plus `lifecycle.sh`. Each loads the package and exercises one concern.
 - `checkouts/`, `state/`, `logs/`: runtime only, git-ignored.
