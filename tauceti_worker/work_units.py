@@ -20,7 +20,7 @@ from .agents import (
     run_in_bubble,
     run_to_logfile,
 )
-from .config import Config, Die, NoProgress, log, roadmap_areas, roadmap_skip, warn_red
+from .config import Config, Die, NoProgress, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
     AGENT_NAMES,
     CONTEST_CLAIM_TTL,
@@ -32,6 +32,7 @@ from .constants import (
     TAUCETI,
 )
 from .github import GitHub, GitHubError, gh_run, me
+from .intentions import claimed_avoid_list
 from .paths import HERE
 from .review_state import ReviewState
 from .round import Claims, RoundContext
@@ -452,6 +453,11 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # Never tell the agent to avoid the very area it's pinned to (a contradiction); the pinned area is
     # already excluded from the auto pick above, so this only matters for an explicit --roadmap-only.
     skip_str = ", ".join(a for a in skip if a != only) or "none"
+    # Cross-contributor claims: avoid targets others have claimed on the intentions board. Soft and
+    # fail-open; skipped for the "any" roam (no single area to scope the query to) and when opted out.
+    claimed_str = "none"
+    if respect_claims() and only not in ("any", ""):
+        claimed_str = claimed_avoid_list(w.gh, only)
     refs = w.cfg.state / "refs"
     if not fetch_ref(ROADMAP, refs / "roadmap"):
         raise Die(f"fetch {ROADMAP} failed")
@@ -466,6 +472,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 HERE / "prompts" / "roadmap.md",
                 ONLY=only,
                 SKIP=skip_str,
+                CLAIMED=claimed_str,
                 AGENT=opts.agent_name,
                 ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
                 REVIEW_DIR="/opt/review",
@@ -479,6 +486,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         HERE / "prompts" / "roadmap.md",
         ONLY=only,
         SKIP=skip_str,
+        CLAIMED=claimed_str,
         AGENT=opts.agent_name,
         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
         REVIEW_DIR=str(refs / "review"),

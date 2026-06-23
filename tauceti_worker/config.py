@@ -34,6 +34,23 @@ def roadmap_skip() -> list[str]:
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+def roadmap_extra_identities() -> list[str]:
+    """Additional GitHub logins, beyond the worker's own `gh auth` identity, whose registered
+    intentions this worker should treat as its own (so it won't avoid targets they've claimed).
+    Comma-separated, read live from TAUCETI_ROADMAP_EXTRA_IDENTITIES; deduped and lowercased.
+    Returns [] when unset/blank. Never hardcodes an account: who the worker is is whoever ran
+    `gh auth`; this only widens that set when the operator opts in."""
+    raw = os.environ.get("TAUCETI_ROADMAP_EXTRA_IDENTITIES", "")
+    return sorted({tok.lower() for tok in (t.strip() for t in raw.split(",")) if tok})
+
+
+def respect_claims() -> bool:
+    """Whether roadmap workers avoid targets claimed by other contributors on the intentions
+    board. On by default; read live from TAUCETI_RESPECT_CLAIMS so --ignore-claims (which sets it
+    false) is inherited by loop children."""
+    return os.environ.get("TAUCETI_RESPECT_CLAIMS", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _only_label(sv=None) -> str:
     """Friendly render of the roadmap-only area for the status bar. Prefers the survey's sanitized
     value ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""

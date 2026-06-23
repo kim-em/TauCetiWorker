@@ -189,6 +189,18 @@ class GitHub:
             raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
         return json.loads(p.stdout or "[]")
 
+    def issue_list(self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200) -> list[dict]:
+        """List issues in `repo` (explicit, since the client is bound to its own repo), filtered by
+        ALL of `labels` (repeated --label = AND; gh handles slashes in label names). Each dict has
+        the requested `fields`. Raises GitHubError on failure."""
+        args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
+        for label in labels or []:
+            args += ["--label", label]
+        p = self._gh(args)
+        if p.returncode != 0:
+            raise GitHubError(f"gh issue list failed: {p.stderr.strip()}")
+        return json.loads(p.stdout or "[]")
+
     def pr_view(self, pr: int, fields: list[str]) -> dict | None:
         p = self._gh(["pr", "view", str(pr), "--repo", self.repo, "--json", ",".join(fields)])
         if p.returncode != 0:

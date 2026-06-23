@@ -109,6 +109,16 @@ To stay out of areas other contributors are working on, exclude them with
 `x` key): skipped areas drop out of the random pick and the all-areas case.
 `--roadmap-only` wins if it names a skipped area.
 
+Within an area, roadmap workers also respect finer-grained **claims** registered by other
+contributors on the [intentions board](https://github.com/leanprover-community/intentions):
+an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that someone has
+claimed is treated as theirs, and the worker is told not to author it. "You" is your own
+`gh auth` identity; if you run workers under several accounts (or coordinate with someone
+whose intentions you're fulfilling), list those logins with
+`--roadmap-extra-identities <login>[,<login>...]` (or `TAUCETI_ROADMAP_EXTRA_IDENTITIES`) so
+the worker doesn't avoid your own side's claims. This is on by default and is cooperative
+(soft, fail-open); `--ignore-claims` (or `TAUCETI_RESPECT_CLAIMS=false`) opts out.
+
 ### Which agent: `--agent`
 
 `--agent` is independent of `--only`, so any kind of work can run on any agent:
@@ -242,6 +252,8 @@ is in `tauceti work -h`.
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
+| `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
 | `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its `$HOME`. |
@@ -258,6 +270,8 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_WORKER_ID` | `default` | Default for `--worker-id`. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own, for `--roadmap-extra-identities`. |
+| `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |

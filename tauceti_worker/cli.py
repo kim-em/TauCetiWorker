@@ -157,6 +157,24 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "$TAUCETI_ROADMAP_SKIP for this run",
     )
     p.add_argument(
+        "--roadmap-extra-identities",
+        dest="roadmap_extra_identities",
+        default=None,
+        metavar="LOGIN[,LOGIN...]",
+        help="additional GitHub logins, beyond your `gh auth` identity, whose registered "
+        "intentions this worker should treat as its own (so it won't avoid targets they've "
+        "claimed on the intentions board). Comma-separated. Overrides "
+        "$TAUCETI_ROADMAP_EXTRA_IDENTITIES for this run",
+    )
+    p.add_argument(
+        "--ignore-claims",
+        dest="respect_claims",
+        action="store_false",
+        default=None,
+        help="opt OUT of avoiding roadmap targets other contributors have claimed on the "
+        "intentions board (claim-respect is on by default). Sets $TAUCETI_RESPECT_CLAIMS=false",
+    )
+    p.add_argument(
         "--ignore-quota",
         dest="ignore_quota",
         action="store_true",
@@ -316,6 +334,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # --roadmap-extra-identities and --ignore-claims override the env and are inherited by loop
+    # children (read live via roadmap_extra_identities() / respect_claims()).
+    if getattr(args, "roadmap_extra_identities", None) is not None:
+        os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
+    if getattr(args, "respect_claims", None) is False:
+        os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
     # --stream restores live agent output (default redirects it to a log file). Set in the env so loop
     # children inherit it.
     if getattr(args, "stream", False):
