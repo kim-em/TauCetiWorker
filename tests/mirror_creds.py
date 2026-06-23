@@ -3,7 +3,8 @@
 WITHOUT the operator's real refresh token (so nothing in the worker can rotate the single-use token), and
 only when the source is fresher. Claude: the refresh field is dropped; codex: it is replaced by a constant
 placeholder (codex-cli >=0.139 won't parse auth.json without the field, but never uses it given a valid
-access token). Never refreshes, never blanks a good copy on a torn source read."""
+access token). Never refreshes, never blanks a good copy on a torn source read, and follows an operator
+account switch even when the new account's token carries an earlier expiry."""
 
 import json
 import os
@@ -107,18 +108,19 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-# 3) Source expiry OLDER than dest (a torn read) → skip; dest left intact.
+# 3) Operator account SWITCH: the new account's token has an EARLIER expiry than the copy we hold (each
+#    account refreshes independently, so absolute expiries are unrelated). The switch MUST be mirrored —
+#    a stale expiry guard used to skip this, wedging the worker on the prior account until the two accounts'
+#    expiries happened to cross. src is authoritative; trust the changed token.
 tmp = Path(tempfile.mkdtemp())
 try:
     cfg, sc, sx, dc, dx = setup(tmp)
-    sc.write_text(json.dumps(claude_block("TORN", 50)))  # different token but older expiry
-    dc.write_text(json.dumps(claude_block("GOOD", 100, rt=None)))
+    sc.write_text(json.dumps(claude_block("SWITCHED", 50)))  # different account, earlier expiry
+    dc.write_text(json.dumps(claude_block("PRIOR", 100, rt=None)))
     tc.mirror_creds(cfg)
-    check(
-        "claude: older-expiry source is not mirrored",
-        json.loads(dc.read_text())["claudeAiOauth"]["accessToken"],
-        "GOOD",
-    )
+    out_c = json.loads(dc.read_text())["claudeAiOauth"]
+    check("claude: account switch is mirrored despite earlier expiry", out_c["accessToken"], "SWITCHED")
+    check("claude: switched copy still has no refresh token", "refreshToken" in out_c, False)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
