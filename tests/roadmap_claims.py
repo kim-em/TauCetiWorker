@@ -40,23 +40,42 @@ representation theorems:
 
 _No response_
 """
-check("parse_scope pulls the Items in scope section", it.parse_scope(form_body)
-      == "representation theorems: - Bernstein - Bochner (finite-dim)")
-check("parse_scope strips HTML-comment markers",
-      it.parse_scope("### Items in scope\n\nfoo <!--tauceti-claim:v1 {\"x\":1}--> bar") == "foo bar")
+check(
+    "parse_scope pulls the Items in scope section",
+    it.parse_scope(form_body) == "representation theorems: - Bernstein - Bochner (finite-dim)",
+)
+check(
+    "parse_scope strips HTML-comment markers",
+    it.parse_scope('### Items in scope\n\nfoo <!--tauceti-claim:v1 {"x":1}--> bar') == "foo bar",
+)
 check("parse_scope falls back to whole body when no section", it.parse_scope("just a sentence") == "just a sentence")
 check("parse_scope empty -> empty", it.parse_scope("") == "")
 
 
 # --- select_foreign --------------------------------------------------------
 issues = [
-    {"number": 1, "url": "u1", "title": "A", "body": "### Items in scope\n\nobject API",
-     "assignees": [{"login": "kim-em"}]},                       # ours
-    {"number": 2, "url": "u2", "title": "B", "body": "### Items in scope\n\nrepresentation theorems",
-     "assignees": [{"login": "mrdouglasny"}]},                  # foreign
+    {
+        "number": 1,
+        "url": "u1",
+        "title": "A",
+        "body": "### Items in scope\n\nobject API",
+        "assignees": [{"login": "kim-em"}],
+    },  # ours
+    {
+        "number": 2,
+        "url": "u2",
+        "title": "B",
+        "body": "### Items in scope\n\nrepresentation theorems",
+        "assignees": [{"login": "mrdouglasny"}],
+    },  # foreign
     {"number": 3, "url": "u3", "title": "C", "body": "unclaimed", "assignees": []},  # registered, unclaimed
-    {"number": 4, "url": "u4", "title": "D", "body": "### Items in scope\n\npaired",
-     "assignees": [{"login": "Kim-Em"}, {"login": "someone"}]},  # co-assigned incl. ours (case-insensitive)
+    {
+        "number": 4,
+        "url": "u4",
+        "title": "D",
+        "body": "### Items in scope\n\npaired",
+        "assignees": [{"login": "Kim-Em"}, {"login": "someone"}],
+    },  # co-assigned incl. ours (case-insensitive)
 ]
 own = {"kim-em"}
 foreign = it.select_foreign(issues, own)
@@ -66,15 +85,13 @@ check("foreign claim carries holders", foreign and foreign[0].holders == ["mrdou
 check("foreign claim carries parsed scope", foreign and foreign[0].scope == "representation theorems")
 
 # extra identities widen "ours": mrdouglasny becomes ours too
-check("extra identities suppress a foreign claim",
-      it.select_foreign(issues, {"kim-em", "mrdouglasny"}) == [])
+check("extra identities suppress a foreign claim", it.select_foreign(issues, {"kim-em", "mrdouglasny"}) == [])
 
 
 # --- claimed_block ---------------------------------------------------------
 check("claimed_block empty -> none", it.claimed_block([]) == "none")
 block = it.claimed_block(foreign)
-check("claimed_block lists holder + number + scope",
-      block == "- (claimed by @mrdouglasny, #2) representation theorems")
+check("claimed_block lists holder + number + scope", block == "- (claimed by @mrdouglasny, #2) representation theorems")
 
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

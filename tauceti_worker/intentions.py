@@ -42,7 +42,7 @@ def parse_scope(body: str) -> str:
     if not body:
         return ""
     m = _SCOPE_RE.search(body)
-    text = (m.group(1) if m else body)
+    text = m.group(1) if m else body
     text = _HTML_COMMENT_RE.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
 

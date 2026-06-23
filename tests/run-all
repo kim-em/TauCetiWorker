@@ -30,6 +30,7 @@ RUN_STDLIB=(
   quota_cache_fp.py
   quota_reason.py
   review_daily_cap.py
+  roadmap_claims.py
   round_group_sweep.py
   spread_candidates.py
 )
