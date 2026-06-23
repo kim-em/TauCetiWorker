@@ -8,7 +8,7 @@ import time
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
-from .quota import Provider, Quota, quota_line
+from .quota import Provider, Quota, _unavail_reason, quota_line
 from .round import run_round_subprocess
 
 
@@ -29,8 +29,32 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             if openrouter:
                 model = agent  # pay-per-token; no quota wait
             elif ignore_quota and not quota_cmd:
+                # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
+                # still read the usage endpoint and wait out a HARD block: a window at 100% (exhausted),
+                # usage we cannot read (fail-closed), or the endpoint itself refusing to answer (its own
+                # 429 / a network failure). Only a soft over-pace block — real quota left, merely ahead of
+                # the burn line — runs through here. Without this a pinned `--agent claude` worker re-fires
+                # every green PR into a rate-limited subscription, burning a clone + engine launch each
+                # round to post an all-error scoreboard.
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
+                _chosen, snap = choose_model(cfg, agent, quota_cmd)
+                prov = snap.get(agent)
+                verdict = _ignore_quota_verdict(_chosen, prov)
+                if verdict == "wait":
+                    why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
+                    # Honor the endpoint's Retry-After, else wait for the blocking window's reset
+                    # (capped), else poll. Never sooner than POLL, so we don't re-trip a 429.
+                    nap = max(POLL, int(prov.retry_after) if (prov and prov.retry_after) else 0)
+                    if prov and not prov.retry_after and prov.next_eligible:
+                        nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
+                    log(
+                        f"quota: {agent} hard-blocked ({why}) — --ignore-quota still waits out a hard block; sleeping {nap}s"
+                    )
+                    time.sleep(nap)
+                    continue
+                if verdict == "over-pace":
+                    log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
                 model = agent
             else:
                 model, snap = choose_model(cfg, agent, quota_cmd)
@@ -85,6 +109,24 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     except KeyboardInterrupt:
         log("loop interrupted — stopping")
         return 130
+
+
+def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
+    """What a --ignore-quota loop does with the pacer snapshot for its pinned agent.
+
+    --ignore-quota overrides PACING, not AVAILABILITY:
+      "run"       — the provider is available (under pace), launch as usual.
+      "over-pace" — a SOFT block: real quota remains, we are only ahead of the burn line. This is the
+                    block --ignore-quota exists to override, so launch anyway.
+      "wait"      — a HARD block: a window at 100% (exhausted), usage we cannot read (fail-closed), or
+                    the usage endpoint refusing to answer (its own 429 / a network error leaves `prov`
+                    with no windows). Firing here only hits a dead provider, so back off even under
+                    --ignore-quota.
+    """
+    if chosen is not None:
+        return "run"
+    soft = prov is not None and _unavail_reason(prov)[0]
+    return "over-pace" if soft else "wait"
 
 
 def choose_model(cfg: Config, agent: str, quota_cmd: str | None) -> tuple[str | None, dict]:
