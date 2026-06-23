@@ -24,6 +24,7 @@ RUN_STDLIB=(
   claude_keychain.py
   contest_claim.py
   github_ratelimit.py
+  ignore_quota_hardblock.py
   inflight_review.py
   ledger_blocking.py
   mirror_creds.py

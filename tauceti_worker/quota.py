@@ -543,6 +543,12 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
     spent = [w for w in gating if w.status == "exhausted"]
     if spent:
         return False, ", ".join(f"{w.name} exhausted" for w in spent)
+    # An unreadable gating window is fail-closed (hard) and must dominate a co-occurring over-pace
+    # window: we cannot tell the unknown one is not exhausted, so a partial payload (one window known and
+    # merely ahead of pace, another null) must NOT read as a soft pacing pause — under --ignore-quota that
+    # would fire blind into a provider we can't confirm is up.
+    if any(w.status == "unknown" for w in gating):
+        return False, "usage unknown"
     ahead = [w for w in gating if w.status == "over-pace"]
     if ahead:
         bits = []
@@ -550,8 +556,6 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
             left = "" if w.used is None else f", {max(0, round(100 - w.used))}% left"
             bits.append(f"{w.name} ahead of pace{left}")
         return True, "; ".join(bits)
-    if any(w.status == "unknown" for w in gating):
-        return False, "usage unknown"
     return False, "unavailable"
 
 

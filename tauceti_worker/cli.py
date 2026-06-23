@@ -178,8 +178,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--ignore-quota",
         dest="ignore_quota",
         action="store_true",
-        help="ignore the quota pacer; run the requested --agent regardless of pace "
-        "(needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)",
+        help="ignore the quota PACER (run the requested --agent even when ahead of the burn pace); "
+        "a HARD block — a window at 100%%, unreadable usage, or the usage endpoint refusing to answer — "
+        "still backs off (needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)",
     )
     p.add_argument(
         "--quota-cmd",

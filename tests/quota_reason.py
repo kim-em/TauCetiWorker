@@ -46,6 +46,11 @@ reason_cases = [
         (False, "usage unknown"),
     ),
     (
+        "unknown dominates a co-occurring over-pace window (fail-closed, not soft)",
+        prov(W("session", None, None, "unknown"), W("weekly", 60.0, 40.0, "over-pace")),
+        (False, "usage unknown"),
+    ),
+    (
         "weekly_sonnet is ignored; only the real gate is reported",
         prov(
             W("session", 70.0, 40.0, "over-pace"),
