@@ -230,15 +230,20 @@ def _mirror_creds_file(
     block_key: str,
     tok_key: str,
     rt_key: str,
-    exp_key: str | None,
     rt_placeholder: str | None = None,
 ) -> None:
-    """Copy src -> dst WITHOUT the operator's real refresh token, iff src is fresher than dst. Freshness is
-    keyed on the access token changing (the operator's external writer only ever moves forward); a src
-    whose expiry is OLDER than dst's is treated as a torn read and skipped. A missing/unreadable src leaves
-    dst untouched — never blank a good copy. The real refresh token is never copied through, so nothing in
-    the worker (pacer or spawned agent) can rotate the operator's single-use token and invalidate their
-    copy.
+    """Copy src -> dst WITHOUT the operator's real refresh token, whenever src's access token differs from
+    the copy we hold (or that copy still carries a real refresh token to strip). src is the operator's
+    single-writer live credential file and is authoritative — including across an account switch, where the
+    operator rotates to a *different* account whose token carries an unrelated (often earlier) expiry. We do
+    NOT compare expiry: a torn read of src surfaces as invalid JSON, which `_read_json_file` turns into None
+    and we skip on below (dst left untouched), so a partial read can never present as a valid-but-stale
+    credential for an expiry check to catch. Within one account the operator only refreshes forward, so the
+    only thing an expiry comparison ever actually rejected was a legitimate account switch to a token with an
+    earlier expiry — wedging the worker on the prior account until the two accounts' expiries happened to
+    cross. A missing/unreadable src leaves dst untouched — never blank a good copy. The real refresh token is
+    never copied through, so nothing in the worker (pacer or spawned agent) can rotate the operator's
+    single-use token and invalidate their copy.
 
     rt_placeholder: when None, the refresh-token field is omitted entirely (Claude). When set, the field is
     written with this constant value instead — codex-cli >=0.139 refuses to parse an auth.json that lacks
@@ -256,12 +261,10 @@ def _mirror_creds_file(
     dblk = dd.get(block_key) or {}
     if dblk.get(tok_key) == stok and dblk.get(rt_key) == rt_placeholder:
         return  # access token current AND refresh field already normalized
-    # else: a changed access token, or a real refresh token still present (e.g. the once-only isolate_home
-    # seed copied the full creds) — re-write, replacing the refresh token with the placeholder (or omitting).
-    if exp_key:  # torn-read guard: don't move expiry backwards
-        se, de = sblk.get(exp_key), dblk.get(exp_key)
-        if isinstance(se, (int, float)) and isinstance(de, (int, float)) and se < de:
-            return
+    # else: a changed access token (a same-account refresh OR a switch to a different account), or a real
+    # refresh token still present (e.g. the once-only isolate_home seed copied the full creds) — re-write,
+    # replacing the refresh token with the placeholder (or omitting). src is authoritative; we do not second-
+    # guess it by comparing expiry (see the docstring — that only ever wedged the worker across switches).
     out = dict(sd)
     blk = dict(sblk)
     if rt_placeholder is None:
@@ -280,7 +283,8 @@ def mirror_creds(cfg: Config) -> None:
     """Keep an isolated worker's credential copies in step with the operator's real, externally-refreshed
     files — without ever using a refresh token. The operator runs their own processes that rotate
     ~/.claude/.credentials.json and ~/.codex/auth.json (they own the single-use refresh token); the worker
-    only READS those and mirrors a fresher access token into its isolated home, refresh token stripped.
+    only READS those and mirrors any changed access token into its isolated home, refresh token stripped
+    (including across an operator account switch, whose new token may carry an earlier expiry).
     No-op when not isolated (no seed marker ⇒ the worker reads the live file directly) or on macOS (the
     Keychain is the store; the keychain-first pacer and _ensure_claude_creds_for_bubble handle it). Safe to
     call every pacer cycle and before every bubble launch: in steady state it is two small reads + a string
@@ -296,7 +300,6 @@ def mirror_creds(cfg: Config) -> None:
             block_key="claudeAiOauth",
             tok_key="accessToken",
             rt_key="refreshToken",
-            exp_key="expiresAt",
         )
     src_codex = _read_marker(cfg.home / ".codex" / ".tauceti-creds-source")
     if src_codex:  # absent on homes seeded before this marker existed
@@ -306,7 +309,6 @@ def mirror_creds(cfg: Config) -> None:
             block_key="tokens",
             tok_key="access_token",
             rt_key="refresh_token",
-            exp_key=None,
             rt_placeholder=CODEX_RT_PLACEHOLDER,
         )
 
