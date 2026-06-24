@@ -34,6 +34,7 @@ from .constants import (
 from .github import GitHub, GitHubError, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import HERE
+from .quota import mirror_creds
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
@@ -82,6 +83,13 @@ def _bubble(stage: str, opts: RoundOpts) -> bool:
 
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
+    # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
+    # before any work runs. The quota pacer does this too, but the --ignore-quota + pinned --agent
+    # fast path in resolve_work_model skips the pacer, and --host review never hits the bubble-seed
+    # mirror — so without this an operator token refresh (or account switch) never reaches a host
+    # worker, and its mirror ages out into 401s that silently burn review rounds. No-op when not
+    # isolated / on macOS, two reads + a compare in steady state, so it is safe every round.
+    mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
