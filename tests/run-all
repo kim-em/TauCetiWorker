@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Run the whole test suite and report pass/fail. Exit 0 only if every test passes.
+#
+# The tests are standalone scripts (not pytest): each loads the `tauceti` program and exits 0/1.
+# This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
+#   - most are stdlib-only         -> `uv run python <file>`
+#   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
+#   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
+#   - lifecycle is bash (flock/signals); it resolves its own python3
+#   - egress needs the bubble sandbox/proxy              -> skipped here
+# The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
+#
+# Usage: tests/run-all [--fail-fast]
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+FAIL_FAST=0
+[ "${1:-}" = "--fail-fast" ] && FAIL_FAST=1
+
+# stdlib-only python tests, run with the uv-provided interpreter
+RUN_STDLIB=(
+  agent_cmds.py
+  claude_config_dir.py
+  claude_keychain.py
+  contest_claim.py
+  github_ratelimit.py
+  ignore_quota_hardblock.py
+  inflight_review.py
+  ledger_blocking.py
+  mirror_creds.py
+  quota_cache_fp.py
+  quota_reason.py
+  review_daily_cap.py
+  roadmap_claims.py
+  round_group_sweep.py
+  safe_exists.py
+  spread_candidates.py
+)
+# special-cased python tests (handled explicitly below)
+RUN_SPECIAL=(parity_selectors.py dashboard.py)
+# bash tests
+RUN_SH=(lifecycle.sh)
+# deliberately not run here (needs the bubble sandbox/proxy)
+SKIP=(egress.sh)
+
+pass=0; fail=0; failed=()
+
+# run <label> <cmd...> : run a test, tally the result, honour --fail-fast
+run() {
+  local label="$1"; shift
+  echo "== $label =="
+  if "$@"; then
+    echo "  [PASS] $label"; pass=$((pass + 1))
+  else
+    echo "  [FAIL] $label (rc=$?)"; fail=$((fail + 1)); failed+=("$label")
+    [ "$FAIL_FAST" = 1 ] && { summary; exit 1; }
+  fi
+  echo
+}
+
+summary() {
+  echo "================================================================"
+  echo "run-all: $pass passed, $fail failed"
+  ((${#failed[@]})) && printf '  failed: %s\n' "${failed[@]}"
+  ((${#SKIP[@]}))   && printf '  skipped (needs sandbox): %s\n' "${SKIP[@]}"
+}
+
+# --- inventory guard: every tests/*.py and tests/*.sh must be classified --------------------------
+# Catches a newly-added test that nobody wired in here: better a loud CI failure than a silent skip.
+known=(" ${RUN_STDLIB[*]} ${RUN_SPECIAL[*]} ${RUN_SH[*]} ${SKIP[*]} ")
+unclassified=()
+for f in tests/*.py tests/*.sh; do
+  base=$(basename "$f")
+  [ "$base" = "run-all" ] && continue
+  [[ "${known[*]}" == *" $base "* ]] || unclassified+=("$base")
+done
+if ((${#unclassified[@]})); then
+  echo "ERROR: test file(s) not classified in tests/run-all (add to a RUN_* or SKIP list):" >&2
+  printf '  - %s\n' "${unclassified[@]}" >&2
+  exit 2
+fi
+
+# --- run ------------------------------------------------------------------------------------------
+for t in "${RUN_STDLIB[@]}"; do
+  run "$t" uv run python "tests/$t"
+done
+
+run parity_selectors.py uv run python tests/parity_selectors.py tests/fixtures/pr_selectors.json
+run dashboard.py uv run --script tests/dashboard.py
+
+# lifecycle.sh resolves its own python; hand it the uv-selected interpreter so the matrix
+# actually covers it (otherwise it would always use the runner's default python3).
+PY="$(uv run python -c 'import sys; print(sys.executable)')"
+export PY
+for t in "${RUN_SH[@]}"; do
+  run "$t" bash "tests/$t"
+done
+
+summary
+[ "$fail" -eq 0 ]

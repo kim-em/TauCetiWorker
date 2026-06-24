@@ -10,16 +10,36 @@ requires-python = ">=3.11"
 dependencies = ["rich>=13", "textual>=8,<9"]
 
 [project.scripts]
-tauceti = "tauceti_worker.__main__:cli_main"
+tauceti = "tauceti_worker.cli:cli_main"
 
-# tauceti is one script that needs its prompts/ and scripts/ wrappers at runtime. Install them as
-# siblings of the module (tauceti_worker/{prompts,scripts}) so the same `HERE / "prompts"` lookup the
-# script uses from a clone also works once installed. (No package dir in the source tree: the files
-# stay top-level for `./tauceti`; hatchling maps them into the package only in the built wheel.)
+# The worker is the tauceti_worker/ package. Its prompts/ and scripts/ wrappers live at the repo
+# root for the `./tauceti` shim (HERE resolves to the repo root in a checkout); the wheel bundles
+# them INTO the package (tauceti_worker/{prompts,scripts}) so the same `HERE / "prompts"` lookup
+# works once installed (HERE then resolves to the package dir — see tauceti_worker/paths.py).
 [tool.hatch.build.targets.wheel]
-bypass-selection = true
+packages = ["tauceti_worker"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"tauceti" = "tauceti_worker/__main__.py"
 "prompts" = "tauceti_worker/prompts"
 "scripts" = "tauceti_worker/scripts"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+# `tauceti` is the program but has no .py extension, so ruff won't pick it up by default.
+extend-include = ["tauceti"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501 (line length): the formatter owns code width; long inline comments/URLs are left intact.
+# UP031 (printf-format): the tests build jq/JSON filter strings with literal braces, where
+#   percent-format is clearer than f-strings that would have to escape every brace.
+ignore = ["E501", "UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# The ./tauceti shim must put the checkout on sys.path before importing the package, so its
+# `from tauceti_worker.cli import ...` deliberately follows a statement (E402).
+"tauceti" = ["E402"]
+# Each test puts the repo root on sys.path before `import tauceti_worker as tc`, so the package
+# import deliberately follows statements (E402).
+"tests/*" = ["E402"]

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # The worker is stdlib-only (bar the TUI's rich/textual), so test on one interpreter — the
+      # latest uv ships — rather than a per-version matrix. requires-python >=3.11 is a declaration.
+      UV_PYTHON: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Run the test suite
+        run: ./tests/run-all
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      # Pin ruff so a new release's rules/formatter can't turn CI red without a code change here.
+      - name: ruff check
+        run: uvx ruff@0.15.18 check .
+      - name: ruff format --check
+        run: uvx ruff@0.15.18 format --check .
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
+      # (where B, an echo, always succeeds), while still failing on real warnings and errors.
+      - name: ShellCheck
+        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create tests/*.sh tests/run-all
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Build the wheel
+        run: uv build
+      # uv build proves the artifact builds; this proves the force-include mapping (prompts/ and
+      # scripts/ into the tauceti_worker package) works once installed, and that the console script
+      # runs. Run the import check from /tmp with -P so the source-tree tauceti_worker/ on the
+      # checkout root can't shadow the installed package (whose prompts/scripts sit beside it).
+      - name: Install smoke test
+        run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/tauceti --help
+          cd /tmp && /tmp/smoke/bin/python -P - <<'PY'
+          import pathlib
+          import tauceti_worker.__main__ as m
+          base = pathlib.Path(m.__file__).parent
+          assert (base / "prompts").is_dir(), "prompts/ missing from the installed wheel"
+          assert (base / "scripts").is_dir(), "scripts/ missing from the installed wheel"
+          print("bundled prompts/ and scripts/ present")
+          PY

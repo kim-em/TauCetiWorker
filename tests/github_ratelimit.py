@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""gh_run waits out a GitHub rate limit and retries, rather than failing the round and discarding the
+agent's (expensive) work.
+
+A 403 mid-round used to fail the round outright — and, for a review, count against the review-ERROR cap
+that escalates a healthy PR to a human (the #302 false-escalation in the field log). Now a rate-limited
+`gh` call sleeps until the limit clears and retries in place, bounded by GH_INROUND_WAIT so it can't blow
+ROUND_TIMEOUT; the loop-level preflight (cmd_loop) waits out the longer hourly primary reset. This harness
+pins gh_run's decisions without touching the live API: a scripted FakeRun replays (returncode, stderr)
+tuples and a stubbed sleep records the waits.
+
+Exit 0 = all cases agree; 1 = a mismatch.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
+
+PRIMARY = "HTTP 403: API rate limit exceeded for user ID 477956"
+SECONDARY = "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."
+
+fails = 0
+
+
+def check(name, got, want):
+    global fails
+    ok = got == want
+    fails += not ok
+    print(f"[{'OK ' if ok else 'BAD'}] {name}: got {got!r} want {want!r}")
+
+
+class FakeRun:
+    """Replays a scripted list of (returncode, stderr) for each tc.run() call; records argv seen."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        rc, err = self.script.pop(0)
+        return subprocess.CompletedProcess(argv, rc, stdout="", stderr=err)
+
+
+def with_stubs(run_script, budget=None):
+    """Install a FakeRun and a sleep recorder; budget stubs github_budget() (so primary waits are
+    deterministic without a real rate_limit probe). Returns (FakeRun, slept-list)."""
+    fr = FakeRun(run_script)
+    slept = []
+    tc.github.run = fr
+    tc.time.sleep = lambda s: slept.append(s)
+    tc.github.github_budget = lambda: budget
+    return fr, slept
+
+
+def main() -> int:
+    orig_run, orig_sleep, orig_budget = tc.github.run, tc.time.sleep, tc.github.github_budget
+
+    # Classification: secondary first (its text also contains "rate limit").
+    check("classify primary", tc._gh_rate_kind(PRIMARY), "primary")
+    check("classify secondary", tc._gh_rate_kind(SECONDARY), "secondary")
+    check("classify non-limit", tc._gh_rate_kind("HTTP 404: Not Found"), None)
+
+    # Secondary limit clears on the second try: one wait of GH_SECONDARY_BASE, then success.
+    fr, slept = with_stubs([(1, SECONDARY), (0, "")])
+    p = tc.gh_run(["gh", "pr", "list"])
+    check("secondary retries to success rc", p.returncode, 0)
+    check("secondary waited once", slept, [tc.GH_SECONDARY_BASE])
+    check("secondary made two gh calls", len(fr.calls), 2)
+
+    # Secondary give-up: a wait past the in-round budget surfaces the error rather than overshooting it.
+    fr, slept = with_stubs([(1, SECONDARY)])
+    p = tc.gh_run(["gh", "pr", "list"], max_wait=1)
+    check("secondary over-budget surfaces error", p.returncode, 1)
+    check("secondary over-budget did not sleep", slept, [])
+
+    # Non-rate-limit failure passes straight through, no retry, no sleep.
+    fr, slept = with_stubs([(1, "HTTP 404: Not Found")])
+    p = tc.gh_run(["gh", "pr", "view", "9"])
+    check("non-limit returns the failure", p.returncode, 1)
+    check("non-limit did not sleep", slept, [])
+    check("non-limit made one call", len(fr.calls), 1)
+
+    # Primary limit surfaces IMMEDIATELY (the loop preflight waits the hourly reset out; waiting in a
+    # round under ROUND_TIMEOUT would just be SIGKILLed). No retry, no sleep.
+    fr, slept = with_stubs([(1, PRIMARY)])
+    p = tc.gh_run(["gh", "pr", "list"])
+    check("primary surfaces the error", p.returncode, 1)
+    check("primary did not sleep", slept, [])
+    check("primary made one call", len(fr.calls), 1)
+
+    # github_budget parses the rate_limit JSON object into per-bucket tuples (restore the real fn).
+    tc.github.github_budget = orig_budget
+
+    class BudgetRun:
+        def __call__(self, argv, **kw):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"core":[4321,1750000000],"graphql":[4999,1750000100]}', stderr=""
+            )
+
+    tc.github.run = BudgetRun()
+    check(
+        "github_budget parses both buckets",
+        tc.github_budget(),
+        {"core": (4321, 1750000000), "graphql": (4999, 1750000100)},
+    )
+
+    tc.github.run, tc.time.sleep, tc.github.github_budget = orig_run, orig_sleep, orig_budget
+
+    # pr_progress_state: head + (issue + review-thread) comment count from one GraphQL payload.
+    class GHGraphql(tc.GitHub):
+        def __init__(self, payload, rest_counts=None):
+            super().__init__("owner/repo")
+            self._payload, self._rest = payload, rest_counts
+
+        def _gh(self, args):
+            return subprocess.CompletedProcess(args, 0, stdout=__import__("json").dumps(self._payload), stderr="")
+
+        def issue_comments(self, pr):
+            return [{}] * self._rest[0] if self._rest else None
+
+        def review_comments(self, pr):
+            return [{}] * self._rest[1] if self._rest else None
+
+    def payload(head, issue_n, thread_counts, thread_total=None):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": head,
+                        "comments": {"totalCount": issue_n},
+                        "reviewThreads": {
+                            "totalCount": thread_total if thread_total is not None else len(thread_counts),
+                            "nodes": [{"comments": {"totalCount": c}} for c in thread_counts],
+                        },
+                    }
+                }
+            }
+        }
+
+    gh = GHGraphql(payload("abc123", 3, [2, 1]))
+    check(
+        "pr_progress_state counts head+issue+thread comments",
+        gh.pr_progress_state(7),
+        {"head": "abc123", "ncomments": 6},
+    )  # 3 + 2 + 1
+
+    # >100 threads: fall back to the exact paginated REST count (here 12 issue + 9 review = 21).
+    gh = GHGraphql(payload("def456", 99, [], thread_total=101), rest_counts=(12, 9))
+    check(
+        "pr_progress_state falls back to REST past 100 threads",
+        gh.pr_progress_state(8),
+        {"head": "def456", "ncomments": 21},
+    )
+    print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

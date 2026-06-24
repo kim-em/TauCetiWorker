@@ -12,8 +12,7 @@ Usage:
 
 Exit 0 = all selectors agree; 1 = a mismatch (prints the diff).
 """
-import importlib.machinery
-import importlib.util
+
 import json
 import subprocess
 import sys
@@ -23,14 +22,27 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
 # Load the `tauceti` single-file program as a module (no .py extension; main() is guarded).
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
-tc = importlib.util.module_from_spec(spec)
-sys.modules["tauceti"] = tc   # dataclasses resolves annotations via sys.modules[cls.__module__]
-spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
-FIELDS = ["number", "headRefOid", "headRefName", "headRepositoryOwner", "headRepository",
-          "isDraft", "statusCheckRollup", "author", "mergeable"]
-ME = tc.me()
+FIELDS = [
+    "number",
+    "headRefOid",
+    "headRefName",
+    "headRepositoryOwner",
+    "headRepository",
+    "isDraft",
+    "statusCheckRollup",
+    "author",
+    "mergeable",
+]
+try:
+    ME = tc.me()
+except tc.Die:
+    # This harness compares jq-vs-Python agreement, not specific PRs, so it holds for any login.
+    # When `gh` isn't authenticated (e.g. in CI), fall back to a placeholder so it still runs; the
+    # bot/fork/bump partitions of the fixture are exercised regardless of who ME is.
+    ME = "tauceti-ci-placeholder"
 TAUCETI = tc.TAUCETI
 
 
@@ -39,22 +51,24 @@ def jq(data, expr, args=None):
     p = subprocess.run(cmd, input=json.dumps(data), text=True, capture_output=True)
     if p.returncode != 0:
         raise SystemExit(f"jq failed: {p.stderr}")
-    return [json.loads(l) for l in p.stdout.splitlines() if l.strip()]
+    return [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
 
 
 def fetch_live():
-    p = subprocess.run(["gh", "pr", "list", "--repo", TAUCETI, "--state", "open", "--limit", "200",
-                        "--json", ",".join(FIELDS)], text=True, capture_output=True)
+    p = subprocess.run(
+        ["gh", "pr", "list", "--repo", TAUCETI, "--state", "open", "--limit", "200", "--json", ",".join(FIELDS)],
+        text=True,
+        capture_output=True,
+    )
     if p.returncode != 0:
         raise SystemExit(f"gh failed: {p.stderr}")
     return json.loads(p.stdout)
 
 
-def main():
-    if len(sys.argv) > 1:
-        data = json.loads(Path(sys.argv[1]).read_text())
-    else:
-        data = fetch_live()
+def run_checks(data, label):
+    """Run every selector both ways (independent jq vs Python from_json) over `data`; return the
+    mismatch count. Compares agreement, not specific PR numbers, so it is valid for any login/snapshot."""
+    print(f"--- {label} ({len(data)} PRs) ---")
     prs = [tc.PRInfo.from_json(d) for d in data]
     fails = 0
 
@@ -68,31 +82,62 @@ def main():
             fails += 1
 
     # n_reviewable: non-draft AND a build check SUCCESS (round.sh line 816-817).
-    check("reviewable*",
-          '.[] | select(.isDraft|not) '
-          '| select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))',
-          [p.number for p in prs if not p.is_draft and p.build_success])
+    check(
+        "reviewable*",
+        ".[] | select(.isDraft|not) "
+        '| select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))',
+        [p.number for p in prs if not p.is_draft and p.build_success],
+    )
 
-    # rebaseable: mine, non-draft, CONFLICTING (round.sh 832-835).
-    check("rebaseable",
-          '.[] | select(.isDraft|not) | select(.author.login=="%s") | select(.mergeable=="CONFLICTING")' % ME,
-          [p.number for p in prs if not p.is_draft and p.author == ME and p.mergeable == "CONFLICTING"])
+    # tended = a PR the maintenance stages act on: ours OR a FIRST-PARTY bot PR (bot-authored with its
+    # head branch in the base repo — the review bot's bump PRs; a fork/external bot is excluded).
+    OWNER = tc.TAUCETI_OWNER
+    tended = '(.author.login=="%s" or (.author.is_bot and .headRepositoryOwner.login=="%s"))' % (ME, OWNER)
 
-    # red_ci: mine, build check FAILED-ish (round.sh 878-882).
+    def is_tended(p):
+        return p.author == ME or (p.author_is_bot and p.head_owner == OWNER)
+
+    # rebaseable: tended, non-draft, CONFLICTING.
+    check(
+        "rebaseable",
+        '.[] | select(.isDraft|not) | select(%s) | select(.mergeable=="CONFLICTING")' % tended,
+        [p.number for p in prs if not p.is_draft and is_tended(p) and p.mergeable == "CONFLICTING"],
+    )
+
+    # fix-ci: tended, build check FAILED-ish, but NOT a bump PR (those go to the bump stage).
     fail_set = '"FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"'
-    check("red_ci",
-          '.[] | select(.author.login=="%s") '
-          '| select([.statusCheckRollup[]? | select(.name=="build") '
-          '| select(.conclusion | IN(%s))] | any)' % (ME, fail_set),
-          [p.number for p in prs if p.author == ME and p.build_failed])
+    check(
+        "fix-ci",
+        '.[] | select(%s) | select(.headRefName|startswith("bump-mathlib/")|not) '
+        '| select([.statusCheckRollup[]? | select(.name=="build") '
+        "| select(.conclusion | IN(%s))] | any)" % (tended, fail_set),
+        [p.number for p in prs if is_tended(p) and p.build_failed and not p.head_ref.startswith("bump-mathlib/")],
+    )
 
-    # bump: a hopscotch/lkg-bump PR (bot-authored) whose build is red.
-    check("bump (hopscotch)",
-          '.[] | select(.headRefName|startswith("hopscotch/")) '
-          '| select([.statusCheckRollup[]? | select(.name=="build") '
-          '| select(.conclusion | IN(%s))] | any)' % fail_set,
-          [p.number for p in prs if p.head_ref.startswith("hopscotch/") and p.build_failed])
+    # bump: a bump-mathlib PR (bot-authored) whose build is red.
+    check(
+        "bump (bump-mathlib)",
+        '.[] | select(.headRefName|startswith("bump-mathlib/")) '
+        '| select([.statusCheckRollup[]? | select(.name=="build") '
+        "| select(.conclusion | IN(%s))] | any)" % fail_set,
+        [p.number for p in prs if p.head_ref.startswith("bump-mathlib/") and p.build_failed],
+    )
 
+    return fails
+
+
+def main():
+    fails = 0
+    # Always run the committed fixture: it exercises the first-party-bot / fork / human / bump-partition
+    # cases that live data may not currently contain.
+    fixture = HERE / "fixtures" / "pr_selectors.json"
+    if fixture.exists():
+        fails += run_checks(json.loads(fixture.read_text()), f"fixture {fixture.name}")
+    # Then a saved snapshot (arg) or a live snapshot — a smoke check against real data.
+    if len(sys.argv) > 1:
+        fails += run_checks(json.loads(Path(sys.argv[1]).read_text()), sys.argv[1])
+    else:
+        fails += run_checks(fetch_live(), "live")
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} selector mismatch(es)")
     return 1 if fails else 0
 

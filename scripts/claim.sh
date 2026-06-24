@@ -141,7 +141,7 @@ cmd_read() {
 cmd_list() {
     ensure_repo
     g ls-remote origin "$NS/*" 2>/dev/null | while read -r oid ref; do
-        local key="${ref#$NS/}"
+        local key="${ref#"$NS"/}"
         if [[ "${1:-}" == "--full" ]]; then
             printf '%s\t%s\n' "$key" "$(lease_json "$oid" "$ref" | tr -d '\n')"
         else

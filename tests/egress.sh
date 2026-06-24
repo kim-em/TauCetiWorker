@@ -6,7 +6,7 @@
 # Needs bubble + Colima up and `gh` logged in. Run from the repo root. Re-run when the bubble image
 # or security policy changes, and once review gains tool use.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 PY=$(command -v python3)
 WID="egress-test"
 export TAUCETI_WORKER_ID="$WID"

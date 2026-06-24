@@ -2,19 +2,30 @@
 """Honor $CLAUDE_CONFIG_DIR: the pacer reads Claude creds from it, isolation copies from there and
 repoints it at the per-worker copy, and the bubble path does not block a non-default value
 (bubble honors the var itself)."""
-import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, types
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import types
 from pathlib import Path
+
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_loader("tauceti", importlib.machinery.SourceFileLoader("tauceti", str(REPO / "tauceti")))
-tc = importlib.util.module_from_spec(spec); sys.modules["tauceti"] = tc; spec.loader.exec_module(tc)
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
 
 fails = 0
+
+
 def check(name, got, expect):
     global fails
     ok = got == expect
     print(f"[{'OK ' if ok else 'XX '}] {name}: {got}")
     if not ok:
-        print(f"      expected: {expect}"); fails += 1
+        print(f"      expected: {expect}")
+        fails += 1
+
 
 home = Path("/home/example")
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -26,7 +37,7 @@ check("env var wins", tc.claude_dir(home), Path("/custom/work-claude"))
 # both the pacer (claude_dir) and the spawned claude read the isolated creds.
 tmp = Path(tempfile.mkdtemp())
 wid = f"claude-config-dir-test-{os.getpid()}"
-shutil.rmtree(tc.HERE / "state" / wid, ignore_errors=True)   # a prior interrupted run mustn't taint us
+shutil.rmtree(tc.HERE / "state" / wid, ignore_errors=True)  # a prior interrupted run mustn't taint us
 try:
     real, cfgdir = tmp / "realhome", tmp / "work-claude"
     cfgdir.mkdir(parents=True)
@@ -62,11 +73,15 @@ finally:
     os.environ.pop("TAUCETI_BUBBLE_HOME", None)
     shutil.rmtree(bhome, ignore_errors=True)
 
+
 # Bubble must NOT block a non-default $CLAUDE_CONFIG_DIR: bubble honors the var itself, so run_in_bubble
 # gets past the (removed) guard. The guard sat before ensure_bubble_home, so a sentinel there proves we
 # pass it (no Die) for both the non-default and default cases.
-class PastGuard(Exception): pass
-tc.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(PastGuard())   # the first call after the removed guard
+class PastGuard(Exception):
+    pass
+
+
+tc.agents.ensure_bubble_home = lambda cfg: (_ for _ in ()).throw(PastGuard())  # the first call after the removed guard
 w = types.SimpleNamespace(cfg=types.SimpleNamespace(home=Path("/home/example"), state=Path("/tmp"), wid="w"))
 opts = types.SimpleNamespace(work_model="claude")
 
