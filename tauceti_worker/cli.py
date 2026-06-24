@@ -38,7 +38,7 @@ from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, TAUCETI, WORK_TASKS
 from .github import GitHub
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE
-from .quota import Quota, _claude_keychain_creds, claude_dir
+from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .survey import Counters, survey
@@ -462,10 +462,10 @@ def cmd_doctor(args) -> int:
     rows.append(("incus", _have("incus"), "bubble's container runtime — install it, or use --host"))
     rows.append(("lake", _have("lake"), "only --host authoring builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
-    rows.append(("codex creds", (cfg.home / ".codex" / "auth.json").exists(), "~/.codex/auth.json"))
+    rows.append(("codex creds", _safe_exists(cfg.home / ".codex" / "auth.json"), "~/.codex/auth.json"))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
-    if claude_creds.exists() or sys.platform != "darwin":
-        rows.append(("claude creds", claude_creds.exists(), str(claude_creds)))
+    if _safe_exists(claude_creds) or sys.platform != "darwin":
+        rows.append(("claude creds", _safe_exists(claude_creds), str(claude_creds)))
     else:
         # macOS keeps Claude creds in the login Keychain, not a file; the pacer reads them there.
         rows.append(

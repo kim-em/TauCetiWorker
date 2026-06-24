@@ -33,6 +33,7 @@ RUN_STDLIB=(
   review_daily_cap.py
   roadmap_claims.py
   round_group_sweep.py
+  safe_exists.py
   spread_candidates.py
 )
 # special-cased python tests (handled explicitly below)

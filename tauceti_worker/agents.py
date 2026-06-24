@@ -16,7 +16,14 @@ from .config import Config, Die, log
 from .constants import CLAUDE_CMD, OPENROUTER_MODELS, PI_RUN, REVIEW, REVIEW_DAILY_CAP, ROADMAP, TAUCETI
 from .github import me
 from .paths import HERE
-from .quota import _claude_keychain_creds_interactive, _read_json_file, _write_json_atomic, claude_dir, mirror_creds
+from .quota import (
+    _claude_keychain_creds_interactive,
+    _read_json_file,
+    _safe_exists,
+    _write_json_atomic,
+    claude_dir,
+    mirror_creds,
+)
 
 # ============================================================================
 # Agents — prompt filling, the host checkout, and the byte-for-byte agent launch.
@@ -454,14 +461,14 @@ def isolate_home(wid: str) -> Path:
     (home / ".codex").mkdir(parents=True, exist_ok=True)
     for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
         src, dst = real_claude / item, iso_claude / item
-        if src.exists() and not dst.exists():
+        if _safe_exists(src) and not dst.exists():
             try:
                 dst.symlink_to(src)
             except OSError:
                 pass
     for f in (".credentials.json", ".gist-id", ".gist-encryption-key"):
         src, dst = real_claude / f, iso_claude / f
-        if src.exists() and not dst.exists():
+        if _safe_exists(src) and not dst.exists():
             shutil.copy2(src, dst)
     # The initial copy is once-only; thereafter mirror_creds() RE-MIRRORS a fresher access token from the
     # source whenever the operator's external refresher rotates it (the worker never refreshes its own
@@ -478,7 +485,7 @@ def isolate_home(wid: str) -> Path:
         marker.write_text(str(real_claude))
     real_codex, iso_codex = real / ".codex", home / ".codex"
     src, dst = real_codex / "auth.json", iso_codex / "auth.json"
-    if src.exists() and not dst.exists():
+    if _safe_exists(src) and not dst.exists():
         shutil.copy2(src, dst)
     # Record the real ~/.codex so mirror_creds() can re-mirror the codex token too (the Claude marker only
     # names the Claude source). Written unconditionally so homes seeded before this marker existed get it

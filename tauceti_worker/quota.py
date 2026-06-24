@@ -86,6 +86,17 @@ def _read_json_file(path: Path) -> dict | None:
         return None
 
 
+def _safe_exists(path: Path) -> bool:
+    """Path.exists() that never raises. A permission-denied probe (EPERM/EACCES — e.g. a sandbox or
+    macOS data protection that walls off ~/.codex or ~/.claude) degrades to False instead of crashing,
+    matching how _read_json_file swallows OSError. Use it to probe credential/config paths under the
+    operator's home, whose permissions we don't control."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def _claude_keychain_attempts() -> list[list[str]]:
     """The `security` reads that locate Claude Code's Keychain item: service "Claude Code-credentials"
     keyed by the login user, then a service-only fallback for older CLI builds that stored it without an
