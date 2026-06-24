@@ -88,8 +88,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # fast path in resolve_work_model skips the pacer, and --host review never hits the bubble-seed
     # mirror — so without this an operator token refresh (or account switch) never reaches a host
     # worker, and its mirror ages out into 401s that silently burn review rounds. No-op when not
-    # isolated / on macOS, two reads + a compare in steady state, so it is safe every round.
-    mirror_creds(w.cfg)
+    # isolated / on macOS, and a handful of small local reads + compares in steady state, so it is
+    # safe to run every round. Skipped under --dry-run, which must not mutate the credential mirror.
+    if not opts.dry_run:
+        mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
