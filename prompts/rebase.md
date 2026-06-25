@@ -24,6 +24,8 @@ lake exe axioms
 ```
 Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
 
+**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
+
 ## Submit
 - Commit the merge/resolution (if `git merge` left a merge commit, keep its default message; otherwise `<type>: <subject>`, ending the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push with the project's safe wrapper — and ONLY the wrapper:

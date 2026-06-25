@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import subprocess
 import time
@@ -29,6 +30,76 @@ def me() -> str:
     if not login:
         raise Die("could not determine the authenticated GitHub account (run `gh auth login`)")
     return login
+
+
+def can_push(repo: str) -> bool | None:
+    """Does the authenticated account have push (write) access to `repo`? `true`/`false` from GitHub's
+    own `permissions.push`, or None when we can't tell (network/rate-limit/parse) — callers fail OPEN on
+    None so a transient hiccup never blocks work; only an explicit `false` means 'no access'."""
+    r = gh_run(["gh", "api", f"repos/{repo}", "--jq", ".permissions.push"])
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    return True if out == "true" else False if out == "false" else None
+
+
+def _find_fork() -> str | None:
+    """The authed user's fork of TAUCETI, resolved by PARENT (not by name, so a same-named non-fork is
+    never mistaken for it): the first owned fork whose parent is TAUCETI, as `owner/repo`, or None."""
+    r = gh_run(["gh", "repo", "list", "--fork", "--limit", "200", "--json", "nameWithOwner,parent"])
+    if r.returncode != 0:
+        return None
+    try:
+        for repo in json.loads(r.stdout or "[]"):
+            parent = repo.get("parent") or {}
+            owner = (parent.get("owner") or {}).get("login") or ""
+            full = f"{owner}/{parent.get('name') or ''}"
+            if full.lower() == TAUCETI.lower():
+                return repo.get("nameWithOwner")
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def ensure_fork() -> str:
+    """The contributor's own fork of TAUCETI (`owner/repo`), creating it if absent. The worker pushes
+    authored branches here and opens PRs from it, so it never needs write access to canonical. Fails
+    closed if the resolved fork can't be pushed to (e.g. a token scoped only to the base repo)."""
+    fork = _resolve_fork()
+    if can_push(fork) is False:  # explicit denial only; None (couldn't tell) fails open
+        raise Die(
+            f"resolved your fork {fork}, but this `gh` account cannot push to it. Use a `gh auth` that can "
+            f"push to your fork (a token scoped only to {TAUCETI} is not enough), or set TAUCETI_FORK."
+        )
+    return fork
+
+
+def _resolve_fork() -> str:
+    """Locate (or create) the fork. `$TAUCETI_FORK=<owner/repo>` overrides (escape hatch; also for a fork
+    under a non-default name/org). Otherwise resolve the existing fork by parent; if none, `gh repo fork`
+    and poll until GitHub surfaces it (fork creation is async; a concurrent same-account worker may win
+    the create — the re-query then finds it). Fails closed if a non-fork repo squats the fork's name."""
+    override = os.environ.get("TAUCETI_FORK", "").strip()
+    if override:
+        return override
+    found = _find_fork()
+    if found:
+        return found
+    gh_run(["gh", "repo", "fork", TAUCETI, "--clone=false"])
+    name = TAUCETI.split("/", 1)[1]
+    for attempt in range(8):
+        found = _find_fork()
+        if found:
+            return found
+        clash = gh_run(["gh", "api", f"repos/{me()}/{name}", "--jq", ".fork"])
+        if clash.returncode == 0 and clash.stdout.strip() == "false":
+            raise Die(
+                f"you already own {me()}/{name}, which is NOT a fork of {TAUCETI} — rename it, or set "
+                f"TAUCETI_FORK=<owner/repo> to your fork of {TAUCETI}."
+            )
+        time.sleep(2 * (attempt + 1))
+    raise Die(f"could not create or find your fork of {TAUCETI} via `gh repo fork` (check `gh auth status`).")
 
 
 # ============================================================================

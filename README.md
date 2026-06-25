@@ -13,6 +13,13 @@ as that account, and it treats that account's own PRs as the ones it tends. The
 repo is hardwired to `FormalFrontier/TauCeti`. This is an operator's tool for that
 project, not a general framework.
 
+You author through **your own fork**: the worker forks `FormalFrontier/TauCeti` (once,
+automatically), pushes authored branches and fixes to that fork, and opens PRs from it —
+so you do **not** need write access to the canonical repo, only a `gh auth` that can fork
+it and push to your fork. (A fine-grained token scoped only to the canonical repo is not
+enough.) Set `TAUCETI_FORK=<owner>/<repo>` to point at an existing fork instead of the
+auto-created one.
+
 ## Quickstart
 
 Install it as a tool, no clone needed:

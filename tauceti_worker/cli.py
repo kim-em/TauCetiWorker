@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 
-from .agents import isolate_home, run_in_bubble
+from .agents import bubble_supports_allow_push, isolate_home, run_in_bubble
 from .config import (
     Config,
     Die,
@@ -502,6 +502,16 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "    - re-run with --host to skip the sandbox and run on this host directly (the agent then\n"
             "      has your full gh credentials and network, so use it only on trusted/disposable machines).\n"
             "  `tauceti doctor` reports this too."
+        )
+    # The worker authors/fixes from the contributor's fork, handing bubble `--allow-push <fork>` for the
+    # fork's git access (kim-em/bubble#320). An older cached bubble rejects that flag only AFTER the model
+    # launches — a wasted round — so verify support up front (probes `bubble open --help` once).
+    if uses_bubble and not opts.dry_run and not bubble_supports_allow_push():
+        raise Die(
+            "preflight: this bubble is too old for fork-PR authoring — it has no `--allow-push` "
+            "(needs kim-em/bubble#320). Refresh the cached build, e.g.\n"
+            "    uvx --refresh --from git+https://github.com/kim-em/bubble.git bubble --version\n"
+            "  or update your installed `bubble`, then re-run. (Override the executable with $TAUCETI_BUBBLE.)"
         )
 
 

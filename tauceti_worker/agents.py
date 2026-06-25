@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 import sys
@@ -171,6 +172,18 @@ def bubble_cmd() -> list[str]:
     return ["uvx", "--from", BUBBLE_REPO, "bubble"]
 
 
+@functools.lru_cache(maxsize=1)
+def bubble_supports_allow_push() -> bool:
+    """Does the resolved bubble support `--allow-push` (fork-PR write support, kim-em/bubble#320)? The
+    worker hands that flag to bubble for fork authoring/maintenance, so an OLD cached build would error
+    only after the model launches — wasting the round. Probe `bubble open --help` once per process."""
+    try:
+        p = subprocess.run([*bubble_cmd(), "open", "--help"], capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--allow-push" in (p.stdout or "") + (p.stderr or "")
+
+
 def shlex_split(s: str) -> list[str]:
     import shlex
 
@@ -290,6 +303,7 @@ def run_in_bubble(
     *,
     inner_cmd: str | None = None,
     cred_model: str | None = None,
+    allow_push: str | None = None,
 ) -> int:
     """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
     work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
@@ -326,6 +340,13 @@ def run_in_bubble(
     for m in mounts or []:
         mount_flags += ["--mount", m]
 
+    # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
+    # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
+    # (roadmap) or a fix to a fork-headed PR. The base repo keeps its allowlist-write-graphql scope; the
+    # fork gets git only. (For a PR target, bubble also auto-derives the head fork, so this is belt-and-
+    # suspenders for maintenance and the sole grant for authoring, which has no PR to derive from.)
+    push_flags = ["--allow-push", allow_push] if allow_push else []
+
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
@@ -354,6 +375,7 @@ def run_in_bubble(
         "--ephemeral",
         "--github-security",
         "allowlist-write-graphql",
+        *push_flags,
         *mount_flags,
         *agent_cred_flags(cred_model),
         "--command",

@@ -18,7 +18,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
   ```
   claim.sh acquire "author/__ONLY__/<slug>"
   ```
-  Exit `0` = it's yours, proceed. Exit `1` = another agent already holds it — pick a DIFFERENT target and claim that instead. Exit `2` = the claim service hiccupped; proceed anyway (the duplicate sweeper is the backstop).
+  Exit `0` = it's yours, proceed. Exit `1` = another agent already holds it — pick a DIFFERENT target and claim that instead. Exit `2` = the claim could not be registered; proceed anyway. (This cooperative claim writes to the canonical repo, so without write access there it simply no-ops at exit 2 — that is expected and fine; your real duplicate-avoidance is the open-PR scan above + the intentions claims, and the duplicate sweeper is the backstop.)
 - **Record it in the PR body** (required — the PR will be rejected without it): include the exact line
   ```
   <!--tauceti-target:v1 {"focus":"__ONLY__","id":"<slug>"}-->
@@ -39,16 +39,19 @@ lake exe axioms
 ```
 If `lake build` is red, FIX IT or pick a smaller target. Never push red.
 
+**Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
+
 ## Submit
-- Create a branch `roadmap/<short-slug>` off `main`. Commit (message `feat: <subject>`; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
-- Push the new branch with the project's safe wrapper — and ONLY the wrapper:
+You author from **your own fork** of FormalFrontier/TauCeti (`__FORK__/TauCeti`): the branch is pushed there, and the PR is opened from your fork to `FormalFrontier/TauCeti:main`. You do not need write access to the canonical repo. (The wrappers are already configured to push to your fork — just run them.)
+- Create a branch `roadmap/<short-slug>-__WORKERID__` off `main` (the `-__WORKERID__` suffix keeps concurrent workers on one account from colliding). Commit (message `feat: <subject>`; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
+- Push the new branch to your fork with the project's safe wrapper — and ONLY the wrapper:
   ```
-  git-safe-push <branch>
+  git-safe-push roadmap/<short-slug>-__WORKERID__
   ```
-  This create-only-pushes the branch (it fails closed if that branch name already exists, so two agents can't collide). Do NOT run a raw `git push`.
-- Open the PR with the project's safe wrapper — and ONLY the wrapper:
+  This create-only-pushes the branch to your fork (it fails closed if that branch name already exists, so two agents can't collide). Do NOT run a raw `git push`.
+- Open the PR with the project's safe wrapper — and ONLY the wrapper, passing your fork as the head with an explicit `--head` (note the `__FORK__:` prefix, and no `--fill` / interactive prompts):
   ```
-  gh-safe-pr-create --repo FormalFrontier/TauCeti --base main --title "feat: <subject>" --body-file <file>
+  gh-safe-pr-create --repo FormalFrontier/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
   ```
   Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 

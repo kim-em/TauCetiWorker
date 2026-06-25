@@ -31,7 +31,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, gh_run, me
+from .github import GitHub, GitHubError, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import HERE
 from .quota import mirror_creds
@@ -394,11 +394,21 @@ def _do_fixlike(
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
         raise Die(f"{label}: PR #{pr} vanished from the survey")
+    # Deleted/unavailable head: with the head repo gone, there is nowhere to push the fix and bubble
+    # can't check the PR out. Skip to the next candidate rather than build a `https://github.com//`
+    # remote or an `allow_push="/"` (a fork head deletes to empty fields in PRInfo.from_json).
+    if not (p.head_owner and p.head_repo and p.head_ref):
+        log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
+        return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name)
     if bubble:
-        rc = run_in_bubble(w, f"{TAUCETI}/pull/{pr}", prompt, opts)  # bubble checks out the PR inside
+        # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
+        # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
+        rc = run_in_bubble(
+            w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
+        )  # bubble checks out the PR inside
     else:
         if not prepare_checkout(w.cfg):
             log(f"checkout failed for #{pr} — skipping this attempt")
@@ -474,6 +484,13 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     if not fetch_ref(REVIEW, refs / "review"):
         raise Die(f"fetch {REVIEW} failed")
     os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
+    # Author from the contributor's OWN fork: push the new branch there and open the PR from it, so the
+    # worker never needs write access to canonical (and canonical stays free of WIP branches). The agent
+    # builds against canonical main (the bubble/checkout still targets TAUCETI) — only the push redirects.
+    fork = ensure_fork()
+    fork_owner = fork.split("/", 1)[0]
+    os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{fork}"
+    os.environ.pop("TAUCETI_PUSH_EXPECT", None)  # a fresh branch ⇒ create-only CAS on the fork
     if bubble:
         return run_in_bubble(
             w,
@@ -484,11 +501,14 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 SKIP=skip_str,
                 CLAIMED=claimed_str,
                 AGENT=opts.agent_name,
+                FORK=fork_owner,
+                WORKERID=w.cfg.wid,
                 ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
                 REVIEW_DIR="/opt/review",
             ),
             opts,
             mounts=[f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"],
+            allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )  # M9
     if not prepare_checkout(w.cfg):
         raise Die("checkout failed")
@@ -498,6 +518,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         SKIP=skip_str,
         CLAIMED=claimed_str,
         AGENT=opts.agent_name,
+        FORK=fork_owner,
+        WORKERID=w.cfg.wid,
         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
         REVIEW_DIR=str(refs / "review"),
     )
