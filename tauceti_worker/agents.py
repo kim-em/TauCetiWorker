@@ -184,6 +184,100 @@ def bubble_supports_allow_push() -> bool:
     return "--allow-push" in (p.stdout or "") + (p.stderr or "")
 
 
+def _bubble_version() -> str:
+    """`bubble --version` of the resolved CLI, or '' if it can't be read. NOT cached: a long-lived
+    `--loop` must notice a bubble upgrade applied mid-run so the next round refreshes the daemon."""
+    try:
+        p = subprocess.run([*bubble_cmd(), "--version"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (p.stdout or p.stderr or "").strip()
+
+
+def _auth_proxy_stamp() -> Path:
+    """Where we record the bubble version the auth-proxy daemon was last (re)started for. The daemon is
+    host-global (one launchd/systemd service per OS user), so the stamp is too — keyed off the real login
+    user's home via `pwd`, NOT $HOME, which isolate_home() repoints per worker. A host-global stamp means
+    concurrent workers share one refresh instead of each restarting the daemon on a version bump."""
+    home = None
+    try:
+        import pwd
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        home = Path(os.path.expanduser("~"))
+    return home / ".cache" / "tauceti-worker" / ".auth-proxy-bubble-version"
+
+
+def ensure_fork_proxy_current() -> None:
+    """Keep bubble's git auth-proxy daemon in step with the installed `bubble` CLI; Die if it can't be.
+
+    The proxy that enforces `--allow-push` runs as a long-lived launchd/systemd daemon. Upgrading the
+    `bubble` CLI does NOT restart it, so a daemon started before kim-em/bubble#320 keeps rejecting fork
+    pushes with `403 Repository mismatch` even though `bubble open --help` (and so bubble_supports_allow_push)
+    advertises the flag — the fork round then silently falls back to canonical (a wrong-target PR for an
+    account with canonical write) or fails outright (a read-only contributor). The CLI capability probe
+    can't catch this: it inspects the binary, not the running daemon.
+
+    There is no daemon version/status query, so we stamp the `bubble` version each time we (re)start the
+    daemon (via bubble's own `gh proxy start` — TauCeti stays out of the launchd/systemd details) and
+    restart it whenever that version changes. Version-gated so steady-state rounds never churn a host-shared
+    daemon (a restart is ~instant and tokens persist on disk, but it briefly blips any concurrent bubble),
+    and serialized under a host-global file lock so concurrent workers refresh once, not N racing restarts
+    (interleaved launchd/systemd reloads could otherwise leave the daemon down). Fail-CLOSED throughout: a
+    stale-or-unverifiable daemon is refreshed, and if the refresh can't be confirmed we Die rather than burn
+    a ~30-minute round on a push the proxy will 403. Call this ONLY for rounds that push to a fork — a
+    review-only worker never does, and must not be blocked by it."""
+    import fcntl
+    import tempfile
+
+    ver = _bubble_version()  # '' if unreadable — treated as "currency unverifiable", so refresh anyway
+    stamp = _auth_proxy_stamp()
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails
+    # (Codex's fallback for "lock can't be acquired"). The stamp stays in the user's home so it survives a
+    # reboot that would clear /tmp (a cleared stamp only costs one extra restart).
+    lockpath = Path(tempfile.gettempdir()) / f"tauceti-worker-auth-proxy-{os.getuid()}.lock"
+    lockf = None
+    try:
+        try:
+            lockf = open(lockpath, "w")
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+        except OSError:
+            lockf = None  # extraordinary (temp dir unwritable) — fall through and refresh anyway
+        try:
+            if ver and stamp.read_text().strip() == ver:
+                return  # another worker (or an earlier round) already refreshed the daemon for this version
+        except OSError:
+            pass  # no stamp yet (first fork round) — refresh
+        # Stale, never-stamped, or a version we couldn't read (can't vouch for currency) → refresh, fail closed.
+        try:
+            subprocess.run(
+                [*bubble_cmd(), "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Die(
+                "preflight: bubble's git auth-proxy daemon is stale for fork-PR authoring (it predates the "
+                f"installed bubble and would 403 fork pushes) and could not be refreshed: {e}\n"
+                "  Restart it yourself with `bubble gh proxy start`, then re-run."
+            ) from e
+        if ver:
+            try:
+                stamp.write_text(ver)  # only with a known version; an unreadable read refreshes again next round
+            except OSError:
+                pass
+        log(f"bubble auth-proxy: restarted daemon to match {ver or 'the installed bubble'} (fork --allow-push)")
+    finally:
+        if lockf is not None:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            finally:
+                lockf.close()
+
+
 def shlex_split(s: str) -> list[str]:
     import shlex
 

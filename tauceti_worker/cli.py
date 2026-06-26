@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 
-from .agents import bubble_supports_allow_push, isolate_home, run_in_bubble
+from .agents import bubble_supports_allow_push, ensure_fork_proxy_current, isolate_home, run_in_bubble
 from .config import (
     Config,
     Die,
@@ -494,6 +494,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";
     # catch it here with a pointer to the two ways out.
     uses_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
+    # Rounds that may push to the contributor's fork (everything except review, which only reads/comments).
+    # The fork-PR preflight below is scoped to these so a `--only review` worker is never blocked by it.
+    uses_fork = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s) and s != "review")
     if uses_bubble and not opts.dry_run and not _have("incus"):
         raise Die(
             "preflight: the bubble sandbox needs a working Incus runtime, but `incus` is not on PATH.\n"
@@ -506,13 +509,18 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # The worker authors/fixes from the contributor's fork, handing bubble `--allow-push <fork>` for the
     # fork's git access (kim-em/bubble#320). An older cached bubble rejects that flag only AFTER the model
     # launches — a wasted round — so verify support up front (probes `bubble open --help` once).
-    if uses_bubble and not opts.dry_run and not bubble_supports_allow_push():
+    if uses_fork and not opts.dry_run and not bubble_supports_allow_push():
         raise Die(
             "preflight: this bubble is too old for fork-PR authoring — it has no `--allow-push` "
             "(needs kim-em/bubble#320). Refresh the cached build, e.g.\n"
             "    uvx --refresh --from git+https://github.com/kim-em/bubble.git bubble --version\n"
             "  or update your installed `bubble`, then re-run. (Override the executable with $TAUCETI_BUBBLE.)"
         )
+    # The CLI may advertise --allow-push while a daemon started before that support keeps rejecting fork
+    # pushes (403) — refresh the auth-proxy daemon when the installed bubble version changes so the running
+    # proxy honors the flag we hand it. Fork-pushing rounds only (a stale daemon must not block review).
+    if uses_fork and not opts.dry_run:
+        ensure_fork_proxy_current()
 
 
 def cli_main() -> int:

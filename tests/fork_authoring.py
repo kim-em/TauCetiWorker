@@ -173,10 +173,74 @@ def test_roadmap():
     check("roadmap: no unsubstituted placeholders", "__FORK__" not in prompt and "__WORKERID__" not in prompt)
 
 
+# ---- 4. ensure_fork_proxy_current: version-gated auth-proxy daemon restart -------------------
+def test_proxy_current():
+    tmp = Path(tempfile.mkdtemp(prefix="fork-proxy-"))
+    stamp = tmp / ".auth-proxy-bubble-version"
+    tc.agents._auth_proxy_stamp = lambda: stamp  # host-global stamp (real path uses pwd, not $HOME)
+    tc.agents._bubble_version = lambda: "bubble, version 0.7.25"
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return _cp(0, "")
+
+    def started():
+        return any(a[-3:] == ["gh", "proxy", "start"] for a in calls)
+
+    real_run = tc.agents.subprocess.run
+    tc.agents.subprocess.run = fake_run
+    try:
+        # no stamp yet -> restart the daemon and record the version
+        tc.agents.ensure_fork_proxy_current()
+        check("proxy: unstamped -> gh proxy start", started())
+        check("proxy: stamp written with current version", stamp.read_text().strip() == "bubble, version 0.7.25")
+
+        # stamp matches -> no restart
+        calls.clear()
+        tc.agents.ensure_fork_proxy_current()
+        check("proxy: matching stamp -> no restart", not started())
+
+        # version changed -> restart again and update the stamp
+        calls.clear()
+        tc.agents._bubble_version = lambda: "bubble, version 0.7.26"
+        tc.agents.ensure_fork_proxy_current()
+        check("proxy: version change -> restart", started())
+        check("proxy: stamp updated", stamp.read_text().strip() == "bubble, version 0.7.26")
+
+        # restart failure is fail-CLOSED: Die, and leave the stamp stale so a later round retries
+        stamp.write_text("bubble, version 0.7.25")  # pretend stale again
+        tc.agents._bubble_version = lambda: "bubble, version 0.7.27"
+
+        def boom(argv, **kw):
+            raise subprocess.CalledProcessError(1, argv)
+
+        tc.agents.subprocess.run = boom
+        try:
+            tc.agents.ensure_fork_proxy_current()
+            check("proxy: restart failure -> Die", False)
+        except tc.Die:
+            check("proxy: restart failure -> Die", True)
+        check("proxy: failed restart leaves stamp stale", stamp.read_text().strip() == "bubble, version 0.7.25")
+
+        # unreadable version -> refresh anyway (fail-closed: currency unverifiable), leave the stamp untouched
+        calls.clear()
+        tc.agents.subprocess.run = fake_run
+        stamp.write_text("bubble, version 0.7.99")
+        tc.agents._bubble_version = lambda: ""
+        tc.agents.ensure_fork_proxy_current()
+        check("proxy: unreadable version -> refresh", started())
+        check("proxy: unreadable version -> stamp untouched", stamp.read_text().strip() == "bubble, version 0.7.99")
+    finally:
+        tc.agents.subprocess.run = real_run
+
+
 def main():
     test_ensure_fork()
     test_fixlike()
     test_roadmap()
+    test_proxy_current()
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
     return 1 if fails else 0
 
