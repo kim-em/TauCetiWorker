@@ -544,6 +544,42 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers)
 
 
+def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
+    """The per-worker isolated $HOME. On macOS it MUST be short: bubble runs the sandbox in a colima VM
+    whose lima/incus unix sockets nest under $HOME, and the default location beneath the installed package
+    (site-packages) pushes those socket paths past UNIX_PATH_MAX (104) — colima then refuses to start
+    ("instance name … too long"). Anchor it at the real login user's home (via `pwd`, NOT $HOME, which a
+    loop child has already had repointed) so the path is short and stable across re-isolations, and bound
+    the per-worker component against the longest socket bubble nests under the home so that even a long
+    --worker-id (or login name) can't reoverflow it — hashing (deterministically; a loop child must
+    recompute the same path) only when the raw wid wouldn't fit, so ordinary ids stay readable. Linux uses
+    native incus (no $HOME-nested sockets, no colima), so it keeps the in-tree location beside the worker's
+    other state. The path must be a pure function of wid (no $HOME) so the early-return below recognises an
+    already-isolated child."""
+    if sys.platform != "darwin":
+        return HERE / "state" / wid / "home"
+    base = _base
+    if base is None:
+        try:
+            import pwd
+
+            base = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (ImportError, KeyError, OSError):
+            base = Path(os.path.expanduser("~"))
+    root = base / ".tauceti"
+    # colima binds <home>/.colima/_lima/<profile>/ssh.sock.<16-digit id>; keep that whole path strictly
+    # under UNIX_PATH_MAX (104) by bounding the per-worker component.
+    sock_suffix = len("/.colima/_lima/colima-bubble-colima/ssh.sock.") + 16
+    budget = (104 - 1 - sock_suffix) - len(str(root)) - 1  # max home length, minus root and its trailing "/"
+    if len(wid) <= budget:
+        return root / wid
+    import hashlib
+
+    digest = hashlib.sha1(wid.encode()).hexdigest()[:8]
+    keep = max(1, budget - 9)  # leave room for "-" + 8 hex chars
+    return root / f"{wid[:keep]}-{digest}"
+
+
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
     review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface from the real
@@ -557,10 +593,13 @@ def isolate_home(wid: str) -> Path:
     macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
     Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
     repointing is a no-op there: the spawned claude reads the shared Keychain regardless, and the pacer's
-    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature."""
+    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature.
+    On macOS the home also sits at a short path (see _worker_iso_home) and its colima/incus state is
+    symlinked to the operator's, so bubble reuses the one host VM instead of building a throwaway per-worker
+    one (and the sockets under it stay within UNIX_PATH_MAX)."""
     import shutil
 
-    home = HERE / "state" / wid / "home"
+    home = _worker_iso_home(wid)
     if Path(os.environ.get("HOME", "")) == home:
         return home  # already isolated (a loop child inherits the parent's $HOME) — don't re-copy or warn
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
@@ -568,6 +607,27 @@ def isolate_home(wid: str) -> Path:
     iso_claude = home / ".claude"
     iso_claude.mkdir(parents=True, exist_ok=True)
     (home / ".codex").mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        # Point the isolated home's colima/incus state at the operator's so bubble's `colima status`
+        # (which reads $HOME/.colima) finds the host's already-running VM and skips building a throwaway
+        # per-worker one — and the short home keeps the resulting socket paths within UNIX_PATH_MAX. The
+        # shared host VM is the same one the 'default' worker uses, so this adds no new colima ownership.
+        for rel in (".colima", Path(".config") / "incus"):
+            link, target = home / rel, real / rel
+            if link.is_symlink() and not link.exists():
+                try:
+                    link.unlink()  # stale dangling link (target since removed) — drop it before re-linking
+                except OSError:
+                    pass
+            # Only link when the operator actually has state to share; otherwise leave it absent so bubble
+            # creates a real dir here (a self-contained per-worker VM at this short path), never a dangling
+            # symlink. Don't clobber an existing real dir or a good link.
+            if target.exists() and not link.exists() and not link.is_symlink():
+                try:
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(target)
+                except OSError:
+                    pass
     for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
         src, dst = real_claude / item, iso_claude / item
         if src.exists() and not dst.exists():

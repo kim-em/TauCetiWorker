@@ -27,6 +27,7 @@ RUN_STDLIB=(
   github_ratelimit.py
   ignore_quota_hardblock.py
   inflight_review.py
+  isolate_home_paths.py
   ledger_blocking.py
   mirror_creds.py
   quota_cache_fp.py
