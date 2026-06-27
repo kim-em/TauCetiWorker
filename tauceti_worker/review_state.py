@@ -75,8 +75,10 @@ class ReviewState:
         OWN PRs; the merge gate reads the authoritative, write-restricted TauCetiData records, not this
         comment, so a forged comment cannot merge anything. The residual risk is a forged all-green
         scoreboard suppressing a review — which a forger can't parlay into a merge and which self-heals on
-        the next push (its head_sha stops matching). Empty fetch with a prior cache value → serve the stale
-        value (stale-but-real beats a phantom '{}'); only fall to '{}' with no cache at all.
+        the next push (its head_sha stops matching). A FETCH FAILURE with a prior cache value → serve the
+        stale value (stale-but-real beats a phantom '{}'); a SUCCESSFUL fetch that finds no scoreboard
+        returns '{}' even with a cache, so a scoreboard that was deleted/edited away (or a forged one a
+        worker briefly cached) can't be served as fresh past the TTL.
         """
         cache = self._cache_path(pr)
         if cache.exists():
@@ -85,29 +87,33 @@ class ReviewState:
                 return Meta(self._load(cache), "fresh")
 
         comments = self._issue_comments(pr)
-        meta_str = ""
         fetch_failed = comments is None
+        data = None
         if comments:
-            marked = [c for c in comments if "<!--tauceti-scoreboard-->" in (c.get("body") or "")]
-            marked.sort(key=lambda c: c.get("updated_at", ""))
-            if marked:
-                body = marked[-1].get("body") or ""
-                matches = META_RE.findall(body)
-                if matches:
-                    meta_str = matches[-1].strip()
+            # Newest-first, but skip a marker comment whose meta is missing/garbage: a newer empty or
+            # malformed <!--tauceti-scoreboard--> marker must not mask an older comment that does carry a
+            # valid scoreboard (without the author gate, anyone can post such a masking marker).
+            marked = sorted(
+                (c for c in comments if "<!--tauceti-scoreboard-->" in (c.get("body") or "")),
+                key=lambda c: c.get("updated_at", ""),
+                reverse=True,
+            )
+            for c in marked:
+                matches = META_RE.findall(c.get("body") or "")
+                if not matches:
+                    continue
+                try:
+                    data = json.loads(matches[-1].strip())
+                    break
+                except json.JSONDecodeError:
+                    continue
 
-        if not meta_str:
-            # Transient fetch failure OR genuinely no scoreboard. If we have a prior value, serve it.
-            if cache.exists():
-                return Meta(self._load(cache), "stale" if fetch_failed else "fresh")
-            return Meta({}, "fetch_failed" if fetch_failed else "missing")
-
-        try:
-            data = json.loads(meta_str)
-        except json.JSONDecodeError:
-            if cache.exists():
+        if data is None:
+            # Serve a prior value ONLY on a fetch failure (transient); a successful fetch that parsed no
+            # scoreboard means there genuinely isn't one now — don't keep serving a now-absent meta.
+            if fetch_failed and cache.exists():
                 return Meta(self._load(cache), "stale")
-            return Meta({}, "missing")
+            return Meta({}, "fetch_failed" if fetch_failed else "missing")
         self.sbcache.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(data) + "\n")
         return Meta(data, "fresh")

@@ -14,8 +14,10 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import json
+import os
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -46,6 +48,12 @@ def plain(updated, assoc="MEMBER"):
     """A non-scoreboard comment (no marker) — must be ignored even from a 'trusted' author."""
     meta = json.dumps({"head_sha": "FORGED"})
     return {"body": f"just chatting <!--tauceti-meta:v1 {meta}-->", "updated_at": updated, "author_association": assoc}
+
+
+def empty_marker(updated, garbage=False):
+    """A scoreboard MARKER with no valid meta — a newer one of these must not mask an older real board."""
+    tail = "<!--tauceti-meta:v1 {not json}-->" if garbage else ""
+    return {"body": f"<!--tauceti-scoreboard--> {tail}", "updated_at": updated, "author_association": "MEMBER"}
 
 
 def make_rs(comments):
@@ -87,6 +95,38 @@ check("no scoreboard -> missing", m.data == {} and m.provenance == "missing")
 # 6) Fetch failure (issue_comments None) with no cache -> fetch_failed sentinel.
 m = make_rs(None).gh_meta(476)
 check("fetch failure -> fetch_failed", m.data == {} and m.provenance == "fetch_failed")
+
+# 7) A NEWER bare/garbage marker must not mask an OLDER comment that carries a valid scoreboard.
+m = make_rs([sb("REALHEAD", "2026-06-26T12:00:00Z"), empty_marker("2026-06-26T18:00:00Z")]).gh_meta(477)
+check("newer empty marker doesn't mask older valid scoreboard", m.data.get("head_sha") == "REALHEAD")
+m = make_rs([sb("REALHEAD", "2026-06-26T12:00:00Z"), empty_marker("2026-06-26T18:00:00Z", garbage=True)]).gh_meta(478)
+check("newer garbage-meta marker doesn't mask older valid scoreboard", m.data.get("head_sha") == "REALHEAD")
+
+# 8) Cache poisoning: once a scoreboard is cached, a later SUCCESSFUL fetch that finds none returns
+#    'missing' (not the cached value) past the TTL — a forged-then-deleted board can't linger.
+cfg = types.SimpleNamespace(sbcache=Path(tempfile.mkdtemp()) / "sb")
+box = {"comments": [sb("CACHED", "2026-06-26T12:00:00Z")]}
+rs = tc.ReviewState(cfg, types.SimpleNamespace(issue_comments=lambda pr: box["comments"]))
+cache_file = cfg.sbcache / "479.json"
+old = time.time() - (tc.SBCACHE_TTL + 5)
+
+
+def reread():  # age the cache past the TTL and drop the per-pass comment memo, then re-read
+    if cache_file.exists():
+        os.utime(cache_file, (old, old))
+    rs._comments.clear()
+    return rs.gh_meta(479)
+
+
+check("scoreboard cached on first read", rs.gh_meta(479).data.get("head_sha") == "CACHED")
+box["comments"] = [plain("2026-06-26T20:00:00Z")]  # the board is now gone from the PR
+after = reread()  # successful fetch, no board
+check("deleted scoreboard not served from cache past TTL", after.data == {} and after.provenance == "missing")
+# a FETCH FAILURE still serves the stale cache (transient — don't lose real state on a blip)
+cache_file.write_text(json.dumps({"head_sha": "CACHED"}))  # missing-path above didn't rewrite it
+box["comments"] = None
+stale = reread()
+check("fetch failure still serves stale cache", stale.data.get("head_sha") == "CACHED" and stale.provenance == "stale")
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)
