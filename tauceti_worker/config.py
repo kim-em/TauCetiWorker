@@ -1,4 +1,5 @@
-"""tauceti_worker.config — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.config — per-worker Config resolution, the roadmap/claims env dials, worker-slot
+locking, and logging."""
 
 from __future__ import annotations
 

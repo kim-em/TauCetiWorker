@@ -1,4 +1,5 @@
-"""tauceti_worker.tui — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.tui — the survey renderer (Rich, for `status`) and the Textual dashboard + launcher
+that bare `tauceti` opens."""
 
 from __future__ import annotations
 
@@ -18,13 +19,68 @@ from .quota import Quota, _read_json_file, quota_line
 from .review_state import ReviewState
 from .survey import Candidate, Counters, Survey, survey
 
-# --- command stubs (filled in by later milestones) ---------------------------
-
 
 def _sample(cands: list[Candidate], n: int = 3) -> str:
     nums = [f"#{c.pr}" for c in cands]
     head = " ".join(nums[:n])
     return head + (f" +{len(nums) - n}" if len(nums) > n else "")
+
+
+# The survey row policy — shared by the Rich snapshot (render_survey) and the Textual dashboard
+# (_render_table) so the two can't drift (e.g. the daily-capped note that once showed only in the
+# snapshot). Each renderer keeps its own styling/escaping; these decide only WHAT text a row carries.
+
+
+def _kind_note(sv: Survey, name: str) -> tuple[str, str]:
+    """(ready, note) for a non-roadmap kind row. Note text is safe ASCII (PR numbers + counts), so
+    neither renderer needs to escape it."""
+    wk = sv.kind(name)
+    ready = str(wk.count) if wk.count else "—"
+    extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
+    if name == "review" and sv.review_capped:
+        capped = ",".join("#" + str(p) for p, _ in sv.review_capped[:5])
+        extra += f"  ({len(sv.review_capped)} daily-capped: {capped})"
+    note = (_sample(wk.actionable) or "") + extra
+    if name == "bump" and not wk.actionable and not wk.suppressed:
+        note = "no broken bump-mathlib PR"
+    return ready, note
+
+
+def _roadmap_note(sv: Survey, esc=lambda s: s) -> tuple[str, str]:
+    """(ready, note) for the roadmap header row. `esc` escapes the external area names for the
+    markup-interpreting Rich renderer; the Textual renderer passes them through unchanged."""
+    skip_note = f"  (skip: {esc(', '.join(sv.roadmap_skip))})" if sv.roadmap_skip else ""
+    only = esc(sv.roadmap_only)
+    if sv.roadmap_backpressure:
+        return "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (only: {only}){skip_note}"
+    return "∞", f"only: {only}{skip_note}"
+
+
+def _expansion_rows(sv: Survey, name: str, titles: dict, areas: list | None) -> list[tuple[str, str]]:
+    """The sub-rows under an expanded kind, as (label, note) plain-text pairs. `label` already carries
+    the "    └ " tree prefix (the KIND column); `note` is the trailing text (the SAMPLE / NOTE column).
+    Each renderer applies its own dim styling/escaping."""
+    if name == "roadmap":
+        if not areas:
+            return [("    └ (areas unavailable)", "")]
+        skip = set(sv.roadmap_skip)
+        rows = []
+        # In "auto" mode no area is pinned (a random one is picked per round), so no row is marked
+        # "← only" — the intended display.
+        for a in ["(all areas)"] + list(areas):
+            active = a == sv.roadmap_only or (a == "(all areas)" and sv.roadmap_only in ("", "any"))
+            tag = "← only" if active else ("(skipped)" if a in skip else "")
+            rows.append((f"    └ {a}", tag))
+        return rows
+    wk = sv.kind(name)
+    cands = [(c, False) for c in wk.actionable] + [(c, True) for c in wk.suppressed]
+    if not cands:
+        return [("    └ (none)", "")]
+    rows = []
+    for c, supp in cands:
+        title = titles.get(c.pr) or c.reason or ""
+        rows.append((f"    └ #{c.pr}", title + ("  (past-budget)" if supp else "")))
+    return rows
 
 
 def render_survey(
@@ -54,9 +110,6 @@ def render_survey(
 
     expanded = expanded or set()
     titles = {p.number: p.title for p in sv.open_prs}
-    only = escape(sv.roadmap_only)
-    skip = set(sv.roadmap_skip)
-    skip_note = f"  (skip: {escape(', '.join(sv.roadmap_skip))})" if sv.roadmap_skip else ""
 
     header = (
         f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   "
@@ -77,47 +130,11 @@ def render_survey(
         is_sel = name == selected
         style = "reverse" if is_sel else None  # the arrow-key cursor
         kind_cell = ("▸ " if is_sel else "  ") + name  # marker survives even without color
-        if name == "roadmap":
-            if sv.roadmap_backpressure:
-                t.add_row(
-                    num,
-                    kind_cell,
-                    "⛔",
-                    f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (only: {only}){skip_note}",
-                    style=style,
-                )
-            else:
-                t.add_row(num, kind_cell, "∞", f"only: {only}{skip_note}", style=style)
-            if name in expanded:  # list the areas, marking the active one and any skipped ones
-                if not areas:
-                    t.add_row("", "    └ (areas unavailable)", "", "", style="dim")
-                else:
-                    # In "auto" mode no row matches (no area is pinned — a random one is picked per
-                    # round), so no "← only" marker shows; that is the intended display.
-                    for a in ["(all areas)"] + areas:
-                        active = a == sv.roadmap_only or (a == "(all areas)" and sv.roadmap_only in ("", "any"))
-                        tag = "[dim]← only[/]" if active else ("[dim](skipped)[/]" if a in skip else "")
-                        t.add_row("", f"    └ {escape(a)}", "", tag)
-            continue
-        wk = sv.kind(name)
-        ready = str(wk.count) if wk.count else "—"
-        extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
-        if name == "review" and sv.review_capped:
-            extra += (
-                f"  ({len(sv.review_capped)} daily-capped: {','.join('#' + str(p) for p, _ in sv.review_capped[:5])})"
-            )
-        note = (_sample(wk.actionable) or "") + extra
-        if name == "bump" and not wk.actionable and not wk.suppressed:
-            note = "no broken bump-mathlib PR"
+        ready, note = _roadmap_note(sv, escape) if name == "roadmap" else _kind_note(sv, name)
         t.add_row(num, kind_cell, ready, note, style=style)
-        if name in expanded:  # tree-style PR list under the expanded kind
-            rows = [(c, False) for c in wk.actionable] + [(c, True) for c in wk.suppressed]
-            if not rows:
-                t.add_row("", "    └ (none)", "", "", style="dim")
-            for c, supp in rows:
-                title = titles.get(c.pr) or c.reason or ""
-                tag = " [dim](past-budget)[/]" if supp else ""
-                t.add_row("", f"    └ #{c.pr}", "", f"[dim]{escape(title)}[/]" + tag)
+        if name in expanded:  # tree-style PR / area list under the expanded kind
+            for label, tag in _expansion_rows(sv, name, titles, areas):
+                t.add_row("", escape(label), "", escape(tag), style="dim")
     console.print(t)
 
     nxt = sv.next_auto_stage
@@ -454,53 +471,12 @@ def _dashboard_app(cfg, loader=None):
                 def cell(s, sel=is_sel):
                     return Text(s, style="reverse bold" if sel else "")
 
-                if name == "roadmap":
-                    skip = set(sv.roadmap_skip)
-                    skip_note = f"  (skip: {', '.join(sv.roadmap_skip)})" if sv.roadmap_skip else ""
-                    if sv.roadmap_backpressure:
-                        ready = "⛔"
-                        note = (
-                            f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (only: {sv.roadmap_only}){skip_note}"
-                        )
-                    else:
-                        ready = "∞"
-                        note = f"only: {sv.roadmap_only}{skip_note}"
-                    self._hdr_row[name] = t.row_count
-                    t.add_row(cell(num), cell(marker + name), cell(ready), cell(note))
-                    if name in self.expanded:
-                        if not self.areas:
-                            t.add_row(Text(""), Text("    └ (areas unavailable)", style="dim"), Text(""), Text(""))
-                        else:
-                            # "auto" mode pins no area (a random one is picked per round), so no row
-                            # matches and no "← only" marker shows — the intended display.
-                            for a in ["(all areas)"] + self.areas:
-                                active = a == sv.roadmap_only or (a == "(all areas)" and sv.roadmap_only in ("", "any"))
-                                tag = "← only" if active else ("(skipped)" if a in skip else "")
-                                t.add_row(
-                                    Text(""),
-                                    Text("    └ " + a, style="dim"),
-                                    Text(""),
-                                    Text(tag, style="dim"),
-                                )
-                    continue
-                wk = sv.kind(name)
-                ready = str(wk.count) if wk.count else "—"
-                extra = f"  (+{len(wk.suppressed)} past-budget)" if wk.suppressed else ""
-                note = (_sample(wk.actionable) or "") + extra
-                if name == "bump" and not wk.actionable and not wk.suppressed:
-                    note = "no broken bump-mathlib PR"
+                ready, note = _roadmap_note(sv) if name == "roadmap" else _kind_note(sv, name)
                 self._hdr_row[name] = t.row_count
                 t.add_row(cell(num), cell(marker + name), cell(ready), cell(note))
                 if name in self.expanded:
-                    rows = [(c, False) for c in wk.actionable] + [(c, True) for c in wk.suppressed]
-                    if not rows:
-                        t.add_row(Text(""), Text("    └ (none)", style="dim"), Text(""), Text(""))
-                    for c, supp in rows:
-                        title = titles.get(c.pr) or c.reason or ""
-                        tag = "  (past-budget)" if supp else ""
-                        t.add_row(
-                            Text(""), Text(f"    └ #{c.pr}", style="dim"), Text(""), Text(title + tag, style="dim")
-                        )
+                    for label, tag in _expansion_rows(sv, name, titles, self.areas):
+                        t.add_row(Text(""), Text(label, style="dim"), Text(""), Text(tag, style="dim"))
             row = self._hdr_row.get(sel_name, 0)
             if t.row_count:
                 t.move_cursor(row=row, animate=False)  # scroll the selected kind into view (no focus needed)

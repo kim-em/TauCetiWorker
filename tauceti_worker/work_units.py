@@ -1,4 +1,5 @@
-"""tauceti_worker.work_units — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.work_units — the want-gated cascade: pick one actionable PR per round and dispatch
+its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble."""
 
 from __future__ import annotations
 
@@ -40,8 +41,8 @@ from .round import Claims, RoundContext
 from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
 
 # ============================================================================
-# Round — the want-gated cascade over survey(). Pre-passes (merge/abandon/dedup)
-# always run (quota-free); then ONE work unit. Mirrors round.sh main().
+# Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
+# Merging green PRs, abandoning stuck ones, and de-duplicating is the repo's CI now, not the worker.
 # ============================================================================
 
 
@@ -57,8 +58,6 @@ class RoundOpts:
     work_model: str  # the concrete model to run (codex|claude|deepseek|minimax), or 'auto' for dry-run
     sandbox_host: bool  # True = --host (opt out of bubble)
     dry_run: bool
-    ignore_quota: bool = False
-    quota_cmd: str | None = None
 
     @property
     def agent_name(self) -> str:
@@ -253,7 +252,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     return rc
 
 
-# --- the work units (host path here; bubble path lands in M9) ---------------
+# --- the work units (each runs in bubble by default, or on the host with --host) ---
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
@@ -275,7 +274,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers} (CI retires at the cap)")
     try:
         if bubble:
-            rc = review_in_bubble(w, pr, head, reviewers, opts)  # M9b
+            rc = review_in_bubble(w, pr, head, reviewers, opts)
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             rc = run_to_logfile(
@@ -519,7 +518,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             opts,
             mounts=[f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"],
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
-        )  # M9
+        )
     if not prepare_checkout(w.cfg):
         raise Die("checkout failed")
     prompt = fill_prompt(

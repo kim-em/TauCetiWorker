@@ -1,4 +1,5 @@
-"""tauceti_worker.github — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.github — the gh CLI wrapper: PR/issue queries, reactions, fork resolution, and
+GitHub REST rate-limit handling."""
 
 from __future__ import annotations
 
@@ -104,7 +105,7 @@ def _resolve_fork() -> str:
 
 # ============================================================================
 # run() — subprocess helpers. close_fds=True (Python default) means children never
-# inherit the round.lock fd, retiring round.sh's hand-managed `9>&-` fd-leak fix.
+# inherit the round.lock fd (the old shell worker needed a hand-managed `9>&-` for this).
 # ============================================================================
 
 

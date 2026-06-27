@@ -1,4 +1,5 @@
-"""tauceti_worker.constants — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.constants — repo names, per-PR budgets, loop timing, rate-limit regexes, and the
+agent/task tables."""
 
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ ROADMAP = "FormalFrontier/TauCetiRoadmap"
 REVIEW = "FormalFrontier/TauCetiReview"
 
 
-# Per-PR budgets (a PR can never churn forever). Names match round.sh.
+# Per-PR budgets (a PR can never churn forever).
 MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't change (a stuck
 
 # head never advances a review round, so CI's round cap can't catch it).
@@ -60,7 +61,7 @@ BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mat
 MAX_OPEN_PRS = 8  # backpressure: don't author new roadmap PRs while this many of ours are open
 
 
-# Loop timing (loop.sh). Env-overridable for tuning and tests.
+# Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
 ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
@@ -148,5 +149,3 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 
 
 AGENTS = ["auto", "codex", "claude", "deepseek", "minimax"]
-
-SUBSCRIPTION_AGENTS = {"codex", "claude"}

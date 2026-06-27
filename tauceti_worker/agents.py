@@ -1,4 +1,5 @@
-"""tauceti_worker.agents — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.agents — prompt filling, the host/bubble checkout, and the agent launch: the host
+argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolation)."""
 
 from __future__ import annotations
 
@@ -20,10 +21,10 @@ from .paths import HERE
 from .quota import _claude_keychain_creds_interactive, _read_json_file, _write_json_atomic, claude_dir, mirror_creds
 
 # ============================================================================
-# Agents — prompt filling, the host checkout, and the byte-for-byte agent launch.
-# The host argv lists reproduce round.sh's run_agent exactly (the `( cd … ) 9>&-`
-# and `env -u` mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh /
-# git-safe-push / gh-safe-pr-create are put on the agent's PATH so it can push.
+# Agents — prompt filling, the host checkout, and the agent launch. The host argv lists are a frozen
+# contract — keep them byte-for-byte stable (the historical `( cd … ) 9>&-` and `env -u` shell
+# mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh / git-safe-push /
+# gh-safe-pr-create are put on the agent's PATH so it can push.
 # ============================================================================
 
 
@@ -76,7 +77,7 @@ def fetch_ref(repo: str, dir: Path) -> bool:
 
 
 def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
-    """The exact argv + env for the host work agent (round.sh run_agent). HERE is on PATH so the agent
+    """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     if work_model == "codex":
@@ -154,7 +155,7 @@ def _shq(s: str) -> str:
 # The checkout, lake build, and every git/gh call happen IN a repo-scoped bubble
 # container. GitHub goes through bubble's auth proxy (the host gh token never
 # enters); only the one credential the work model needs is seeded; no host config
-# crosses the boundary. Byte-for-byte the same agent invocation as round.sh.
+# crosses the boundary. The in-container agent invocation is a frozen contract (see agent_inner_cmd).
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
 
@@ -332,8 +333,9 @@ def _codex_model() -> str:
 
 
 def agent_inner_cmd(work_model: str) -> str:
-    """The command bubble runs INSIDE the container (bash -lc). Byte-for-byte round.sh's agent_inner_cmd:
-    the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force subscription auth."""
+    """The command bubble runs INSIDE the container (bash -lc); a frozen contract, kept byte-for-byte
+    stable: the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force
+    subscription auth."""
     import shlex
 
     if work_model == "codex":
@@ -622,7 +624,7 @@ def _seed_gh_token_for_isolation() -> None:
 
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
-    review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface from the real
+    review / the --isolate-home flag). Symlinks the read-only Claude tool/config surface from the real
     config dir; copies the mutable Claude/Codex auth files in ONCE, then records the source dirs in
     .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher access token whenever the
     operator's external refresher rotates it. The worker itself never refreshes (never touches the

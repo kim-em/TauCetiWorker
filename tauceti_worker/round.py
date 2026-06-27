@@ -1,4 +1,5 @@
-"""tauceti_worker.round — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.round — round lifecycle: the per-worker lock, signal/cleanup handling, the
+branch-claim heartbeat, and the loop→child round spawn with process-group teardown."""
 
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from .paths import CLAIM_SH, self_argv, self_env
 # the loop→child spawn with process-group teardown.
 #
 # Python's default close_fds=True means children never inherit the round.lock fd,
-# so round.sh's hand-managed `9>&-` fd-leak fix (commit 3e4828b) is automatic; we
+# so the old shell worker's hand-managed `9>&-` fd-leak fix (commit 3e4828b) is automatic; we
 # also mark the lock fd non-inheritable as belt-and-suspenders. Running each round
 # as a child of the loop in its OWN session is what makes timeout teardown, the
 # cleanup-on-exit, and a SIGKILL-self-cleaning bubble behave like the shell.

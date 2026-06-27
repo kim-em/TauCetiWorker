@@ -411,8 +411,6 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             work_model=work_model,
             sandbox_host=getattr(args, "host", False),
             dry_run=dry,
-            ignore_quota=ignore_quota,
-            quota_cmd=quota_cmd,
         )
         if not dry:
             preflight(cfg, opts)

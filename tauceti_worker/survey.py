@@ -1,4 +1,5 @@
-"""tauceti_worker.survey — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.survey — classify every open PR per work-kind into the read-only Survey that the
+picker, `status`, and the TUI all consume."""
 
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ from .github import GitHub, GitHubError, me
 from .review_state import Meta, ReviewState
 
 # ============================================================================
-# Counters — state/<wid>/... single-integer files (round.sh `counter`).
+# Counters — state/<wid>/... single-integer counter files.
 # ============================================================================
 
 
@@ -109,7 +110,6 @@ class Candidate:
     reason: str = ""
     attempts: int = 0
     budget: int = 0
-    provenance: str = "fresh"
     contest: str = ""  # set to the contested rubric when this is an author-contest re-review
     contest_reply_id: int = 0  # the review-comment id of the contesting reply (the 👀 claim anchor)
 
@@ -329,7 +329,6 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
                 p.number,
                 p.head_oid,
                 "build-green, head not cleanly reviewed",
-                provenance=m.provenance,
                 attempts=counters.read(f"review-err-{p.number}"),
                 budget=MAX_REVIEW_ERRORS,
             )
@@ -380,7 +379,6 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             p.number,
             p.head_oid,
             f"author contest on {rubric}",
-            provenance=m.provenance,
             contest=rubric,
             contest_reply_id=reply["id"],
             attempts=counters.read(f"review-contest-{p.number}"),

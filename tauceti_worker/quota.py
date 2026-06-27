@@ -1,4 +1,5 @@
-"""tauceti_worker.quota — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.quota — the subscription pacer: read Codex/Claude usage and credentials and decide
+which model may run now, plus the isolated-home credential mirroring."""
 
 from __future__ import annotations
 

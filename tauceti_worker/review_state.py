@@ -1,4 +1,5 @@
-"""tauceti_worker.review_state — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.review_state — read the PR scoreboard comment (the multi-agent source of truth)
+behind a short-TTL cache, with the predicates the cascade gates on."""
 
 from __future__ import annotations
 
@@ -133,10 +134,7 @@ class ReviewState:
     def bust(self, pr: int) -> None:
         self._cache_path(pr).unlink(missing_ok=True)
 
-    # --- predicates over the meta (verbatim ports of the round.sh jq) ---
-    def ledger_head(self, pr: int) -> str:
-        return str(self.gh_meta(pr).data.get("head_sha") or "")
-
+    # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
         runs = self.gh_meta(pr).data.get("runs") or []
         if runs and all(r.get("verdict") != "error" for r in runs):
@@ -202,16 +200,6 @@ class ReviewState:
             return any(v not in ("green", "stale") for v in states.values())
         runs = m.get("runs") or []
         return any(r.get("verdict") not in ("approve", "error") for r in runs)
-
-    def review_all_green(self, pr: int, head: str) -> Meta:
-        """Returns the Meta (so callers can inspect provenance); .data['_all_green'] is the verdict."""
-        meta = self.gh_meta(pr)
-        m = meta.data
-        runs = m.get("runs") or []
-        green = (
-            str(m.get("head_sha") or "") == head and len(runs) > 0 and all(r.get("verdict") == "approve" for r in runs)
-        )
-        return Meta({**m, "_all_green": green}, meta.provenance)
 
 
 def inflight_review_providers(comments: list[dict] | None, head: str, now: int) -> set[str]:
