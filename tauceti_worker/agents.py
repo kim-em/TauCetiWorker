@@ -580,6 +580,46 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
     return root / f"{wid[:keep]}-{digest}"
 
 
+def _seed_gh_token_for_isolation() -> None:
+    """macOS only: export $GH_TOKEN from the operator's gh login BEFORE isolate_home repoints $HOME.
+
+    gh stores its token in the login Keychain, which gh's keyring backend can resolve via
+    $HOME/Library/Keychains on an affected setup. Once isolate_home sets $HOME to the worker's short
+    isolated home, that lookup misses and the survey's `gh pr list` fails unauthenticated — the worker
+    aborts the round (Bryan's report). The GH_CONFIG_DIR redirect recovers gh's host LIST but not the
+    keychain-backed token. So while the real $HOME still reaches the Keychain, capture the token and
+    export it: gh and gh's git credential helper both honour $GH_TOKEN ahead of the keychain, so child
+    calls (the survey, host pushes, and the agent's own gh on --host) stay authenticated under the
+    isolated home. macOS is single-account by nature, so one token is correct.
+
+    Scope/limits: github.com only (the sole host TauCeti uses; a GHES remote would need a separate
+    $GH_ENTERPRISE_TOKEN). Captured once, at isolation — a long `--loop` inherits it for the run, which
+    matches gh's own use of the static keychain token; if the operator rotates gh creds mid-loop,
+    restart the worker to re-seed. No-op off macOS (Linux keeps its token in the redirected
+    GH_CONFIG_DIR or a session keyring, neither $HOME-path-scoped), when the operator already exported a
+    token, or when capture fails (logged, then left for `gh auth login` / `--worker-id default` — no
+    worse than before this seed existed)."""
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return  # respect an operator-set token; don't shell out
+    try:
+        r = subprocess.run(
+            ["gh", "auth", "token", "--hostname", "github.com"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not capture a gh token for the isolated home ({e}); gh may fail under the isolated $HOME")
+        return
+    tok = (r.stdout or "").strip()
+    if r.returncode == 0 and tok:
+        os.environ["GH_TOKEN"] = tok
+    else:
+        log(
+            "could not capture a gh token for the isolated home (gh auth token failed); gh may fail "
+            "under the isolated $HOME on macOS — run `gh auth login` or pass --worker-id default"
+        )
+
+
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
     review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface from the real
@@ -669,12 +709,18 @@ def isolate_home(wid: str) -> Path:
     # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
     # point them back at the operator's real config rather than an empty isolated one. Respect a value
     # the operator already exported. Children inherit these, so the early-return path above is covered.
+    # (On macOS this redirect recovers gh's host list but not its keychain-backed token — that needs the
+    # $GH_TOKEN seed just below, before $HOME moves.)
     gh_cfg = real / ".config" / "gh"
     if gh_cfg.is_dir():
         os.environ.setdefault("GH_CONFIG_DIR", str(gh_cfg))
     git_cfg = real / ".gitconfig"
     if git_cfg.exists():
         os.environ.setdefault("GIT_CONFIG_GLOBAL", str(git_cfg))
+    # Capture gh's keychain-backed token while the real $HOME still reaches the login Keychain (macOS),
+    # so child gh/git calls authenticate via $GH_TOKEN once $HOME is repointed below. Must precede the
+    # $HOME assignment — afterwards the Keychain lookup misses.
+    _seed_gh_token_for_isolation()
     os.environ["HOME"] = str(home)
     os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)  # so claude_dir() + the spawned claude agree
     log(f"isolated HOME={home} (worker '{wid}')")
