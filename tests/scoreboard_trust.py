@@ -56,6 +56,12 @@ def empty_marker(updated, garbage=False):
     return {"body": f"<!--tauceti-scoreboard--> {tail}", "updated_at": updated, "author_association": "MEMBER"}
 
 
+def nondict_marker(updated, literal="[]"):
+    """A scoreboard marker whose meta is valid JSON but NOT an object (list/string/number/null) — not a
+    usable scoreboard, and must never be cached (callers call meta.data.get(...))."""
+    return {"body": f"<!--tauceti-scoreboard--> <!--tauceti-meta:v1 {literal}-->", "updated_at": updated}
+
+
 def make_rs(comments):
     cfg = types.SimpleNamespace(sbcache=Path(tempfile.mkdtemp()) / "sb")
     gh = types.SimpleNamespace(issue_comments=lambda pr: comments)
@@ -101,6 +107,13 @@ m = make_rs([sb("REALHEAD", "2026-06-26T12:00:00Z"), empty_marker("2026-06-26T18
 check("newer empty marker doesn't mask older valid scoreboard", m.data.get("head_sha") == "REALHEAD")
 m = make_rs([sb("REALHEAD", "2026-06-26T12:00:00Z"), empty_marker("2026-06-26T18:00:00Z", garbage=True)]).gh_meta(478)
 check("newer garbage-meta marker doesn't mask older valid scoreboard", m.data.get("head_sha") == "REALHEAD")
+# valid JSON but non-dict meta (list / null) is not a usable scoreboard: skip to the older real one...
+for lit in ("[]", "null", '"x"', "123"):
+    m = make_rs([sb("REALHEAD", "2026-06-26T12:00:00Z"), nondict_marker("2026-06-26T18:00:00Z", lit)]).gh_meta(480)
+    check(f"non-dict meta {lit!r} doesn't mask older valid scoreboard", m.data.get("head_sha") == "REALHEAD")
+# ...and a lone non-dict marker yields a safe empty dict (provenance missing), never a non-dict .data
+m = make_rs([nondict_marker("2026-06-26T18:00:00Z", "[]")]).gh_meta(481)
+check("lone non-dict meta -> missing with dict data", m.data == {} and m.provenance == "missing")
 
 # 8) Cache poisoning: once a scoreboard is cached, a later SUCCESSFUL fetch that finds none returns
 #    'missing' (not the cached value) past the TTL — a forged-then-deleted board can't linger.

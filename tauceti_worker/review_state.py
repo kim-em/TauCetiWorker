@@ -103,10 +103,15 @@ class ReviewState:
                 if not matches:
                     continue
                 try:
-                    data = json.loads(matches[-1].strip())
-                    break
+                    parsed = json.loads(matches[-1].strip())
                 except json.JSONDecodeError:
                     continue
+                # Require an object: a newer marker carrying valid JSON that ISN'T a dict (a list, string,
+                # number, or null) is not a usable scoreboard — skip to an older marker rather than cache
+                # it as fresh (callers do meta.data.get(...), which would crash on a non-dict).
+                if isinstance(parsed, dict):
+                    data = parsed
+                    break
 
         if data is None:
             # Serve a prior value ONLY on a fetch failure (transient); a successful fetch that parsed no
