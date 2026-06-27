@@ -105,6 +105,15 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         else:
             log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
 
+    # Explain why a fix-focused worker has nothing to fix: for each of the contributor's own PRs that is
+    # not an actionable fix candidate, say why (awaiting first review, head moved, all green, attempts
+    # spent). Scoped to a fix-focused run (`--only fix[,...]`) so the full-auto loop's per-round firehose
+    # stays quiet; this is the missing signal behind Bryan's report — a one-shot `work --only fix` minutes
+    # before the scoreboard landed printed a bare "no eligible work" with no hint the PR was just waiting.
+    if "fix" in opts.only:
+        for pr, why in sv.fix_waiting:
+            log(f"  fix #{pr}: {why}")
+
     # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
     # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
     # per PR for a permanent record. These PRs neither merge nor advance toward CI's round cap, so a

@@ -23,6 +23,7 @@ RUN_STDLIB=(
   claude_config_dir.py
   claude_keychain.py
   contest_claim.py
+  fix_diagnostic.py
   fork_authoring.py
   github_ratelimit.py
   ignore_quota_hardblock.py
