@@ -27,7 +27,7 @@ from .constants import (
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, me
-from .review_state import ReviewState
+from .review_state import Meta, ReviewState
 
 # ============================================================================
 # Counters — state/<wid>/... single-integer files (round.sh `counter`).
@@ -155,6 +155,12 @@ class Survey:
     # ledger). Skipped this round — reviewing them would only make the engine clone repos then refuse,
     # which is the tight loop we hit. (pr, "n/cap") for a one-line status note; resets at 00:00 UTC.
     review_capped: list[tuple[int, str]] = field(default_factory=list)
+    # Tended PRs that are NOT actionable for `fix`, each with a one-line reason (awaiting first review,
+    # head moved since review, reviews all green, fix attempts spent, or a transient fetch failure). A
+    # fix-focused worker logs these so it explains its idleness instead of sitting on a bare "no eligible
+    # work" — reviews are async, so a one-shot `work --only fix` right after opening a PR commonly finds
+    # the scoreboard not yet posted. (pr, reason) for a one-line status note.
+    fix_waiting: list[tuple[int, str]] = field(default_factory=list)
 
     def kind(self, name: str) -> WorkKind:
         return {
@@ -199,6 +205,46 @@ def spread_candidates(candidates: list, rng=random) -> list:
     out = list(candidates)
     rng.shuffle(out)
     return out
+
+
+def fix_disposition(meta: Meta, head: str, build_success: bool, blocking: bool, per_head: int) -> tuple[str, str]:
+    """Classify a tended PR for the `fix` stage from its scoreboard meta. Returns (disposition, reason):
+
+      'actionable' — a blocking rubric stands at the current head, under the per-head attempt budget
+      'exhausted'  — blocking at head, but the per-head fixer budget is spent (reason names the count)
+      'waiting'    — not actionable now; reason explains why (awaiting first review, head moved,
+                     reviews all green, or a transient fetch failure) so a fix-focused worker can say
+                     whether to wait for reviews, re-push, or stop
+      'skip'       — nothing worth a status line (a red PR awaiting CI, not review)
+
+    `blocking` is rs.ledger_blocking(pr, head) — the same authority CI's close reads — passed in so this
+    stays a pure formatter with no second copy of the blocking rule. A pure function (no I/O): the survey
+    fetches the meta + predicate, this decides the disposition and phrases the reason.
+    """
+    lh = str(meta.data.get("head_sha") or "")
+    if lh != head:
+        # No (current) review verdict stands at the head.
+        if not build_success:
+            return ("skip", "")  # red build: fix-ci/bump greens it before a review can land — not fix's
+        # A failed live fetch — whether or not a stale cache backs it — means we can't trust head_sha to
+        # tell "head moved" from "couldn't refresh", so don't assert either; say so and let a later round retry.
+        if meta.provenance in ("fetch_failed", "stale"):
+            return ("waiting", "could not read current review state (GitHub fetch failed) — will retry next round")
+        if lh:
+            return ("waiting", f"reviewed at {lh[:12]}; head moved to {head[:12]} — awaiting re-review")
+        return ("waiting", "build-green, awaiting first review (no scoreboard at this head yet)")
+    if not blocking:
+        # head matches the scoreboard. With verdicts present this is a genuine all-green; with none at all
+        # (a malformed/skeleton scoreboard) ledger_blocking is also false, but "all green" would mislead.
+        if (meta.data.get("states") or {}) or (meta.data.get("runs") or []):
+            return ("waiting", "reviews all green — nothing to fix")
+        return ("waiting", "review recorded at this head but no rubric verdicts yet — awaiting review")
+    if per_head >= MAX_FIX_ATTEMPTS:
+        return (
+            "exhausted",
+            f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — needs a human",
+        )
+    return ("actionable", "")
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
@@ -352,19 +398,29 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     if deep:
         # 3) fix: tended (ours or bot-authored), reviewed-at-head, latest rubric blocking, under
         #    budgets. Bump PRs get reviewed like any other, so a blocking rubric on one is ours to fix
-        #    (orthogonal to the bump stage, which only adapts a RED build).
+        #    (orthogonal to the bump stage, which only adapts a RED build). Every tended PR that is NOT
+        #    actionable records a one-line reason in fix_waiting (awaiting first review, head moved, all
+        #    green, attempts spent) so a fix-focused worker explains its idleness instead of a bare
+        #    "no eligible work" — reviews are async, so a one-shot fix run can precede the scoreboard.
         for p in tended:
-            if rs.ledger_head(p.number) != p.head_oid:
-                continue
-            if not rs.ledger_blocking(p.number, p.head_oid):
-                continue
-            c = Candidate(p.number, p.head_oid, "blocking review at head")
+            meta = rs.gh_meta(p.number)
+            blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
-            c.attempts, c.budget = per_head, MAX_FIX_ATTEMPTS
-            if per_head >= MAX_FIX_ATTEMPTS:
-                sv.needs_fix.suppressed.append(c)
-            else:
+            disp, why = fix_disposition(meta, p.head_oid, p.build_success, blocking, per_head)
+            if disp == "skip":
+                continue
+            if disp == "actionable":
+                c = Candidate(
+                    p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
+                )
                 sv.needs_fix.actionable.append(c)
+                continue
+            sv.fix_waiting.append((p.number, why))
+            if disp == "exhausted":
+                c = Candidate(
+                    p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
+                )
+                sv.needs_fix.suppressed.append(c)
 
     # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
     #    the bump stage's job (its adaptation prompt knows mathlib moved), so fix-ci defers those to
