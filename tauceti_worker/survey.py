@@ -223,16 +223,22 @@ def fix_disposition(meta: Meta, head: str, build_success: bool, blocking: bool, 
     """
     lh = str(meta.data.get("head_sha") or "")
     if lh != head:
-        # No review verdict stands at the current head.
+        # No (current) review verdict stands at the head.
         if not build_success:
             return ("skip", "")  # red build: fix-ci/bump greens it before a review can land — not fix's
-        if meta.provenance == "fetch_failed":
-            return ("waiting", "could not read review state (GitHub fetch failed) — will retry next round")
+        # A failed live fetch — whether or not a stale cache backs it — means we can't trust head_sha to
+        # tell "head moved" from "couldn't refresh", so don't assert either; say so and let a later round retry.
+        if meta.provenance in ("fetch_failed", "stale"):
+            return ("waiting", "could not read current review state (GitHub fetch failed) — will retry next round")
         if lh:
             return ("waiting", f"reviewed at {lh[:12]}; head moved to {head[:12]} — awaiting re-review")
         return ("waiting", "build-green, awaiting first review (no scoreboard at this head yet)")
     if not blocking:
-        return ("waiting", "reviews all green — nothing to fix")
+        # head matches the scoreboard. With verdicts present this is a genuine all-green; with none at all
+        # (a malformed/skeleton scoreboard) ledger_blocking is also false, but "all green" would mislead.
+        if (meta.data.get("states") or {}) or (meta.data.get("runs") or []):
+            return ("waiting", "reviews all green — nothing to fix")
+        return ("waiting", "review recorded at this head but no rubric verdicts yet — awaiting review")
     if per_head >= MAX_FIX_ATTEMPTS:
         return (
             "exhausted",

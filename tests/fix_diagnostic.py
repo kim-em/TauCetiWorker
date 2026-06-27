@@ -79,6 +79,14 @@ check(
     "waiting",
     "all green",
 )
+# head matches a scoreboard that carries no verdicts at all (malformed/skeleton): ledger_blocking is
+# also false, but "all green" would mislead — say the verdicts aren't in yet.
+check(
+    "reviewed at head, no verdicts -> waiting (awaiting review), not 'all green'",
+    disp(meta({"head_sha": HEAD}), blocking=False),
+    "waiting",
+    "no rubric verdicts yet",
+)
 
 # --- waiting: build-green, no scoreboard at this head (Bryan's case) -----------------------------
 check(
@@ -102,6 +110,13 @@ check(
     disp(meta({}, "fetch_failed"), blocking=False),
     "waiting",
     "fetch failed",
+)
+# A stale cache (fetch failed, serving an old head) must not assert "head moved" — head_sha is unreliable.
+check(
+    "stale cache at old head -> waiting (could not read), not 'head moved'",
+    disp(meta({"head_sha": OLD}, "stale"), blocking=False),
+    "waiting",
+    "could not read current review state",
 )
 
 # --- skip: a red PR with no review at head is fix-ci/bump's job, not a fix-stage status line ------

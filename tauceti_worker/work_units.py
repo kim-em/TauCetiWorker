@@ -107,10 +107,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 
     # Explain why a fix-focused worker has nothing to fix: for each of the contributor's own PRs that is
     # not an actionable fix candidate, say why (awaiting first review, head moved, all green, attempts
-    # spent). Scoped to a fix-focused run (`--only fix[,...]`) so the full-auto loop's per-round firehose
-    # stays quiet; this is the missing signal behind Bryan's report — a one-shot `work --only fix` minutes
+    # spent). Scoped to a fix-focused run (`--only fix[,...]`) with NO actionable fix this round, so it
+    # never talks over a round that is about to fix something and the full-auto loop's per-round firehose
+    # stays quiet. This is the missing signal behind Bryan's report — a one-shot `work --only fix` minutes
     # before the scoreboard landed printed a bare "no eligible work" with no hint the PR was just waiting.
-    if "fix" in opts.only:
+    if "fix" in opts.only and not sv.needs_fix.actionable:
         for pr, why in sv.fix_waiting:
             log(f"  fix #{pr}: {why}")
 
