@@ -25,8 +25,6 @@ from .github import GitHub
 
 META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
 
-TRUSTED_ASSOC = {"OWNER", "MEMBER", "COLLABORATOR"}
-
 
 @dataclass
 class Meta:
@@ -65,11 +63,20 @@ class ReviewState:
         return inflight_review_providers(self._issue_comments(pr), head, int(time.time()))
 
     def gh_meta(self, pr: int) -> Meta:
-        """Newest trusted scoreboard's <!--tauceti-meta:v1 {...}--> JSON, with TTL cache.
+        """Newest scoreboard's <!--tauceti-meta:v1 {...}--> JSON, identified by the <!--tauceti-scoreboard-->
+        marker, with TTL cache.
 
-        Trust = the <!--tauceti-scoreboard--> marker AND an author with repo association, so a random
-        external comment can't forge review state. Empty fetch with a prior cache value → serve the
-        stale value (stale-but-real beats a phantom '{}'); only fall to '{}' with no cache at all.
+        We DON'T gate on the comment author's repo association. `author_association` is viewer-dependent:
+        a reviewer who is a PRIVATE org member reads as MEMBER to themselves but as CONTRIBUTOR/NONE to an
+        outside contributor, so an association filter silently discarded legitimate scoreboards for every
+        unprivileged contributor (Bryan's PR #470: a real kim-em scoreboard, four blocking rubrics, that
+        his worker treated as "no scoreboard at this head" — so `fix` never ran). The cost of trusting any
+        marked scoreboard is bounded: this meta only drives the worker's OWN review/fix eligibility on its
+        OWN PRs; the merge gate reads the authoritative, write-restricted TauCetiData records, not this
+        comment, so a forged comment cannot merge anything. The residual risk is a forged all-green
+        scoreboard suppressing a review — which a forger can't parlay into a merge and which self-heals on
+        the next push (its head_sha stops matching). Empty fetch with a prior cache value → serve the stale
+        value (stale-but-real beats a phantom '{}'); only fall to '{}' with no cache at all.
         """
         cache = self._cache_path(pr)
         if cache.exists():
@@ -81,14 +88,10 @@ class ReviewState:
         meta_str = ""
         fetch_failed = comments is None
         if comments:
-            trusted = [
-                c
-                for c in comments
-                if "<!--tauceti-scoreboard-->" in (c.get("body") or "") and c.get("author_association") in TRUSTED_ASSOC
-            ]
-            trusted.sort(key=lambda c: c.get("updated_at", ""))
-            if trusted:
-                body = trusted[-1].get("body") or ""
+            marked = [c for c in comments if "<!--tauceti-scoreboard-->" in (c.get("body") or "")]
+            marked.sort(key=lambda c: c.get("updated_at", ""))
+            if marked:
+                body = marked[-1].get("body") or ""
                 matches = META_RE.findall(body)
                 if matches:
                     meta_str = matches[-1].strip()
