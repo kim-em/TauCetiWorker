@@ -28,7 +28,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 
-TAUCETI = tc.constants.TAUCETI  # "FormalFrontier/TauCeti"
+TAUCETI = tc.constants.TAUCETI  # "TauCetiProject/TauCeti"
 FORK = "alice/TauCeti"
 fails = 0
 
@@ -83,7 +83,7 @@ def run_ensure_fork(scenario, env_fork=None):
 
 def test_ensure_fork():
     # existing fork resolved by parent (a same-named repo with a DIFFERENT parent must not match)
-    sc = {"repo_list": lambda: _repo_list_json("FormalFrontier", "TauCeti")}
+    sc = {"repo_list": lambda: _repo_list_json("TauCetiProject", "TauCeti")}
     check("ensure_fork: existing fork resolved by parent", run_ensure_fork(sc) == FORK)
 
     # resolve-by-parent: a same-named repo whose parent is someone ELSE is not our fork
@@ -93,7 +93,7 @@ def test_ensure_fork():
     # no fork yet -> create, then resolve (the list flips to the real fork after `gh repo fork`)
     sc = {
         "forked": False,
-        "repo_list": lambda: _repo_list_json("FormalFrontier", "TauCeti") if sc.get("forked") else "[]",
+        "repo_list": lambda: _repo_list_json("TauCetiProject", "TauCeti") if sc.get("forked") else "[]",
     }
     check("ensure_fork: absent -> create -> resolve", run_ensure_fork(sc) == FORK)
 
@@ -110,7 +110,7 @@ def test_ensure_fork():
     check("ensure_fork: $TAUCETI_FORK override", run_ensure_fork(sc, env_fork="bob/MyTauCeti") == "bob/MyTauCeti")
 
     # fork resolves but the account can't push to it -> Die (explicit false only; None fails open)
-    sc = {"repo_list": lambda: _repo_list_json("FormalFrontier", "TauCeti"), "can_push": "false"}
+    sc = {"repo_list": lambda: _repo_list_json("TauCetiProject", "TauCeti"), "can_push": "false"}
     try:
         run_ensure_fork(sc)
         check("ensure_fork: unpushable fork -> Die", False)

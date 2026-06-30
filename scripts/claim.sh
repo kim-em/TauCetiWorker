@@ -23,11 +23,11 @@
 #   claim.sh list    [--full]              # list live claim refs (--full fetches each lease)
 #   claim.sh gc                            # CAS-delete expired claims
 #
-# Env: CLAIM_REPO (default FormalFrontier/TauCeti), TAUCETI_WORKER_ID (default host-pid),
+# Env: CLAIM_REPO (default TauCetiProject/TauCeti), TAUCETI_WORKER_ID (default host-pid),
 #      CLAIM_TTL (default 1500), CLAIM_GITDIR (scratch object store).
 set -uo pipefail
 
-REPO="${CLAIM_REPO:-FormalFrontier/TauCeti}"
+REPO="${CLAIM_REPO:-TauCetiProject/TauCeti}"
 URL="https://github.com/$REPO"
 WID="${TAUCETI_WORKER_ID:-$(hostname)-$$}"
 DEFAULT_TTL="${CLAIM_TTL:-1500}"

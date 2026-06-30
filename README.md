@@ -1,6 +1,6 @@
 # Tau Ceti Worker
 
-`tauceti` keeps the [TauCeti](https://github.com/FormalFrontier/TauCeti) Lean
+`tauceti` keeps the [TauCeti](https://github.com/TauCetiProject/TauCeti) Lean
 library moving, using a "bring your own agent" approach. Run it with no command
 and you get a dashboard of the work the queue needs right now: PRs to review,
 fixes a review asked for, a Mathlib bump that needs adapting, roadmap targets.
@@ -10,10 +10,10 @@ and let it pick the most useful job each round until you stop it.
 
 It runs as your authenticated `gh` account: you set up `gh auth`, the worker acts
 as that account, and it treats that account's own PRs as the ones it tends. The
-repo is hardwired to `FormalFrontier/TauCeti`. This is an operator's tool for that
+repo is hardwired to `TauCetiProject/TauCeti`. This is an operator's tool for that
 project, not a general framework.
 
-You author through **your own fork**: the worker forks `FormalFrontier/TauCeti` (once,
+You author through **your own fork**: the worker forks `TauCetiProject/TauCeti` (once,
 automatically), pushes authored branches and fixes to that fork, and opens PRs from it —
 so you do **not** need write access to the canonical repo, only a `gh auth` that can fork
 it and push to your fork. (A fine-grained token scoped only to the canonical repo is not
@@ -81,7 +81,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
-| **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/FormalFrontier/TauCetiRoadmap) target. |
+| **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
 Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
 the worker. A GitHub API failure aborts the round rather than reading as "nothing
@@ -107,7 +107,7 @@ tauceti work --loop --only bump       # only adapt broken bump-mathlib PRs
 The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
 
 Roadmap rounds steer toward one area (a subdirectory of the
-[roadmap](https://github.com/FormalFrontier/TauCetiRoadmap)). Pin it with
+[roadmap](https://github.com/TauCetiProject/TauCetiRoadmap)). Pin it with
 `--roadmap-only <area>` (or `TAUCETI_ROADMAP_ONLY`, or the dashboard's `o`
 key); an empty value means "all areas". With nothing set, each round picks a
 fresh random area (so an unpinned `--loop` roams the whole roadmap over time).
@@ -195,7 +195,7 @@ In a bubble round the checkout, `lake build`, and every git/gh call happen insid
 the container:
 
 - GitHub traffic goes through bubble's auth proxy, scoped to
-  `FormalFrontier/TauCeti`. A push or API call outside that repo is rejected by
+  `TauCetiProject/TauCeti`. A push or API call outside that repo is rejected by
   the proxy, not just flagged by CI later.
 - Only the one credential the agent needs is seeded. The other models'
   credentials, and all your host config (`CLAUDE.md`, skills), stay out.

@@ -6,13 +6,13 @@ from __future__ import annotations
 import os
 import re
 
-TAUCETI = "FormalFrontier/TauCeti"
+TAUCETI = "TauCetiProject/TauCeti"
 
 TAUCETI_OWNER = TAUCETI.split("/", 1)[0]  # base-repo owner: a bot PR is first-party iff its head lives here
 
-ROADMAP = "FormalFrontier/TauCetiRoadmap"
+ROADMAP = "TauCetiProject/TauCetiRoadmap"
 
-REVIEW = "FormalFrontier/TauCetiReview"
+REVIEW = "TauCetiProject/TauCetiReview"
 
 
 # Per-PR budgets (a PR can never churn forever).

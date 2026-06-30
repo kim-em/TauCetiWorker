@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tauceti"
 version = "0.1.0"
-description = "Autonomous worker for the FormalFrontier/TauCeti Lean library"
+description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
 dependencies = ["rich>=13", "textual>=8,<9"]
 

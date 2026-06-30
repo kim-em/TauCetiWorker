@@ -146,7 +146,7 @@ class Config:
             home=h,
             state=state,
             checkout=HERE / "checkouts" / wid / "TauCeti",
-            store_dir=h / ".cache" / "tauceti-review" / wid / "store" / "FormalFrontier__TauCeti",
+            store_dir=h / ".cache" / "tauceti-review" / wid / "store" / "TauCetiProject__TauCeti",
             sbcache=state / "cache" / "scoreboard",
             logdir=HERE / "logs" / wid,
             quota_cache=state / "cache",

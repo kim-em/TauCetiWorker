@@ -1,9 +1,9 @@
-You are fixing FAILING CI on pull request #__PR__ of FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
+You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
 
 ## Find out what's actually failing
 - See which checks failed and read their logs:
-  - `gh pr checks __PR__ --repo FormalFrontier/TauCeti`
-  - `gh run view <run-id> --repo FormalFrontier/TauCeti --log-failed` (use the run id from the failing check)
+  - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
+  - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
 - Reproduce locally — this is the source of truth, not the log alone:
   ```
   lake exe cache get

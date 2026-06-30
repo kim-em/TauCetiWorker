@@ -3,7 +3,7 @@
 Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the work
 (one round, or the driver loop); `tauceti status` prints the read-only survey.
 
-The worker acts on FormalFrontier/TauCeti as the authenticated `gh` account, and
+The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
 of work, chosen in priority order: rebase → review → fix-ci → fix → bump → roadmap.
 The `bump` step adapts a red bump-mathlib PR (the review bot opens those; the worker
@@ -140,7 +140,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         metavar="AREA",
         help="for roadmap rounds, the single roadmap area to steer toward: a subdirectory of "
         "the TauCetiRoadmap repo. List them by opening the dashboard (bare `tauceti`) and "
-        "expanding the roadmap row, or browse github.com/FormalFrontier/TauCetiRoadmap. "
+        "expanding the roadmap row, or browse github.com/TauCetiProject/TauCetiRoadmap. "
         "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_ONLY "
         "unset) to pick a fresh random area each round. Overrides "
         "$TAUCETI_ROADMAP_ONLY for this run",
@@ -426,7 +426,7 @@ def cmd_egress_probe(args) -> int:
     # set +e so a non-zero curl (the blocked case) doesn't abort the script before we print the verdict.
     probe = (
         "sh -lc 'set +e; "
-        "if gh auth token >/dev/null 2>&1 && gh api /repos/FormalFrontier/TauCeti >/dev/null 2>&1; "
+        "if gh auth token >/dev/null 2>&1 && gh api /repos/TauCetiProject/TauCeti >/dev/null 2>&1; "
         "then echo PROXY_OK; else echo PROXY_FAIL; fi; "
         "if curl -sS --max-time 10 -o /dev/null https://example.com 2>/dev/null; "
         "then echo EGRESS_LEAK; else echo EGRESS_BLOCKED; fi'"

@@ -1,4 +1,4 @@
-You are authoring a new pull request to FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a clean checkout of `main`. Pick the LOWEST-HANGING genuine roadmap target (or a clean prerequisite a target needs) and write the best small, complete, sorry-free PR you can — optimised to pass the project's review rubrics. Do honest mathematics. Work autonomously to completion.
+You are authoring a new pull request to TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a clean checkout of `main`. Pick the LOWEST-HANGING genuine roadmap target (or a clean prerequisite a target needs) and write the best small, complete, sorry-free PR you can — optimised to pass the project's review rubrics. Do honest mathematics. Work autonomously to completion.
 
 ## Choose a target
 - **Work ONLY within the `__ONLY__` roadmap.** Read its plan under `__ROADMAP_DIR__/__ONLY__/` (provided read-only) — especially `README.md` and `Targets.lean` — and pick a target (or a clean prerequisite a target there needs) from THAT area only. Do not pick targets from other roadmap areas. (If `__ONLY__` is literally `any`, then any area under `__ROADMAP_DIR__/` is fair game, EXCEPT the skipped areas below.) Cite the exact target — e.g. `TauCetiRoadmap/__ONLY__/README.md` plus the specific item — in the PR body.
@@ -7,7 +7,7 @@ You are authoring a new pull request to FormalFrontier/TauCeti, an AIs-welcome L
   __CLAIMED__
 
   Everything else in `__ONLY__` is fair game. If the list above is `none`, there are no outstanding claims to avoid. These are cooperative claims registered by others; pick something genuinely distinct, not a near-variant of a claimed target.
-- **Avoid duplicating open work.** List the PRs already in flight and read their titles and descriptions: `gh pr list --repo FormalFrontier/TauCeti --state open --limit 100 --json number,title,headRefName,body`. Also skim recently MERGED PRs (`--state merged`) so you build on, rather than repeat, what already landed. Do NOT pick a target an open or merged PR already covers or substantially overlaps (the same definition, the same roadmap item, or a near-identical API). Within `__ONLY__`, prefer the lowest-hanging target not yet taken; if every easy one is in flight, pick a genuine prerequisite none of them supply. When in doubt that your idea is distinct, choose something else.
+- **Avoid duplicating open work.** List the PRs already in flight and read their titles and descriptions: `gh pr list --repo TauCetiProject/TauCeti --state open --limit 100 --json number,title,headRefName,body`. Also skim recently MERGED PRs (`--state merged`) so you build on, rather than repeat, what already landed. Do NOT pick a target an open or merged PR already covers or substantially overlaps (the same definition, the same roadmap item, or a near-identical API). Within `__ONLY__`, prefer the lowest-hanging target not yet taken; if every easy one is in flight, pick a genuine prerequisite none of them supply. When in doubt that your idea is distinct, choose something else.
 - Read the review rubrics you'll be judged against under `__REVIEW_DIR__/rubrics/*.md` (provided read-only): scope, correctness, reuse, attribution, api-design, generality, placement, naming, documentation, proof-quality, deprecation.
 - Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The pinned Mathlib source is vendored in this checkout at `.lake/packages/mathlib` once `lake exe cache get` (or dependency resolution) has run — `grep` there; don't try to clone it from the network.
 
@@ -42,7 +42,7 @@ If `lake build` is red, FIX IT or pick a smaller target. Never push red.
 **Do this synchronously, in this one turn.** Run the three commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed, pushed, and opened the PR (below). Pushing is the only thing that preserves your work.
 
 ## Submit
-You author from **your own fork** of FormalFrontier/TauCeti (`__FORK__/TauCeti`): the branch is pushed there, and the PR is opened from your fork to `FormalFrontier/TauCeti:main`. You do not need write access to the canonical repo. (The wrappers are already configured to push to your fork — just run them.)
+You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`): the branch is pushed there, and the PR is opened from your fork to `TauCetiProject/TauCeti:main`. You do not need write access to the canonical repo. (The wrappers are already configured to push to your fork — just run them.)
 - Create a branch `roadmap/<short-slug>-__WORKERID__` off `main` (the `-__WORKERID__` suffix keeps concurrent workers on one account from colliding). Commit (message `feat: <subject>`; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push the new branch to your fork with the project's safe wrapper — and ONLY the wrapper:
   ```
@@ -51,7 +51,7 @@ You author from **your own fork** of FormalFrontier/TauCeti (`__FORK__/TauCeti`)
   This create-only-pushes the branch to your fork (it fails closed if that branch name already exists, so two agents can't collide). Do NOT run a raw `git push`.
 - Open the PR with the project's safe wrapper — and ONLY the wrapper, passing your fork as the head with an explicit `--head` (note the `__FORK__:` prefix, and no `--fill` / interactive prompts):
   ```
-  gh-safe-pr-create --repo FormalFrontier/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
+  gh-safe-pr-create --repo TauCetiProject/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
   ```
   Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 

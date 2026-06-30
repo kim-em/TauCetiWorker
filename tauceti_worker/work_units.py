@@ -346,7 +346,7 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     # are kept in the local outbox — an external review will count once contributor-publishing lands.
     # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
     # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
-    perm = gh_run(["gh", "api", "repos/FormalFrontier/TauCetiData", "--jq", ".permissions.push"])
+    perm = gh_run(["gh", "api", "repos/TauCetiProject/TauCetiData", "--jq", ".permissions.push"])
     if perm.returncode == 0 and perm.stdout.strip() == "false":
         log(
             f"  review #{pr}: no write access to TauCetiData — review posted, records kept in "
