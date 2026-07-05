@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from .constants import (
     AGENT_NAMES,
     CONTEST_CLAIM_TTL,
     MAX_OPEN_PRS,
+    OPENROUTER_MODELS,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
@@ -208,6 +210,15 @@ def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool:
     return False
 
 
+def _host_agent_binary(model: str) -> str | None:
+    """The CLI a HOST round shells out to for `model` (None ⇒ nothing to gate). codex/claude are the
+    subscription binaries; an OpenRouter model runs through `pi`. Mirrors the host launchers in
+    agents.py and the review engine's own `shutil.which` gate."""
+    if model in OPENROUTER_MODELS:
+        return "pi"
+    return {"codex": "codex", "claude": "claude"}.get(model)
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
@@ -219,6 +230,24 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
+    # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
+    # review engine rejects `--reviewer codex` and do_review counts it as a PER-PR review error — so a
+    # machine-wide outage marches PRs one-by-one to the "needs a human" escalation cap. Catch it HERE,
+    # before launch, as a loud self-healing pause (NoProgress ⇒ backoff, no counter bump): every PR
+    # would hit the identical failure, so it must not be charged to any single PR's error budget.
+    if not bubble:
+        binname = _host_agent_binary(opts.work_model)
+        if binname and shutil.which(binname) is None:
+            warn_red(
+                f"agent '{opts.work_model}' needs the `{binname}` CLI on PATH, but it is not "
+                f"resolvable on this host — pausing this round. This is machine-wide (every PR would "
+                f"hit it), so it is NOT charged to any PR's review-error budget. Restore `{binname}` on "
+                f"the worker's PATH and the loop resumes on its own."
+            )
+            raise NoProgress(
+                f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host"
+            )
     fn = {
         "review": do_review,
         "fix": do_fix,
