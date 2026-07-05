@@ -27,13 +27,32 @@ def check(name, got, want):
     print(f"[{'OK ' if ok else 'XX '}] {name}: got {got!r} want {want!r}")
 
 
-# --- the model -> host-binary map (mirrors the launchers in agents.py + the engine's which() gate) ---
-check("codex -> codex", wu._host_agent_binary("codex"), "codex")
-check("claude -> claude", wu._host_agent_binary("claude"), "claude")
-check("deepseek -> pi", wu._host_agent_binary("deepseek"), "pi")
-check("minimax -> pi", wu._host_agent_binary("minimax"), "pi")
-check("auto -> None (nothing to gate)", wu._host_agent_binary("auto"), None)
-check("unknown -> None (nothing to gate)", wu._host_agent_binary("nope"), None)
+# --- review stage: literal names, matching the engine's own which() gate (it ignores CLAUDE_CMD/PI_RUN)
+check("review codex -> codex", wu._host_agent_binary("review", "codex"), "codex")
+check("review claude -> claude", wu._host_agent_binary("review", "claude"), "claude")
+check("review deepseek -> pi", wu._host_agent_binary("review", "deepseek"), "pi")
+check("review minimax -> pi", wu._host_agent_binary("review", "minimax"), "pi")
+check("review auto -> None (nothing to gate)", wu._host_agent_binary("review", "auto"), None)
+
+# --- non-review stages: the EXACT executable host_agent_argv will exec, so a custom TAUCETI_CLAUDE_CMD
+#     wrapper or PI_RUN path is preflighted faithfully (no false block, no missed gap). Cross-check the
+#     preflight target against the real launcher argv[0] for every model.
+for model in ("codex", "claude", "deepseek", "minimax"):
+    launcher_bin = tc.host_agent_argv("", model)[0][0]
+    check(f"fix {model} -> host_agent_argv argv[0]", wu._host_agent_binary("fix", model), launcher_bin)
+check("fix deepseek -> PI_RUN", wu._host_agent_binary("fix", "deepseek"), tc.PI_RUN)
+
+# A custom claude wrapper: the preflight must target the wrapper, not bare `claude`, or it would
+# false-block a working launcher (or miss a broken one).
+_saved_cmd = tc.agents.CLAUDE_CMD
+tc.agents.CLAUDE_CMD = "my-wrapper --flag claude"
+check("fix claude honours TAUCETI_CLAUDE_CMD wrapper", wu._host_agent_binary("fix", "claude"), "my-wrapper")
+check(
+    "review claude ignores the wrapper (engine uses literal claude)",
+    wu._host_agent_binary("review", "claude"),
+    "claude",
+)
+tc.agents.CLAUDE_CMD = _saved_cmd
 
 
 # --- dispatch() preflight -----------------------------------------------------------------------
@@ -52,14 +71,17 @@ runs = {"n": 0}
 warns = []
 
 
-def fake_review(w, sv, c, o, bubble):
+def fake_stage(w, sv, c, o, bubble):
     runs["n"] += 1
     return 0
 
 
-_saved = {k: getattr(wu, k) for k in ("do_review", "warn_red", "_progress_snapshot", "_progressed", "_bubble")}
+_saved = {
+    k: getattr(wu, k) for k in ("do_review", "do_fix", "warn_red", "_progress_snapshot", "_progressed", "_bubble")
+}
 _saved_which = wu.shutil.which
-wu.do_review = fake_review
+wu.do_review = fake_stage
+wu.do_fix = fake_stage
 wu.warn_red = lambda msg: warns.append(msg)
 wu._progress_snapshot = lambda w, c: None
 wu._progressed = lambda w, c, pre: True  # stub out the "nothing landed on GitHub" guard
@@ -101,6 +123,18 @@ try:
     rc = wu.dispatch("review", None, None, CAND, opts(sandbox_host=False))
     check("bubble -> host preflight skipped, stage runs", runs["n"], 1)
     check("bubble -> no red warning", len(warns), 0)
+
+    # 4) a non-review OpenRouter stage: the gate is `pi` (host_agent_argv), missing -> pause, no stage run.
+    wu._bubble = lambda stage, o: False
+    wu.shutil.which = lambda name: None
+    reset()
+    raised = False
+    try:
+        wu.dispatch("fix", None, None, CAND, opts(work_model="deepseek"))
+    except tc.NoProgress:
+        raised = True
+    check("fix deepseek missing pi -> NoProgress", raised, True)
+    check("fix deepseek missing pi -> stage NOT run", runs["n"], 0)
 finally:
     for k, v in _saved.items():
         setattr(wu, k, v)
