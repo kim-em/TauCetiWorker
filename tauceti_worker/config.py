@@ -1,4 +1,5 @@
-"""tauceti_worker.config — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.config — per-worker Config resolution, the roadmap/claims env dials, worker-slot
+locking, and logging."""
 
 from __future__ import annotations
 
@@ -68,7 +69,7 @@ def _skip_label(sv=None) -> str:
 
 def roadmap_areas(gh) -> list[str]:
     """The roadmap areas a user can steer toward: the subdirectories of the roadmap repo (each
-    holds a README.md + Targets.lean). Listed over the API so the TUI can offer a picker. Returns []
+    holds a README.md + Suggested.lean). Listed over the API so the TUI can offer a picker. Returns []
     if it can't be fetched (the picker then falls back to free-text entry)."""
     out = gh.api_jq(f"repos/{ROADMAP}/contents/TauCetiRoadmap", '.[] | select(.type=="dir") | .name')
     return sorted(out.splitlines()) if out else []
@@ -145,7 +146,7 @@ class Config:
             home=h,
             state=state,
             checkout=HERE / "checkouts" / wid / "TauCeti",
-            store_dir=h / ".cache" / "tauceti-review" / wid / "store" / "FormalFrontier__TauCeti",
+            store_dir=h / ".cache" / "tauceti-review" / wid / "store" / "TauCetiProject__TauCeti",
             sbcache=state / "cache" / "scoreboard",
             logdir=HERE / "logs" / wid,
             quota_cache=state / "cache",

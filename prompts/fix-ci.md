@@ -1,9 +1,9 @@
-You are fixing FAILING CI on pull request #__PR__ of FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
+You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
 
 ## Find out what's actually failing
 - See which checks failed and read their logs:
-  - `gh pr checks __PR__ --repo FormalFrontier/TauCeti`
-  - `gh run view <run-id> --repo FormalFrontier/TauCeti --log-failed` (use the run id from the failing check)
+  - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
+  - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
 - Reproduce locally — this is the source of truth, not the log alone:
   ```
   lake exe cache get
@@ -28,6 +28,8 @@ lake build
 lake exe axioms
 ```
 Iterate until green. Never push red.
+
+**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the fix (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).

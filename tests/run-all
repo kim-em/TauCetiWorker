@@ -23,9 +23,14 @@ RUN_STDLIB=(
   claude_config_dir.py
   claude_keychain.py
   contest_claim.py
+  fix_diagnostic.py
+  fork_authoring.py
   github_ratelimit.py
+  host_agent_preflight.py
   ignore_quota_hardblock.py
   inflight_review.py
+  isolate_home_gh_token.py
+  isolate_home_paths.py
   ledger_blocking.py
   mirror_creds.py
   quota_cache_fp.py
@@ -34,6 +39,7 @@ RUN_STDLIB=(
   roadmap_claims.py
   round_group_sweep.py
   safe_exists.py
+  scoreboard_trust.py
   spread_candidates.py
 )
 # special-cased python tests (handled explicitly below)

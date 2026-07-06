@@ -13,7 +13,7 @@
 # if the lease was lost (someone took over). The claim is [COOP] (avoids duplicate work); the branch CAS
 # is what actually protects the write.
 #
-# Inputs (exported by round.sh; the agent just runs `git-safe-push [<branch>]`):
+# Inputs (exported by the worker before it launches the agent; the agent just runs `git-safe-push [<branch>]`):
 #   TAUCETI_PUSH_REF     destination branch on the head repo (or pass as $1)
 #   TAUCETI_PUSH_EXPECT  observed remote head oid; empty/unset ⇒ create-only (new branch)
 #   TAUCETI_PUSH_REMOTE  git remote or URL to push to (default: origin)

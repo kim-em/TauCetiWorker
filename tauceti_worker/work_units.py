@@ -1,10 +1,12 @@
-"""tauceti_worker.work_units — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.work_units — the want-gated cascade: pick one actionable PR per round and dispatch
+its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble."""
 
 from __future__ import annotations
 
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +16,7 @@ from pathlib import Path
 from .agents import (
     fetch_ref,
     fill_prompt,
+    host_agent_argv,
     prepare_checkout,
     review_in_bubble,
     run_agent_host,
@@ -25,22 +28,24 @@ from .constants import (
     AGENT_NAMES,
     CONTEST_CLAIM_TTL,
     MAX_OPEN_PRS,
+    OPENROUTER_MODELS,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, gh_run, me
+from .github import GitHub, GitHubError, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import HERE
+from .quota import mirror_creds
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
 
 # ============================================================================
-# Round — the want-gated cascade over survey(). Pre-passes (merge/abandon/dedup)
-# always run (quota-free); then ONE work unit. Mirrors round.sh main().
+# Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
+# Merging green PRs, abandoning stuck ones, and de-duplicating is the repo's CI now, not the worker.
 # ============================================================================
 
 
@@ -56,8 +61,6 @@ class RoundOpts:
     work_model: str  # the concrete model to run (codex|claude|deepseek|minimax), or 'auto' for dry-run
     sandbox_host: bool  # True = --host (opt out of bubble)
     dry_run: bool
-    ignore_quota: bool = False
-    quota_cmd: str | None = None
 
     @property
     def agent_name(self) -> str:
@@ -82,6 +85,15 @@ def _bubble(stage: str, opts: RoundOpts) -> bool:
 
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
+    # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
+    # before any work runs. The quota pacer does this too, but the --ignore-quota + pinned --agent
+    # fast path in resolve_work_model skips the pacer, and --host review never hits the bubble-seed
+    # mirror — so without this an operator token refresh (or account switch) never reaches a host
+    # worker, and its mirror ages out into 401s that silently burn review rounds. No-op when not
+    # isolated / on macOS, and a handful of small local reads + compares in steady state, so it is
+    # safe to run every round. Skipped under --dry-run, which must not mutate the credential mirror.
+    if not opts.dry_run:
+        mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
@@ -94,6 +106,16 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
             log(f"  review #{pr}: local ledger unreadable — skipping review (fail-closed); fix the ledger")
         else:
             log(f"  review #{pr}: daily cap {count} reached — skipping until 00:00 UTC (no launch/clone)")
+
+    # Explain why a fix-focused worker has nothing to fix: for each of the contributor's own PRs that is
+    # not an actionable fix candidate, say why (awaiting first review, head moved, all green, attempts
+    # spent). Scoped to a fix-focused run (`--only fix[,...]`) with NO actionable fix this round, so it
+    # never talks over a round that is about to fix something and the full-auto loop's per-round firehose
+    # stays quiet. This is the missing signal behind Bryan's report — a one-shot `work --only fix` minutes
+    # before the scoreboard landed printed a bare "no eligible work" with no hint the PR was just waiting.
+    if "fix" in opts.only and not sv.needs_fix.actionable:
+        for pr, why in sv.fix_waiting:
+            log(f"  fix #{pr}: {why}")
 
     # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
     # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
@@ -189,6 +211,22 @@ def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool:
     return False
 
 
+def _host_agent_binary(stage: str, model: str) -> str | None:
+    """The executable a HOST `stage` must resolve on PATH to run `model` (None ⇒ nothing to gate).
+
+    A review round shells the review engine, which gates on a literal `codex`/`claude`/`pi` via its own
+    shutil.which (TauCetiReview runner/cli.py) and ignores TAUCETI_CLAUDE_CMD / PI_RUN. Every other model
+    stage launches via host_agent_argv, so preflight the EXACT argv[0] it will exec — which honours a
+    custom TAUCETI_CLAUDE_CMD wrapper or PI_RUN path, so we neither miss a real gap nor false-block a
+    working custom launcher."""
+    if stage == "review":
+        if model in OPENROUTER_MODELS:
+            return "pi"
+        return {"codex": "codex", "claude": "claude"}.get(model)
+    argv, _ = host_agent_argv("", model)
+    return argv[0] if argv else None
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
@@ -200,6 +238,22 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
+    # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
+    # review engine rejects `--reviewer codex` and do_review counts it as a PER-PR review error — so a
+    # machine-wide outage marches PRs one-by-one to the "needs a human" escalation cap. Catch it HERE,
+    # before launch, as a loud self-healing pause (NoProgress ⇒ backoff, no counter bump): every PR
+    # would hit the identical failure, so it must not be charged to any single PR's error budget.
+    if not bubble:
+        binname = _host_agent_binary(stage, opts.work_model)
+        if binname and shutil.which(binname) is None:
+            warn_red(
+                f"agent '{opts.work_model}' needs the `{binname}` CLI on PATH, but it is not "
+                f"resolvable on this host — pausing this round. This is machine-wide (every PR would "
+                f"hit it), so it is NOT charged to any PR's review-error budget. Restore `{binname}` on "
+                f"the worker's PATH and the loop resumes on its own."
+            )
+            raise NoProgress(f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host")
     fn = {
         "review": do_review,
         "fix": do_fix,
@@ -233,7 +287,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     return rc
 
 
-# --- the work units (host path here; bubble path lands in M9) ---------------
+# --- the work units (each runs in bubble by default, or on the host with --host) ---
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
@@ -255,7 +309,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         log(f"  review round {nrnd + 1} @ {head[:12]}, reviewers={reviewers} (CI retires at the cap)")
     try:
         if bubble:
-            rc = review_in_bubble(w, pr, head, reviewers, opts)  # M9b
+            rc = review_in_bubble(w, pr, head, reviewers, opts)
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             rc = run_to_logfile(
@@ -327,7 +381,7 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     # are kept in the local outbox — an external review will count once contributor-publishing lands.
     # The maintainer's identity returns push=true, so the sync below runs and a genuine outage still
     # surfaces loudly. A failed/ambiguous check falls through to the sync (preserving the loud-fail).
-    perm = gh_run(["gh", "api", "repos/FormalFrontier/TauCetiData", "--jq", ".permissions.push"])
+    perm = gh_run(["gh", "api", "repos/TauCetiProject/TauCetiData", "--jq", ".permissions.push"])
     if perm.returncode == 0 and perm.stdout.strip() == "false":
         log(
             f"  review #{pr}: no write access to TauCetiData — review posted, records kept in "
@@ -384,11 +438,21 @@ def _do_fixlike(
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
         raise Die(f"{label}: PR #{pr} vanished from the survey")
+    # Deleted/unavailable head: with the head repo gone, there is nowhere to push the fix and bubble
+    # can't check the PR out. Skip to the next candidate rather than build a `https://github.com//`
+    # remote or an `allow_push="/"` (a fork head deletes to empty fields in PRInfo.from_json).
+    if not (p.head_owner and p.head_repo and p.head_ref):
+        log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
+        return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name)
     if bubble:
-        rc = run_in_bubble(w, f"{TAUCETI}/pull/{pr}", prompt, opts)  # bubble checks out the PR inside
+        # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
+        # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
+        rc = run_in_bubble(
+            w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
+        )  # bubble checks out the PR inside
     else:
         if not prepare_checkout(w.cfg):
             log(f"checkout failed for #{pr} — skipping this attempt")
@@ -464,6 +528,13 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     if not fetch_ref(REVIEW, refs / "review"):
         raise Die(f"fetch {REVIEW} failed")
     os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
+    # Author from the contributor's OWN fork: push the new branch there and open the PR from it, so the
+    # worker never needs write access to canonical (and canonical stays free of WIP branches). The agent
+    # builds against canonical main (the bubble/checkout still targets TAUCETI) — only the push redirects.
+    fork = ensure_fork()
+    fork_owner = fork.split("/", 1)[0]
+    os.environ["TAUCETI_PUSH_REMOTE"] = f"https://github.com/{fork}"
+    os.environ.pop("TAUCETI_PUSH_EXPECT", None)  # a fresh branch ⇒ create-only CAS on the fork
     if bubble:
         return run_in_bubble(
             w,
@@ -474,12 +545,15 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 SKIP=skip_str,
                 CLAIMED=claimed_str,
                 AGENT=opts.agent_name,
+                FORK=fork_owner,
+                WORKERID=w.cfg.wid,
                 ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
                 REVIEW_DIR="/opt/review",
             ),
             opts,
             mounts=[f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"],
-        )  # M9
+            allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
+        )
     if not prepare_checkout(w.cfg):
         raise Die("checkout failed")
     prompt = fill_prompt(
@@ -488,6 +562,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         SKIP=skip_str,
         CLAIMED=claimed_str,
         AGENT=opts.agent_name,
+        FORK=fork_owner,
+        WORKERID=w.cfg.wid,
         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
         REVIEW_DIR=str(refs / "review"),
     )

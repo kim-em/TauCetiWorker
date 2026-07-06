@@ -1,4 +1,4 @@
-You are resolving merge conflicts on pull request #__PR__ of FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The PR has become un-mergeable: its branch conflicts with the current `main`. Bring it up to date with `main` and resolve the conflicts so it can merge again. Work autonomously to completion.
+You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The PR has become un-mergeable: its branch conflicts with the current `main`. Bring it up to date with `main` and resolve the conflicts so it can merge again. Work autonomously to completion.
 
 ## Rebase onto current main
 - Fetch and integrate the latest `main`:
@@ -23,6 +23,8 @@ lake build
 lake exe axioms
 ```
 Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
+
+**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the merge/resolution (if `git merge` left a merge commit, keep its default message; otherwise `<type>: <subject>`, ending the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).

@@ -3,7 +3,7 @@
 Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the work (one round, or
 the driver loop); `tauceti status` prints the read-only survey.
 
-The worker acts on FormalFrontier/TauCeti as the authenticated `gh` account, and treats that
+The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and treats that
 account's own PRs as the ones it tends. Each round does exactly ONE unit of work, chosen in
 priority order: rebase -> review -> fix-ci -> fix -> bump -> roadmap.
 

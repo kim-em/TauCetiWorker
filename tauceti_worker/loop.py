@@ -1,4 +1,5 @@
-"""tauceti_worker.loop — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.loop — the driver loop: pace against quota, run one round as a child under a hard
+timeout, then settle (short pause if productive, escalating back-off otherwise)."""
 
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ from .round import run_round_subprocess
 def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     """The driver: pace against quota (codex preferred), run ONE round as a child under a hard timeout,
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
-    round and exits. Mirrors loop.sh — including the back-off that stopped ~700 no-op rounds hammering
-    a rate-limited GitHub."""
+    round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
+    rate-limited GitHub."""
     openrouter = agent in OPENROUTER_MODELS
     ignore_quota = getattr(args, "ignore_quota", False)
     host = getattr(args, "host", False)

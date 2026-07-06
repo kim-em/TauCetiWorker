@@ -1,4 +1,4 @@
-You are adapting FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib, to a Mathlib bump on pull request #__PR__. You are in a checkout of the repo, already on the PR's branch. A bot opened this PR to move the Lake pins (`lake-manifest.json` and/or `lean-toolchain`) forward to a newer Mathlib, and the `build` check is red because `TauCeti/` has not caught up to the Mathlib API at the new pin. Work autonomously to completion: make CI green by adapting `TauCeti/`, without reverting the bump and without weakening the library.
+You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib, to a Mathlib bump on pull request #__PR__. You are in a checkout of the repo, already on the PR's branch. A bot opened this PR to move the Lake pins (`lake-manifest.json` and/or `lean-toolchain`) forward to a newer Mathlib, and the `build` check is red because `TauCeti/` has not caught up to the Mathlib API at the new pin. Work autonomously to completion: make CI green by adapting `TauCeti/`, without reverting the bump and without weakening the library.
 
 ## The pins are the point — keep them
 - The bumped `lake-manifest.json` / `lean-toolchain` on this branch ARE the change under review. Do NOT revert them, do NOT re-pin to an older Mathlib, do NOT touch the lakefile. Your job is to make `TauCeti/` build against the Mathlib the bot pinned.
@@ -11,7 +11,7 @@ lake build
 lake exe axioms
 ```
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
-- For a failing check's logs: `gh pr checks __PR__ --repo FormalFrontier/TauCeti`, then `gh run view <run-id> --repo FormalFrontier/TauCeti --log-failed`.
+- For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
 - If the failure is genuinely transient infra (e.g. a cache fetch timeout) and the code builds clean locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
 
 ## Rules of the repo (hard constraints)
@@ -26,6 +26,8 @@ lake build
 lake exe axioms
 ```
 Iterate until green. Never push red.
+
+**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the adaptation (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).

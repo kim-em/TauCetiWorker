@@ -1,4 +1,5 @@
-"""tauceti_worker.review_state — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.review_state — read the PR scoreboard comment (the multi-agent source of truth)
+behind a short-TTL cache, with the predicates the cascade gates on."""
 
 from __future__ import annotations
 
@@ -24,8 +25,6 @@ from .github import GitHub
 # ============================================================================
 
 META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
-
-TRUSTED_ASSOC = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 
 @dataclass
@@ -65,11 +64,22 @@ class ReviewState:
         return inflight_review_providers(self._issue_comments(pr), head, int(time.time()))
 
     def gh_meta(self, pr: int) -> Meta:
-        """Newest trusted scoreboard's <!--tauceti-meta:v1 {...}--> JSON, with TTL cache.
+        """Newest scoreboard's <!--tauceti-meta:v1 {...}--> JSON, identified by the <!--tauceti-scoreboard-->
+        marker, with TTL cache.
 
-        Trust = the <!--tauceti-scoreboard--> marker AND an author with repo association, so a random
-        external comment can't forge review state. Empty fetch with a prior cache value → serve the
-        stale value (stale-but-real beats a phantom '{}'); only fall to '{}' with no cache at all.
+        We DON'T gate on the comment author's repo association. `author_association` is viewer-dependent:
+        a reviewer who is a PRIVATE org member reads as MEMBER to themselves but as CONTRIBUTOR/NONE to an
+        outside contributor, so an association filter silently discarded legitimate scoreboards for every
+        unprivileged contributor (Bryan's PR #470: a real kim-em scoreboard, four blocking rubrics, that
+        his worker treated as "no scoreboard at this head" — so `fix` never ran). The cost of trusting any
+        marked scoreboard is bounded: this meta only drives the worker's OWN review/fix eligibility on its
+        OWN PRs; the merge gate reads the authoritative, write-restricted TauCetiData records, not this
+        comment, so a forged comment cannot merge anything. The residual risk is a forged all-green
+        scoreboard suppressing a review — which a forger can't parlay into a merge and which self-heals on
+        the next push (its head_sha stops matching). A FETCH FAILURE with a prior cache value → serve the
+        stale value (stale-but-real beats a phantom '{}'); a SUCCESSFUL fetch that finds no scoreboard
+        returns '{}' even with a cache, so a scoreboard that was deleted/edited away (or a forged one a
+        worker briefly cached) can't be served as fresh past the TTL.
         """
         cache = self._cache_path(pr)
         if cache.exists():
@@ -78,33 +88,38 @@ class ReviewState:
                 return Meta(self._load(cache), "fresh")
 
         comments = self._issue_comments(pr)
-        meta_str = ""
         fetch_failed = comments is None
+        data = None
         if comments:
-            trusted = [
-                c
-                for c in comments
-                if "<!--tauceti-scoreboard-->" in (c.get("body") or "") and c.get("author_association") in TRUSTED_ASSOC
-            ]
-            trusted.sort(key=lambda c: c.get("updated_at", ""))
-            if trusted:
-                body = trusted[-1].get("body") or ""
-                matches = META_RE.findall(body)
-                if matches:
-                    meta_str = matches[-1].strip()
+            # Newest-first, but skip a marker comment whose meta is missing/garbage: a newer empty or
+            # malformed <!--tauceti-scoreboard--> marker must not mask an older comment that does carry a
+            # valid scoreboard (without the author gate, anyone can post such a masking marker).
+            marked = sorted(
+                (c for c in comments if "<!--tauceti-scoreboard-->" in (c.get("body") or "")),
+                key=lambda c: c.get("updated_at", ""),
+                reverse=True,
+            )
+            for c in marked:
+                matches = META_RE.findall(c.get("body") or "")
+                if not matches:
+                    continue
+                try:
+                    parsed = json.loads(matches[-1].strip())
+                except json.JSONDecodeError:
+                    continue
+                # Require an object: a newer marker carrying valid JSON that ISN'T a dict (a list, string,
+                # number, or null) is not a usable scoreboard — skip to an older marker rather than cache
+                # it as fresh (callers do meta.data.get(...), which would crash on a non-dict).
+                if isinstance(parsed, dict):
+                    data = parsed
+                    break
 
-        if not meta_str:
-            # Transient fetch failure OR genuinely no scoreboard. If we have a prior value, serve it.
-            if cache.exists():
-                return Meta(self._load(cache), "stale" if fetch_failed else "fresh")
-            return Meta({}, "fetch_failed" if fetch_failed else "missing")
-
-        try:
-            data = json.loads(meta_str)
-        except json.JSONDecodeError:
-            if cache.exists():
+        if data is None:
+            # Serve a prior value ONLY on a fetch failure (transient); a successful fetch that parsed no
+            # scoreboard means there genuinely isn't one now — don't keep serving a now-absent meta.
+            if fetch_failed and cache.exists():
                 return Meta(self._load(cache), "stale")
-            return Meta({}, "missing")
+            return Meta({}, "fetch_failed" if fetch_failed else "missing")
         self.sbcache.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(data) + "\n")
         return Meta(data, "fresh")
@@ -119,10 +134,7 @@ class ReviewState:
     def bust(self, pr: int) -> None:
         self._cache_path(pr).unlink(missing_ok=True)
 
-    # --- predicates over the meta (verbatim ports of the round.sh jq) ---
-    def ledger_head(self, pr: int) -> str:
-        return str(self.gh_meta(pr).data.get("head_sha") or "")
-
+    # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
         runs = self.gh_meta(pr).data.get("runs") or []
         if runs and all(r.get("verdict") != "error" for r in runs):
@@ -188,16 +200,6 @@ class ReviewState:
             return any(v not in ("green", "stale") for v in states.values())
         runs = m.get("runs") or []
         return any(r.get("verdict") not in ("approve", "error") for r in runs)
-
-    def review_all_green(self, pr: int, head: str) -> Meta:
-        """Returns the Meta (so callers can inspect provenance); .data['_all_green'] is the verdict."""
-        meta = self.gh_meta(pr)
-        m = meta.data
-        runs = m.get("runs") or []
-        green = (
-            str(m.get("head_sha") or "") == head and len(runs) > 0 and all(r.get("verdict") == "approve" for r in runs)
-        )
-        return Meta({**m, "_all_green": green}, meta.provenance)
 
 
 def inflight_review_providers(comments: list[dict] | None, head: str, now: int) -> set[str]:

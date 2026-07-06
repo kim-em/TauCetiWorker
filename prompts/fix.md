@@ -1,9 +1,9 @@
-You are addressing AI code review on pull request #__PR__ of FormalFrontier/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. Work autonomously to completion.
+You are addressing AI code review on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. Work autonomously to completion.
 
 ## Read the review
 - The review is posted as a sticky scoreboard comment plus one thread per flagged rubric. Read them:
-  - `gh pr view __PR__ --repo FormalFrontier/TauCeti --json comments`
-  - `gh api "/repos/FormalFrontier/TauCeti/pulls/__PR__/comments?per_page=100"` (the per-rubric review threads; each root carries a `<!--tauceti-rubric:NAME-->` marker, and the finding text + suggested fix).
+  - `gh pr view __PR__ --repo TauCetiProject/TauCeti --json comments`
+  - `gh api "/repos/TauCetiProject/TauCeti/pulls/__PR__/comments?per_page=100"` (the per-rubric review threads; each root carries a `<!--tauceti-rubric:NAME-->` marker, and the finding text + suggested fix).
 - The blocking rubrics are the ones marked ⛔ (block) or 🟡 (changes requested) on the scoreboard. The other rubrics are already ✅ approved — note which ones.
 
 ## Do not regress what is already green
@@ -16,7 +16,7 @@ The scoreboard shows several rubrics already approved (✅). A re-review re-runs
 For each finding, judge whether it is actually correct:
 - **If it is correct**, fix the code. Verify the fix empirically (does it build? does the claimed Mathlib lemma actually exist — `grep`/`#check`? does the suggested `@[simp]` lemma have a variable head, which the linter forbids?). Reviewers are sometimes confidently wrong; do not blindly comply.
 - **If it is wrong**, do NOT comply. Reply on that rubric's thread explaining why, with evidence (a synth-check, a Mathlib citation, a build error). Post the reply to the thread root:
-  `gh api -X POST "/repos/FormalFrontier/TauCeti/pulls/__PR__/comments/<ROOT_ID>/replies" -f body="..."`
+  `gh api -X POST "/repos/TauCetiProject/TauCeti/pulls/__PR__/comments/<ROOT_ID>/replies" -f body="..."`
   (A re-review reads these replies, so a well-evidenced contest can clear a wrong finding.)
 
 ## Rules of the repo (hard constraints)
@@ -31,6 +31,8 @@ lake build
 lake exe axioms
 ```
 Iterate until green. Never push red.
+
+**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the fixes (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).

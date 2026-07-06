@@ -1,7 +1,9 @@
-"""tauceti_worker.agents — split from the monolithic worker (behaviour-preserving)."""
+"""tauceti_worker.agents — prompt filling, the host/bubble checkout, and the agent launch: the host
+argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolation)."""
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 import sys
@@ -26,10 +28,10 @@ from .quota import (
 )
 
 # ============================================================================
-# Agents — prompt filling, the host checkout, and the byte-for-byte agent launch.
-# The host argv lists reproduce round.sh's run_agent exactly (the `( cd … ) 9>&-`
-# and `env -u` mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh /
-# git-safe-push / gh-safe-pr-create are put on the agent's PATH so it can push.
+# Agents — prompt filling, the host checkout, and the agent launch. The host argv lists are a frozen
+# contract — keep them byte-for-byte stable (the historical `( cd … ) 9>&-` and `env -u` shell
+# mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh / git-safe-push /
+# gh-safe-pr-create are put on the agent's PATH so it can push.
 # ============================================================================
 
 
@@ -82,7 +84,7 @@ def fetch_ref(repo: str, dir: Path) -> bool:
 
 
 def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
-    """The exact argv + env for the host work agent (round.sh run_agent). HERE is on PATH so the agent
+    """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     if work_model == "codex":
@@ -160,7 +162,7 @@ def _shq(s: str) -> str:
 # The checkout, lake build, and every git/gh call happen IN a repo-scoped bubble
 # container. GitHub goes through bubble's auth proxy (the host gh token never
 # enters); only the one credential the work model needs is seeded; no host config
-# crosses the boundary. Byte-for-byte the same agent invocation as round.sh.
+# crosses the boundary. The in-container agent invocation is a frozen contract (see agent_inner_cmd).
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
 
@@ -176,6 +178,112 @@ def bubble_cmd() -> list[str]:
     if shutil.which("bubble"):
         return ["bubble"]
     return ["uvx", "--from", BUBBLE_REPO, "bubble"]
+
+
+@functools.lru_cache(maxsize=1)
+def bubble_supports_allow_push() -> bool:
+    """Does the resolved bubble support `--allow-push` (fork-PR write support, kim-em/bubble#320)? The
+    worker hands that flag to bubble for fork authoring/maintenance, so an OLD cached build would error
+    only after the model launches — wasting the round. Probe `bubble open --help` once per process."""
+    try:
+        p = subprocess.run([*bubble_cmd(), "open", "--help"], capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--allow-push" in (p.stdout or "") + (p.stderr or "")
+
+
+def _bubble_version() -> str:
+    """`bubble --version` of the resolved CLI, or '' if it can't be read. NOT cached: a long-lived
+    `--loop` must notice a bubble upgrade applied mid-run so the next round refreshes the daemon."""
+    try:
+        p = subprocess.run([*bubble_cmd(), "--version"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (p.stdout or p.stderr or "").strip()
+
+
+def _auth_proxy_stamp() -> Path:
+    """Where we record the bubble version the auth-proxy daemon was last (re)started for. The daemon is
+    host-global (one launchd/systemd service per OS user), so the stamp is too — keyed off the real login
+    user's home via `pwd`, NOT $HOME, which isolate_home() repoints per worker. A host-global stamp means
+    concurrent workers share one refresh instead of each restarting the daemon on a version bump."""
+    home = None
+    try:
+        import pwd
+
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        home = Path(os.path.expanduser("~"))
+    return home / ".cache" / "tauceti-worker" / ".auth-proxy-bubble-version"
+
+
+def ensure_fork_proxy_current() -> None:
+    """Keep bubble's git auth-proxy daemon in step with the installed `bubble` CLI; Die if it can't be.
+
+    The proxy that enforces `--allow-push` runs as a long-lived launchd/systemd daemon. Upgrading the
+    `bubble` CLI does NOT restart it, so a daemon started before kim-em/bubble#320 keeps rejecting fork
+    pushes with `403 Repository mismatch` even though `bubble open --help` (and so bubble_supports_allow_push)
+    advertises the flag — the fork round then silently falls back to canonical (a wrong-target PR for an
+    account with canonical write) or fails outright (a read-only contributor). The CLI capability probe
+    can't catch this: it inspects the binary, not the running daemon.
+
+    There is no daemon version/status query, so we stamp the `bubble` version each time we (re)start the
+    daemon (via bubble's own `gh proxy start` — TauCeti stays out of the launchd/systemd details) and
+    restart it whenever that version changes. Version-gated so steady-state rounds never churn a host-shared
+    daemon (a restart is ~instant and tokens persist on disk, but it briefly blips any concurrent bubble),
+    and serialized under a host-global file lock so concurrent workers refresh once, not N racing restarts
+    (interleaved launchd/systemd reloads could otherwise leave the daemon down). Fail-CLOSED throughout: a
+    stale-or-unverifiable daemon is refreshed, and if the refresh can't be confirmed we Die rather than burn
+    a ~30-minute round on a push the proxy will 403. Call this ONLY for rounds that push to a fork — a
+    review-only worker never does, and must not be blocked by it."""
+    import fcntl
+    import tempfile
+
+    ver = _bubble_version()  # '' if unreadable — treated as "currency unverifiable", so refresh anyway
+    stamp = _auth_proxy_stamp()
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails
+    # (Codex's fallback for "lock can't be acquired"). The stamp stays in the user's home so it survives a
+    # reboot that would clear /tmp (a cleared stamp only costs one extra restart).
+    lockpath = Path(tempfile.gettempdir()) / f"tauceti-worker-auth-proxy-{os.getuid()}.lock"
+    lockf = None
+    try:
+        try:
+            lockf = open(lockpath, "w")
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+        except OSError:
+            lockf = None  # extraordinary (temp dir unwritable) — fall through and refresh anyway
+        try:
+            if ver and stamp.read_text().strip() == ver:
+                return  # another worker (or an earlier round) already refreshed the daemon for this version
+        except OSError:
+            pass  # no stamp yet (first fork round) — refresh
+        # Stale, never-stamped, or a version we couldn't read (can't vouch for currency) → refresh, fail closed.
+        try:
+            subprocess.run(
+                [*bubble_cmd(), "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Die(
+                "preflight: bubble's git auth-proxy daemon is stale for fork-PR authoring (it predates the "
+                f"installed bubble and would 403 fork pushes) and could not be refreshed: {e}\n"
+                "  Restart it yourself with `bubble gh proxy start`, then re-run."
+            ) from e
+        if ver:
+            try:
+                stamp.write_text(ver)  # only with a known version; an unreadable read refreshes again next round
+            except OSError:
+                pass
+        log(f"bubble auth-proxy: restarted daemon to match {ver or 'the installed bubble'} (fork --allow-push)")
+    finally:
+        if lockf is not None:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            finally:
+                lockf.close()
 
 
 def shlex_split(s: str) -> list[str]:
@@ -232,8 +340,9 @@ def _codex_model() -> str:
 
 
 def agent_inner_cmd(work_model: str) -> str:
-    """The command bubble runs INSIDE the container (bash -lc). Byte-for-byte round.sh's agent_inner_cmd:
-    the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force subscription auth."""
+    """The command bubble runs INSIDE the container (bash -lc); a frozen contract, kept byte-for-byte
+    stable: the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force
+    subscription auth."""
     import shlex
 
     if work_model == "codex":
@@ -297,6 +406,7 @@ def run_in_bubble(
     *,
     inner_cmd: str | None = None,
     cred_model: str | None = None,
+    allow_push: str | None = None,
 ) -> int:
     """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
     work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
@@ -333,6 +443,13 @@ def run_in_bubble(
     for m in mounts or []:
         mount_flags += ["--mount", m]
 
+    # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
+    # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
+    # (roadmap) or a fix to a fork-headed PR. The base repo keeps its allowlist-write-graphql scope; the
+    # fork gets git only. (For a PR target, bubble also auto-derives the head fork, so this is belt-and-
+    # suspenders for maintenance and the sole grant for authoring, which has no PR to derive from.)
+    push_flags = ["--allow-push", allow_push] if allow_push else []
+
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
@@ -361,6 +478,7 @@ def run_in_bubble(
         "--ephemeral",
         "--github-security",
         "allowlist-write-graphql",
+        *push_flags,
         *mount_flags,
         *agent_cred_flags(cred_model),
         "--command",
@@ -435,9 +553,85 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers)
 
 
+def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
+    """The per-worker isolated $HOME. On macOS it MUST be short: bubble runs the sandbox in a colima VM
+    whose lima/incus unix sockets nest under $HOME, and the default location beneath the installed package
+    (site-packages) pushes those socket paths past UNIX_PATH_MAX (104) — colima then refuses to start
+    ("instance name … too long"). Anchor it at the real login user's home (via `pwd`, NOT $HOME, which a
+    loop child has already had repointed) so the path is short and stable across re-isolations, and bound
+    the per-worker component against the longest socket bubble nests under the home so that even a long
+    --worker-id (or login name) can't reoverflow it — hashing (deterministically; a loop child must
+    recompute the same path) only when the raw wid wouldn't fit, so ordinary ids stay readable. Linux uses
+    native incus (no $HOME-nested sockets, no colima), so it keeps the in-tree location beside the worker's
+    other state. The path must be a pure function of wid (no $HOME) so the early-return below recognises an
+    already-isolated child."""
+    if sys.platform != "darwin":
+        return HERE / "state" / wid / "home"
+    base = _base
+    if base is None:
+        try:
+            import pwd
+
+            base = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        except (ImportError, KeyError, OSError):
+            base = Path(os.path.expanduser("~"))
+    root = base / ".tauceti"
+    # colima binds <home>/.colima/_lima/<profile>/ssh.sock.<16-digit id>; keep that whole path strictly
+    # under UNIX_PATH_MAX (104) by bounding the per-worker component.
+    sock_suffix = len("/.colima/_lima/colima-bubble-colima/ssh.sock.") + 16
+    budget = (104 - 1 - sock_suffix) - len(str(root)) - 1  # max home length, minus root and its trailing "/"
+    if len(wid) <= budget:
+        return root / wid
+    import hashlib
+
+    digest = hashlib.sha1(wid.encode()).hexdigest()[:8]
+    keep = max(1, budget - 9)  # leave room for "-" + 8 hex chars
+    return root / f"{wid[:keep]}-{digest}"
+
+
+def _seed_gh_token_for_isolation() -> None:
+    """macOS only: export $GH_TOKEN from the operator's gh login BEFORE isolate_home repoints $HOME.
+
+    gh stores its token in the login Keychain, which gh's keyring backend can resolve via
+    $HOME/Library/Keychains on an affected setup. Once isolate_home sets $HOME to the worker's short
+    isolated home, that lookup misses and the survey's `gh pr list` fails unauthenticated — the worker
+    aborts the round (Bryan's report). The GH_CONFIG_DIR redirect recovers gh's host LIST but not the
+    keychain-backed token. So while the real $HOME still reaches the Keychain, capture the token and
+    export it: gh and gh's git credential helper both honour $GH_TOKEN ahead of the keychain, so child
+    calls (the survey, host pushes, and the agent's own gh on --host) stay authenticated under the
+    isolated home. macOS is single-account by nature, so one token is correct.
+
+    Scope/limits: github.com only (the sole host TauCeti uses; a GHES remote would need a separate
+    $GH_ENTERPRISE_TOKEN). Captured once, at isolation — a long `--loop` inherits it for the run, which
+    matches gh's own use of the static keychain token; if the operator rotates gh creds mid-loop,
+    restart the worker to re-seed. No-op off macOS (Linux keeps its token in the redirected
+    GH_CONFIG_DIR or a session keyring, neither $HOME-path-scoped), when the operator already exported a
+    token, or when capture fails (logged, then left for `gh auth login` / `--worker-id default` — no
+    worse than before this seed existed)."""
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return  # respect an operator-set token; don't shell out
+    try:
+        r = subprocess.run(
+            ["gh", "auth", "token", "--hostname", "github.com"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not capture a gh token for the isolated home ({e}); gh may fail under the isolated $HOME")
+        return
+    tok = (r.stdout or "").strip()
+    if r.returncode == 0 and tok:
+        os.environ["GH_TOKEN"] = tok
+    else:
+        log(
+            "could not capture a gh token for the isolated home (gh auth token failed); gh may fail "
+            "under the isolated $HOME on macOS — run `gh auth login` or pass --worker-id default"
+        )
+
+
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
-    review / loop.sh --isolate-home). Symlinks the read-only Claude tool/config surface from the real
+    review / the --isolate-home flag). Symlinks the read-only Claude tool/config surface from the real
     config dir; copies the mutable Claude/Codex auth files in ONCE, then records the source dirs in
     .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher access token whenever the
     operator's external refresher rotates it. The worker itself never refreshes (never touches the
@@ -448,10 +642,13 @@ def isolate_home(wid: str) -> Path:
     macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
     Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
     repointing is a no-op there: the spawned claude reads the shared Keychain regardless, and the pacer's
-    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature."""
+    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature.
+    On macOS the home also sits at a short path (see _worker_iso_home) and its colima/incus state is
+    symlinked to the operator's, so bubble reuses the one host VM instead of building a throwaway per-worker
+    one (and the sockets under it stay within UNIX_PATH_MAX)."""
     import shutil
 
-    home = HERE / "state" / wid / "home"
+    home = _worker_iso_home(wid)
     if Path(os.environ.get("HOME", "")) == home:
         return home  # already isolated (a loop child inherits the parent's $HOME) — don't re-copy or warn
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
@@ -459,6 +656,27 @@ def isolate_home(wid: str) -> Path:
     iso_claude = home / ".claude"
     iso_claude.mkdir(parents=True, exist_ok=True)
     (home / ".codex").mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        # Point the isolated home's colima/incus state at the operator's so bubble's `colima status`
+        # (which reads $HOME/.colima) finds the host's already-running VM and skips building a throwaway
+        # per-worker one — and the short home keeps the resulting socket paths within UNIX_PATH_MAX. The
+        # shared host VM is the same one the 'default' worker uses, so this adds no new colima ownership.
+        for rel in (".colima", Path(".config") / "incus"):
+            link, target = home / rel, real / rel
+            if link.is_symlink() and not link.exists():
+                try:
+                    link.unlink()  # stale dangling link (target since removed) — drop it before re-linking
+                except OSError:
+                    pass
+            # Only link when the operator actually has state to share; otherwise leave it absent so bubble
+            # creates a real dir here (a self-contained per-worker VM at this short path), never a dangling
+            # symlink. Don't clobber an existing real dir or a good link.
+            if target.exists() and not link.exists() and not link.is_symlink():
+                try:
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(target)
+                except OSError:
+                    pass
     for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
         src, dst = real_claude / item, iso_claude / item
         if _safe_exists(src) and not dst.exists():
@@ -500,12 +718,18 @@ def isolate_home(wid: str) -> Path:
     # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
     # point them back at the operator's real config rather than an empty isolated one. Respect a value
     # the operator already exported. Children inherit these, so the early-return path above is covered.
+    # (On macOS this redirect recovers gh's host list but not its keychain-backed token — that needs the
+    # $GH_TOKEN seed just below, before $HOME moves.)
     gh_cfg = real / ".config" / "gh"
     if gh_cfg.is_dir():
         os.environ.setdefault("GH_CONFIG_DIR", str(gh_cfg))
     git_cfg = real / ".gitconfig"
     if git_cfg.exists():
         os.environ.setdefault("GIT_CONFIG_GLOBAL", str(git_cfg))
+    # Capture gh's keychain-backed token while the real $HOME still reaches the login Keychain (macOS),
+    # so child gh/git calls authenticate via $GH_TOKEN once $HOME is repointed below. Must precede the
+    # $HOME assignment — afterwards the Keychain lookup misses.
+    _seed_gh_token_for_isolation()
     os.environ["HOME"] = str(home)
     os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)  # so claude_dir() + the spawned claude agree
     log(f"isolated HOME={home} (worker '{wid}')")
