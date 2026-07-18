@@ -405,10 +405,15 @@ class Quota:
             # an 'unknown' window that would fail-closed on a window that simply isn't there. The codex
             # usage endpoint dropped the short `secondary_window` for pro accounts, now reporting a single
             # weekly window in `primary_window` with the other null; the old positional parse read that
-            # null as 'usage unknown' and pinned codex out. A window that IS present but is missing
-            # `used_percent` still classifies as 'unknown' below (the real schema-drift guard we keep).
-            if not isinstance(w, dict):
+            # null as 'usage unknown' and pinned codex out.
+            if w is None:
                 continue
+            # A window that IS present but is not an object is malformed, NOT 'not applicable' — coerce it to
+            # an empty dict so it falls through as an 'unknown' window (fail-closed) rather than being silently
+            # dropped, which would let a garbage value read as confirmed-under-pace. A present-but-well-formed
+            # window that merely drops `used_percent` also classifies as 'unknown' below (the schema-drift guard).
+            if not isinstance(w, dict):
+                w = {}
             lim = w.get("limit_window_seconds")
             ra = w.get("reset_after_seconds")
             elapsed = None

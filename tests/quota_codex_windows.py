@@ -63,6 +63,13 @@ p = q._codex_from_payload(
 check("present window missing used_percent ⇒ unknown", p.windows[0].status, "unknown")
 check("present window missing used_percent ⇒ unavailable", p.available, False)
 
+# A present-but-malformed window (not null, not an object) is corruption we cannot read, NOT a
+# 'not-applicable' signal like null ⇒ it must fail-CLOSED (unknown), never be silently dropped.
+for bad in ("corrupt", [], 42):
+    p = q._codex_from_payload({"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK), "secondary_window": bad}})
+    check(f"malformed secondary {bad!r} ⇒ unknown window", [w.status for w in p.windows], ["under-pace", "unknown"])
+    check(f"malformed secondary {bad!r} ⇒ unavailable (fail-closed)", p.available, False)
+
 # No usable window at all ⇒ fail-CLOSED, never fail-open on a vacuous all(...).
 p = q._codex_from_payload({"rate_limit": {"limit_reached": False, "primary_window": None, "secondary_window": None}})
 check("no windows ⇒ unavailable (fail-closed)", p.available, False)
