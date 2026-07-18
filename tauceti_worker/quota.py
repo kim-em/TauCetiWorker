@@ -399,8 +399,16 @@ class Quota:
         rl = payload.get("rate_limit") or {}
         limit_reached = bool(rl.get("limit_reached"))
         wins = []
-        for key, name in (("primary_window", "session"), ("secondary_window", "weekly")):
-            w = rl.get(key) or {}
+        for key in ("primary_window", "secondary_window"):
+            w = rl.get(key)
+            # An explicitly null / absent window does not apply to this account, so SKIP it — do not emit
+            # an 'unknown' window that would fail-closed on a window that simply isn't there. The codex
+            # usage endpoint dropped the short `secondary_window` for pro accounts, now reporting a single
+            # weekly window in `primary_window` with the other null; the old positional parse read that
+            # null as 'usage unknown' and pinned codex out. A window that IS present but is missing
+            # `used_percent` still classifies as 'unknown' below (the real schema-drift guard we keep).
+            if not isinstance(w, dict):
+                continue
             lim = w.get("limit_window_seconds")
             ra = w.get("reset_after_seconds")
             elapsed = None
@@ -408,8 +416,13 @@ class Quota:
             if isinstance(lim, (int, float)) and lim > 0 and isinstance(ra, (int, float)):
                 elapsed = (lim - ra) / lim * 100
                 resets = time.time() + max(0, ra)
+            # Name by the window's own length, not its position: the endpoint has reordered which slot
+            # carries the ~5h vs the ~7d window, and a positional label would call a weekly window 'session'.
+            name = "session" if isinstance(lim, (int, float)) and lim <= 24 * 3600 else "weekly"
             wins.append(_classify_window(name, w.get("used_percent"), elapsed, resets, limit_reached))
-        avail = all(x.status == "under-pace" for x in wins) and not limit_reached
+        # No usable window at all ⇒ fail-closed (unavailable), never fail-OPEN on an empty all(...) that
+        # is vacuously True.
+        avail = bool(wins) and all(x.status == "under-pace" for x in wins) and not limit_reached
         nxt = self._next_eligible(wins)
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 

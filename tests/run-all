@@ -34,6 +34,7 @@ RUN_STDLIB=(
   ledger_blocking.py
   mirror_creds.py
   quota_cache_fp.py
+  quota_codex_windows.py
   quota_reason.py
   review_daily_cap.py
   roadmap_claims.py
