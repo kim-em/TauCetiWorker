@@ -509,6 +509,17 @@ def run_in_bubble(
     return rc
 
 
+def _codex_review_model_override(reviewers: str) -> str | None:
+    """An explicit codex review-model override from $TAUCETI_CODEX_MODEL, or None to let the engine use
+    its own default (currently gpt-5.6-sol, with an automatic gpt-5.6-terra fallback for accounts that
+    can't run it). Reuses the same env _codex_model() reads for authoring, so one TAUCETI_CODEX_MODEL
+    pins BOTH authoring and review (parity with DEEPSEEK_MODEL / MINIMAX_MODEL). Forwarded only when
+    codex is actually a reviewer; left unset by default so the engine's seamless fallback stays in play
+    (passing --codex-model opts the engine out of it, which is what an explicit pin should mean)."""
+    m = os.environ.get("TAUCETI_CODEX_MODEL")
+    return m if (m and "codex" in [r.strip() for r in reviewers.split(",")]) else None
+
+
 def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
@@ -542,12 +553,16 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
     # `cd` shell builtin — carry the engine on PYTHONPATH instead of cwd (cwd is irrelevant: the engine
     # uses --repo-dir for its files and an absolute temp workdir).
+    import shlex
+
+    cm = _codex_review_model_override(reviewers)
+    codex_flag = f" --codex-model {shlex.quote(cm)}" if cm else ""  # operator override; else engine default
     inner = (
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-sync --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
-        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
+        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}"
     )
     # target is the PR so bubble checks it out; prompt unused by the engine.
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers)

@@ -36,6 +36,7 @@ RUN_STDLIB=(
   quota_cache_fp.py
   quota_codex_windows.py
   quota_reason.py
+  review_codex_model.py
   review_daily_cap.py
   roadmap_claims.py
   round_group_sweep.py

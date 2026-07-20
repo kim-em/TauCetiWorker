@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .agents import (
+    _codex_review_model_override,
     fetch_ref,
     fill_prompt,
     host_agent_argv,
@@ -312,6 +313,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             rc = review_in_bubble(w, pr, head, reviewers, opts)
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+            cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
             rc = run_to_logfile(
                 [
                     "uvx",
@@ -331,6 +333,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     str(REVIEW_DAILY_CAP),
                     "--submitted-by",
                     me(),
+                    *(["--codex-model", cm] if cm else []),
                 ],
                 logf,
                 f"review #{pr}",

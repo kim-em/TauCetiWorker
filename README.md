@@ -283,7 +283,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for `--host` rounds; split as a shell word list, the usual flags appended. |
-| `TAUCETI_CODEX_MODEL` | host's configured model | The Codex model to run in the bubble. |
+| `TAUCETI_CODEX_MODEL` | host's configured model (authoring); engine default `gpt-5.6-sol` (review) | The Codex model for authoring rounds; when set it also pins the Codex **review** model (`TAUCETI_CODEX_MODEL=gpt-5.6-terra tauceti work --only review`), like `DEEPSEEK_MODEL`/`MINIMAX_MODEL`. Left unset, reviews use the engine's default with its automatic `gpt-5.6-terra` fallback for accounts that can't run Sol. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
 | `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
 | `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on `--host`. |
