@@ -86,25 +86,34 @@ class PRInfo:
     @staticmethod
     def from_json(d: dict) -> PRInfo:
         rollup = d.get("statusCheckRollup") or []
+        head_owner = (d.get("headRepositoryOwner") or {}).get("login", "")
         # The required `build` signal is a commit STATUS (a StatusContext with context=="build",
         # carrying `state`), posted by the trusted sandboxed-build workflow — that is exactly what
         # branch protection and the merge gate read. The rollup ALSO contains a check-run named
-        # "build" (the pull_request_target job); on a fork PR that job always FAILS at the
-        # actions/checkout fork-refusal step ("Refusing to check out fork pull request code…") and is
-        # pure noise. Reading name=="build" alone therefore saw only the failing check-run and missed
-        # the passing status, so a green, mergeable fork PR looked red — routed to fix-ci, never
-        # reviewed, budget-exhausted, wedged. Read the commit status when present and ignore the
-        # check-run; fall back to the check-run only when no build status has been posted yet (e.g. a
-        # same-repo PR whose workflow posts a `build` check-run and no status).
+        # "build" (the pull_request_target job). For a fork PR that check-run is NOT the real build: it
+        # can fail (e.g. at the actions/checkout fork-refusal step, "Refusing to check out fork pull
+        # request code…") or otherwise finish without the trusted sandboxed build ever running. Reading
+        # name=="build" alone saw only that check-run and missed the passing status, so a green,
+        # mergeable fork PR looked red — routed to fix-ci, never reviewed, budget-exhausted, wedged.
+        #
+        # So: the commit status is authoritative whenever present. Fall back to the check-run ONLY for a
+        # SAME-REPO PR (head in the base repo), where the `build` check-run IS the real build. For a
+        # fork/cross-repo PR with no build status yet, trust neither — classify as pending and wait for
+        # the trusted build to post, rather than routing an unbuilt fork PR to fix-ci on check-run noise.
         status_states = [c.get("state") for c in rollup if c.get("context") == "build"]
         checkrun_states = [c.get("conclusion") for c in rollup if c.get("name") == "build"]
-        build_states = status_states or checkrun_states
+        if status_states:
+            build_states = status_states
+        elif head_owner == TAUCETI_OWNER:
+            build_states = checkrun_states
+        else:
+            build_states = []
         return PRInfo(
             number=d["number"],
             title=d.get("title", ""),
             head_oid=d.get("headRefOid", ""),
             head_ref=d.get("headRefName", ""),
-            head_owner=(d.get("headRepositoryOwner") or {}).get("login", ""),
+            head_owner=head_owner,
             head_repo=(d.get("headRepository") or {}).get("name", ""),
             is_draft=bool(d.get("isDraft")),
             mergeable=d.get("mergeable", "UNKNOWN"),
