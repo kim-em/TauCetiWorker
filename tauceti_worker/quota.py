@@ -122,7 +122,7 @@ class Window:
 class Provider:
     name: str  # codex | claude
     available: bool  # all windows under pace (and a usable model)
-    model: str | None  # gpt-5 | opus | sonnet | None
+    model: str | None  # gpt-5 | opus | None
     windows: list[Window] = field(default_factory=list)
     error: str | None = None
     next_eligible: float | None = None  # epoch when a blocking window should free
@@ -583,30 +583,61 @@ class Quota:
             self._store_raw("claude", payload, fp)
         return self._claude_from_payload(payload)
 
-    def _claude_from_payload(self, payload: dict) -> Provider:
-        def win(key, name, window_s):
-            w = payload.get(key) or {}
-            used = w.get("utilization")
-            resets = self._parse_iso(w.get("resets_at"))
-            elapsed = None
-            if resets is not None:
-                remaining = resets - time.time()
-                elapsed = (window_s - remaining) / window_s * 100
-            return _classify_window(name, used, elapsed, resets, False)
+    def _claude_win(self, name: str, used: object, resets_raw: object, window_s: float) -> Window:
+        """One Claude window from a utilization% + a reset timestamp. The endpoint gives a reset clock,
+        not an elapsed fraction, so elapsed is derived from the fixed window length."""
+        resets = self._parse_iso(resets_raw if isinstance(resets_raw, str) else None)
+        elapsed = None if resets is None else (window_s - (resets - time.time())) / window_s * 100
+        return _classify_window(name, used, elapsed, resets, False)
 
-        session = win("five_hour", "session", SESSION_WINDOW_S)
-        weekly = win("seven_day", "weekly", WEEK_WINDOW_S)
-        sonnet = win("seven_day_sonnet", "weekly_sonnet", WEEK_WINDOW_S)
-        # All-null across windows ⇒ API unreachable/auth broken ⇒ unavailable.
-        if all(x.used is None for x in (session, weekly, sonnet)):
-            return Provider("claude", False, None, [session, weekly, sonnet], error="all usage null")
-        opus_ok = session.status == "under-pace" and weekly.status == "under-pace"
-        sonnet_ok = sonnet.status == "under-pace"
-        model = "opus" if opus_ok else ("sonnet" if sonnet_ok else None)
-        # The worker wants opus; sonnet does NOT count as available for work.
-        avail = opus_ok
+    def _claude_windows_from_flat(self, payload: dict) -> tuple[Window, Window]:
+        """Legacy reader: the flat `five_hour` / `seven_day` objects (utilization + resets_at)."""
+        fh = payload.get("five_hour") or {}
+        sd = payload.get("seven_day") or {}
+        return (
+            self._claude_win("session", fh.get("utilization"), fh.get("resets_at"), SESSION_WINDOW_S),
+            self._claude_win("weekly", sd.get("utilization"), sd.get("resets_at"), WEEK_WINDOW_S),
+        )
+
+    def _claude_windows_from_limits(self, limits: object) -> tuple[Window, Window] | None:
+        """New reader: pull the session and the overall (unscoped) weekly out of the `limits` array. Each
+        entry carries `group` (session|weekly), a `percent`, a `resets_at`, and a `scope` that is non-null
+        for the per-model weekly caps (which don't gate the worker's opus, so they're skipped — the old
+        flat `seven_day_sonnet` window, now null, moved here). Returns None (⇒ caller falls back to the
+        flat keys) unless BOTH a session and an unscoped weekly are found."""
+        if not isinstance(limits, list):
+            return None
+        session_l = weekly_l = None
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            group = str(lim.get("group") or lim.get("kind") or "")
+            if group == "session" and session_l is None:
+                session_l = lim
+            elif group.startswith("weekly") and not lim.get("scope") and weekly_l is None:
+                weekly_l = lim  # the unscoped overall weekly (weekly_all); model-scoped caps are skipped
+        if session_l is None or weekly_l is None:
+            return None
+        return (
+            self._claude_win("session", session_l.get("percent"), session_l.get("resets_at"), SESSION_WINDOW_S),
+            self._claude_win("weekly", weekly_l.get("percent"), weekly_l.get("resets_at"), WEEK_WINDOW_S),
+        )
+
+    def _claude_from_payload(self, payload: dict) -> Provider:
+        # The usage schema is moving from flat five_hour/seven_day objects to a structured `limits` array
+        # (kind=session | weekly_all | weekly_scoped, each with a `percent` and `resets_at`). Prefer the
+        # array when it yields both windows; fall back to the flat keys so a leaner/older response still
+        # paces. Only the session and the overall (unscoped) weekly gate the worker's opus; the per-model
+        # weekly caps (the old seven_day_sonnet, now null; weekly_scoped in the array) do not.
+        session, weekly = self._claude_windows_from_limits(payload.get("limits")) or self._claude_windows_from_flat(
+            payload
+        )
+        # All-null ⇒ API unreachable / auth broken / schema drift ⇒ unavailable (fail-closed).
+        if session.used is None and weekly.used is None:
+            return Provider("claude", False, None, [session, weekly], error="all usage null")
+        avail = session.status == "under-pace" and weekly.status == "under-pace"
         nxt = self._next_eligible([session, weekly])
-        return Provider("claude", avail, model, [session, weekly, sonnet], None, nxt)
+        return Provider("claude", avail, "opus" if avail else None, [session, weekly], None, nxt)
 
     @staticmethod
     def _parse_iso(s: str | None) -> float | None:
@@ -654,9 +685,9 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
     """Why an unavailable provider can't be used, and whether the block is *soft*.
 
     A soft block means there is real quota left and we're only pausing to pace the burn (over-pace) —
-    distinct from a hard block where a window is exhausted or its usage is unknown (fail-closed). The
-    `weekly_sonnet` window never gates opus, so it is ignored here. Returns (soft, reason)."""
-    gating = [w for w in (prov.windows or []) if w.name != "weekly_sonnet"]
+    distinct from a hard block where a window is exhausted or its usage is unknown (fail-closed).
+    Returns (soft, reason)."""
+    gating = prov.windows or []
     spent = [w for w in gating if w.status == "exhausted"]
     if spent:
         return False, ", ".join(f"{w.name} exhausted" for w in spent)

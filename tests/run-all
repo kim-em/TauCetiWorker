@@ -35,6 +35,7 @@ RUN_STDLIB=(
   mirror_creds.py
   pace_curve.py
   quota_cache_fp.py
+  quota_claude_windows.py
   quota_codex_windows.py
   quota_reason.py
   review_codex_model.py

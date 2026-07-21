@@ -4,7 +4,7 @@
 An over-pace window means we're pacing the burn with real quota left (a soft block, yellow ~), which is
 NOT the same as an exhausted or unknown window (a hard block, red ✗). The old code printed a single
 "over-pace/exhausted" reason and a red ✗ for both, so a healthy worker that was merely ahead of pace
-looked out of quota. The `weekly_sonnet` window never gates opus, so it must not be reported. Dependency-free.
+looked out of quota. Dependency-free.
 """
 
 import sys
@@ -49,15 +49,6 @@ reason_cases = [
         "unknown dominates a co-occurring over-pace window (fail-closed, not soft)",
         prov(W("session", None, None, "unknown"), W("weekly", 60.0, 40.0, "over-pace")),
         (False, "usage unknown"),
-    ),
-    (
-        "weekly_sonnet is ignored; only the real gate is reported",
-        prov(
-            W("session", 70.0, 40.0, "over-pace"),
-            W("weekly", 32.0, 86.0, "under-pace"),
-            W("weekly_sonnet", 0.0, None, "unknown"),
-        ),
-        (True, "session ahead of pace, 30% left"),
     ),
     (
         "two over-pace windows are both listed",
