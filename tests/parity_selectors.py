@@ -45,6 +45,16 @@ except tc.Die:
     ME = "tauceti-ci-placeholder"
 TAUCETI = tc.TAUCETI
 
+# jq mirror of PRInfo.from_json's build signal: the commit STATUS (a StatusContext with
+# context=="build", carrying `state`) is authoritative — that is what branch protection and the merge
+# gate read. Fall back to the check-run (name=="build", carrying `conclusion`) only when no build
+# status has been posted. Binds $b to the chosen list of state strings; callers append the predicate.
+BUILD_STATES = (
+    '([.statusCheckRollup[]? | select(.context=="build") | .state]) as $st '
+    '| ([.statusCheckRollup[]? | select(.name=="build") | .conclusion]) as $cr '
+    '| (if ($st|length)>0 then $st else $cr end) as $b '
+)
+
 
 def jq(data, expr, args=None):
     cmd = ["jq", "-c"] + (args or []) + [expr]
@@ -81,11 +91,11 @@ def run_checks(data, label):
         if not ok:
             fails += 1
 
-    # n_reviewable: non-draft AND a build check SUCCESS (round.sh line 816-817).
+    # n_reviewable: non-draft AND the authoritative build signal is SUCCESS (non-empty, all SUCCESS).
     check(
         "reviewable*",
         ".[] | select(.isDraft|not) "
-        '| select([.statusCheckRollup[]? | select(.name=="build")] | any(.conclusion=="SUCCESS"))',
+        '| select(%s | ($b|length)>0 and (all($b[]; .=="SUCCESS")))' % BUILD_STATES,
         [p.number for p in prs if not p.is_draft and p.build_success],
     )
 
@@ -104,22 +114,20 @@ def run_checks(data, label):
         [p.number for p in prs if not p.is_draft and is_tended(p) and p.mergeable == "CONFLICTING"],
     )
 
-    # fix-ci: tended, build check FAILED-ish, but NOT a bump PR (those go to the bump stage).
+    # fix-ci: tended, authoritative build signal FAILED-ish, but NOT a bump PR (those go to bump).
     fail_set = '"FAILURE","ERROR","TIMED_OUT","CANCELLED","STARTUP_FAILURE","ACTION_REQUIRED"'
     check(
         "fix-ci",
         '.[] | select(%s) | select(.headRefName|startswith("bump-mathlib/")|not) '
-        '| select([.statusCheckRollup[]? | select(.name=="build") '
-        "| select(.conclusion | IN(%s))] | any)" % (tended, fail_set),
+        "| select(%s | any($b[]; . | IN(%s)))" % (tended, BUILD_STATES, fail_set),
         [p.number for p in prs if is_tended(p) and p.build_failed and not p.head_ref.startswith("bump-mathlib/")],
     )
 
-    # bump: a bump-mathlib PR (bot-authored) whose build is red.
+    # bump: a bump-mathlib PR (bot-authored) whose authoritative build is red.
     check(
         "bump (bump-mathlib)",
         '.[] | select(.headRefName|startswith("bump-mathlib/")) '
-        '| select([.statusCheckRollup[]? | select(.name=="build") '
-        "| select(.conclusion | IN(%s))] | any)" % fail_set,
+        "| select(%s | any($b[]; . | IN(%s)))" % (BUILD_STATES, fail_set),
         [p.number for p in prs if p.head_ref.startswith("bump-mathlib/") and p.build_failed],
     )
 

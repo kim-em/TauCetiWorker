@@ -20,6 +20,7 @@ FAIL_FAST=0
 # stdlib-only python tests, run with the uv-provided interpreter
 RUN_STDLIB=(
   agent_cmds.py
+  build_status_rollup.py
   claude_config_dir.py
   claude_keychain.py
   contest_claim.py

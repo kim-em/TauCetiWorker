@@ -86,7 +86,19 @@ class PRInfo:
     @staticmethod
     def from_json(d: dict) -> PRInfo:
         rollup = d.get("statusCheckRollup") or []
-        builds = [c for c in rollup if c.get("name") == "build"]
+        # The required `build` signal is a commit STATUS (a StatusContext with context=="build",
+        # carrying `state`), posted by the trusted sandboxed-build workflow — that is exactly what
+        # branch protection and the merge gate read. The rollup ALSO contains a check-run named
+        # "build" (the pull_request_target job); on a fork PR that job always FAILS at the
+        # actions/checkout fork-refusal step ("Refusing to check out fork pull request code…") and is
+        # pure noise. Reading name=="build" alone therefore saw only the failing check-run and missed
+        # the passing status, so a green, mergeable fork PR looked red — routed to fix-ci, never
+        # reviewed, budget-exhausted, wedged. Read the commit status when present and ignore the
+        # check-run; fall back to the check-run only when no build status has been posted yet (e.g. a
+        # same-repo PR whose workflow posts a `build` check-run and no status).
+        status_states = [c.get("state") for c in rollup if c.get("context") == "build"]
+        checkrun_states = [c.get("conclusion") for c in rollup if c.get("name") == "build"]
+        build_states = status_states or checkrun_states
         return PRInfo(
             number=d["number"],
             title=d.get("title", ""),
@@ -98,8 +110,8 @@ class PRInfo:
             mergeable=d.get("mergeable", "UNKNOWN"),
             author=(d.get("author") or {}).get("login", ""),
             author_is_bot=bool((d.get("author") or {}).get("is_bot")),
-            build_success=any(c.get("conclusion") == "SUCCESS" for c in builds),
-            build_failed=any(c.get("conclusion") in BUILD_FAIL for c in builds),
+            build_success=bool(build_states) and all(s == "SUCCESS" for s in build_states),
+            build_failed=any(s in BUILD_FAIL for s in build_states),
         )
 
 
