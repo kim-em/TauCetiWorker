@@ -99,7 +99,7 @@ async def test_dashboard():
         await pilot.press("m")
         check("m cycles model auto->codex", app.model_dial == "codex")
         await pilot.press("s")
-        check("s toggles sandbox to host", app.host is True)
+        check("s toggles sandbox to bubble", app.bubble is True)
 
         before = table.row_count
         await pilot.press("down")  # onto review (index 1)
@@ -132,14 +132,14 @@ async def test_dashboard():
     check("prefs file written under XDG_CONFIG_HOME", prefs_file.exists() and str(prefs_file).startswith(_CFGDIR))
     saved = json.loads(prefs_file.read_text())
     check("prefs persisted model=codex", saved.get("model") == "codex")
-    check("prefs persisted host=True", saved.get("host") is True)
+    check("prefs persisted bubble=True", saved.get("bubble") is True)
     check("prefs persisted user-chosen only=topology", saved.get("roadmap_only") == "topology")
 
     app2 = tc._dashboard_app(CFG, loader=loader)
     async with app2.run_test() as pilot:
         await pilot.pause(0.05)
         check("restart restores model=codex", app2.model_dial == "codex")
-        check("restart restores sandbox=host", app2.host is True)
+        check("restart restores sandbox=bubble", app2.bubble is True)
 
 
 async def test_cursor_before_load():
@@ -327,7 +327,7 @@ def test_bare_cli_ignores_prefs():
     try:
         cfg = SimpleNamespace(home=Path(cfgdir))
         tc.save_dashboard_prefs(
-            cfg, {"model": "auto", "host": False, "roadmap_only": "SavedArea", "roadmap_skip": "SkipArea"}
+            cfg, {"model": "auto", "bubble": False, "roadmap_only": "SavedArea", "roadmap_skip": "SkipArea"}
         )
         check("bare CLI only is None (auto), ignoring the saved pref", tc.roadmap_only() is None)
         check("bare CLI skip is empty, ignoring the saved pref", tc.roadmap_skip() == [])
@@ -350,7 +350,7 @@ def test_dashboard_uses_saved_pref():
     try:
         cfg = SimpleNamespace(home=Path(cfgdir), state=Path(cfgdir) / "state", logdir=Path("/tmp/x"))
         tc.save_dashboard_prefs(
-            cfg, {"model": "auto", "host": False, "roadmap_only": "topology", "roadmap_skip": "algebra"}
+            cfg, {"model": "auto", "bubble": False, "roadmap_only": "topology", "roadmap_skip": "algebra"}
         )
         tc._dashboard_app(cfg, loader=loader)  # runs the saved-pref restore
         check("dashboard applied the saved only to the env", os.environ.get("TAUCETI_ROADMAP_ONLY") == "topology")

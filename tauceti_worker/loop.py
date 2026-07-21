@@ -20,9 +20,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     rate-limited GitHub."""
     openrouter = agent in OPENROUTER_MODELS
     ignore_quota = getattr(args, "ignore_quota", False)
-    host = getattr(args, "host", False)
+    bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
-    log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}{' [host]' if host else ''}")
+    log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}{' [bubble]' if bubble else ''}")
     streak = 0
     try:
         while True:
@@ -93,8 +93,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 tail += ["--only", ",".join(only)]
             if model:
                 tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
-            if host:
-                tail.append("--host")
+            if bubble:
+                tail.append("--bubble")
             rc = run_round_subprocess(tail)
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.

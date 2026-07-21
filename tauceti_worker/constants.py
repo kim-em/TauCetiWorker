@@ -129,7 +129,7 @@ PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/script
 # $TAUCETI_CLAUDE_CMD overrides the `claude` executable for host rounds (a sandbox wrapper, a
 # differently-named build, ...); it's split as a shell word list and the standard
 # -p/--model/--permission flags are still appended. Matches PI_RUN / $TAUCETI_BUBBLE /
-# $TAUCETI_CODEX_MODEL. (Bubble rounds run claude inside the container, so this is --host only.)
+# $TAUCETI_CODEX_MODEL. (Bubble rounds run claude inside the container, so this is host-mode only.)
 CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 
@@ -144,7 +144,8 @@ KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> 
 
 KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1", ...
 
-# Every mode runs a MODEL on third-party content, so each defaults to bubble (opt out with --host).
+# Every mode runs a MODEL on third-party content, so each is eligible for the bubble sandbox
+# (opt in with --bubble; the host is the default).
 SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 
 

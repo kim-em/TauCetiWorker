@@ -55,7 +55,7 @@ re-queries GitHub. It reacts to single keypresses (no Enter):
 | `1`–`6` | run one round of that numbered kind directly |
 | `l` / `L` | loop the auto cascade / loop just the selected kind |
 | `o` / `x` | pick the single roadmap area (`--roadmap-only`) / edit the skipped areas (`--roadmap-skip`) |
-| `m` / `s` | cycle the agent / toggle the sandbox (bubble ↔ host) |
+| `m` / `s` | cycle the agent / toggle the sandbox (host ↔ bubble) |
 | `r` / `c` / `q` | refresh / copy the launch command to the clipboard / quit |
 
 The agent, sandbox, and roadmap area dials you pick are remembered between runs in
@@ -90,7 +90,7 @@ to do", so a transient outage never falls through to authoring.
 ## Modes
 
 There are three dials: which work (`--only`), which agent (`--agent`), and where
-it runs (`--host`). They're independent, so combine them however you like.
+it runs (`--bubble`). They're independent, so combine them however you like.
 
 ### What work: `--only`
 
@@ -143,22 +143,25 @@ they never run on their own; you have to ask for them by name. Override their
 model ids with `DEEPSEEK_MODEL` / `MINIMAX_MODEL`, and point at a non-default `pi`
 runner with `PI_RUN`.
 
-### Where it runs: bubble, or `--host`
+### Where it runs: the host, or `--bubble`
 
-Every round runs its agent inside a [`bubble`](https://github.com/kim-em/bubble)
-sandbox by default. That's a repo-scoped container: your `gh` token never enters
-it (git and gh go through bubble's auth proxy), only the one credential the agent
-needs is seeded, and none of your host config crosses the boundary. That matters
-most for review, where the agent reads untrusted PRs.
-
-`--host` opts out and runs the agent directly on the host. It's faster, but the
+Every round runs its agent directly on the host by default. It's fast, but the
 agent has your full credentials and network, so keep it for trusted or local
-runs. Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime;
-if you don't have one, `tauceti doctor` says so and you run with `--host`. You
-don't have to install bubble yourself, `tauceti` fetches it with `uvx` when it
-isn't already on your `PATH`. On `--host` you can point at a non-default `claude`
-with `TAUCETI_CLAUDE_CMD` (a sandbox wrapper, a differently-named build, ...); it's
-split as a shell word list and the usual flags are appended.
+runs. You can point at a non-default `claude` with `TAUCETI_CLAUDE_CMD` (a sandbox
+wrapper, a differently-named build, ...); it's split as a shell word list and the
+usual flags are appended.
+
+`--bubble` opts into running the agent inside a
+[`bubble`](https://github.com/kim-em/bubble) sandbox instead. That's a repo-scoped
+container: your `gh` token never enters it (git and gh go through bubble's auth
+proxy), only the one credential the agent needs is seeded, and none of your host
+config crosses the boundary. That matters most for review, where the agent reads
+untrusted PRs. Bubble needs a working [Incus](https://linuxcontainers.org/incus/)
+runtime; if you don't have one, `tauceti doctor` says so. You don't have to install
+bubble yourself, `tauceti` fetches it with `uvx` when it isn't already on your `PATH`.
+
+(`--host` used to be how you opted out of the sandbox. The host is now the default,
+so the flag is a no-op that just warns; pass `--bubble` for the sandbox.)
 
 The agent's conversation transcript is noisy, so by default a round redirects it
 to a timestamped file under `logs/` and prints the path (tailing it if the agent
@@ -264,7 +267,8 @@ is in `tauceti work -h`.
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
 | `--only TASKS` | Restrict the round to a comma list of `rebase,review,fix-ci,fix,bump,roadmap` (default: the whole cascade). |
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax` — see the agent table above. |
-| `--host` | Opt out of the bubble sandbox and run the agent directly on the host. |
+| `--bubble` | Run the agent inside the bubble sandbox instead of directly on the host (the default). |
+| `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
@@ -293,11 +297,11 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
-| `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for `--host` rounds; split as a shell word list, the usual flags appended. |
+| `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
 | `TAUCETI_CODEX_MODEL` | host's configured model (authoring); engine default `gpt-5.6-sol` (review) | The Codex model for authoring rounds; when set it also pins the Codex **review** model (`TAUCETI_CODEX_MODEL=gpt-5.6-terra tauceti work --only review`), like `DEEPSEEK_MODEL`/`MINIMAX_MODEL`. Left unset, reviews use the engine's default with its automatic `gpt-5.6-terra` fallback for accounts that can't run Sol. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
 | `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
-| `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on `--host`. |
+| `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |
 | `TAUCETI_BUBBLE` | `bubble` (else `uvx`-fetched) | Override the bubble executable. |
 | `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
@@ -314,12 +318,12 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 
 - Always: `gh` (logged in as the account the worker should act as), `git`, `uv`,
   and `jq`.
-- Bubble (the default sandbox): a working Incus runtime. `tauceti` fetches the
-  bubble CLI itself.
-- `--host` authoring: an `elan`/`lake` toolchain on the host.
+- Host authoring (the default): an `elan`/`lake` toolchain on the host.
+- The `--bubble` sandbox: a working Incus runtime. `tauceti` fetches the bubble
+  CLI itself.
 - The agents you want: `codex` and/or `claude` logged in, and for
   `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
-  bubble image; you only need it on the host for `--host` rounds).
+  bubble image; you only need it on the host for host-mode rounds).
 
 `tauceti doctor` checks all of this.
 

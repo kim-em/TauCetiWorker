@@ -158,7 +158,7 @@ def _shq(s: str) -> str:
     return shlex.quote(s)
 
 
-# ===== Bubble authoring path (default for model modes; --host opts out) =======
+# ===== Bubble authoring path (opt in with --bubble; the host is the default) =======
 # The checkout, lake build, and every git/gh call happen IN a repo-scoped bubble
 # container. GitHub goes through bubble's auth proxy (the host gh token never
 # enters); only the one credential the work model needs is seeded; no host config
@@ -393,7 +393,7 @@ def _ensure_claude_creds_for_bubble(cfg: Config) -> None:
     raise Die(
         "no Claude credentials to seed the bubble: none in "
         f'{f} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
-        "the Keychain and retry, or run with --host (the host claude reads the Keychain itself)."
+        "the Keychain and retry, or drop --bubble (the host claude reads the Keychain itself)."
     )
 
 
@@ -613,7 +613,7 @@ def _seed_gh_token_for_isolation() -> None:
     aborts the round (Bryan's report). The GH_CONFIG_DIR redirect recovers gh's host LIST but not the
     keychain-backed token. So while the real $HOME still reaches the Keychain, capture the token and
     export it: gh and gh's git credential helper both honour $GH_TOKEN ahead of the keychain, so child
-    calls (the survey, host pushes, and the agent's own gh on --host) stay authenticated under the
+    calls (the survey, host pushes, and the agent's own gh in host mode) stay authenticated under the
     isolated home. macOS is single-account by nature, so one token is correct.
 
     Scope/limits: github.com only (the sole host TauCeti uses; a GHES remote would need a separate

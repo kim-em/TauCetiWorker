@@ -144,7 +144,7 @@ def render_survey(
 def launch_cmd(
     only: str | None,
     model_dial: str,
-    host: bool,
+    bubble: bool,
     loop: bool,
     roadmap_only: str | None = None,
     roadmap_skip: str | None = None,
@@ -161,8 +161,8 @@ def launch_cmd(
         cmd += ["--only", only]
     if model_dial != "auto":
         cmd += ["--agent", model_dial]
-    if host:
-        cmd.append("--host")
+    if bubble:
+        cmd.append("--bubble")
     if roadmap_only is not None:
         cmd += ["--roadmap-only", roadmap_only]
     if roadmap_skip is not None:
@@ -368,7 +368,7 @@ def _dashboard_app(cfg, loader=None):
             super().__init__()
             self.cfg = cfg
             self.model_dial = prefs["model"] if prefs.get("model") in MODELS else "auto"
-            self.host = bool(prefs.get("host", False))
+            self.bubble = bool(prefs.get("bubble", False))
             self.sel = 0
             self.expanded = set()
             self.areas = None
@@ -482,7 +482,7 @@ def _dashboard_app(cfg, loader=None):
                 t.move_cursor(row=row, animate=False)  # scroll the selected kind into view (no focus needed)
 
         def _render_status(self) -> None:
-            sandbox = "host" if self.host else "bubble"
+            sandbox = "bubble" if self.bubble else "host"
             nxt = self.sv.next_auto_stage if self.sv else None
             nxt_s = nxt.upper() if nxt else "NOTHING (no eligible work)"
             s = Text()
@@ -527,7 +527,7 @@ def _dashboard_app(cfg, loader=None):
             self._save_prefs()
 
         def action_toggle_sandbox(self) -> None:
-            self.host = not self.host
+            self.bubble = not self.bubble
             self._render_status()
             self._save_prefs()
 
@@ -535,7 +535,7 @@ def _dashboard_app(cfg, loader=None):
             # Persist the roadmap dials only when the operator set them via [o]/[x]; a transient
             # TAUCETI_ROADMAP_ONLY/SKIP override must not become sticky across future runs. Otherwise
             # leave the saved values as-is.
-            data = {"model": self.model_dial, "host": self.host}
+            data = {"model": self.model_dial, "bubble": self.bubble}
             if self._only_set_by_user:
                 self._saved_only = roadmap_only()
             if self._saved_only is not None:
@@ -598,8 +598,8 @@ def _dashboard_app(cfg, loader=None):
         # ---- launch ---------------------------------------------------------------------------------
         def action_copy_cmd(self) -> None:
             skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
-            one = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.host, False, roadmap_only(), skip))
-            loop = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.host, True, roadmap_only(), skip))
+            one = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.bubble, False, roadmap_only(), skip))
+            loop = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.bubble, True, roadmap_only(), skip))
             copied = True
             try:
                 self.copy_to_clipboard(one)
@@ -610,7 +610,7 @@ def _dashboard_app(cfg, loader=None):
         def _launch(self, *, loop: bool, only_selected: bool) -> None:
             only = ALLOWED_TASKS[self.sel] if only_selected else None
             skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
-            cmd = launch_cmd(only, self.model_dial, self.host, loop, roadmap_only(), skip)
+            cmd = launch_cmd(only, self.model_dial, self.bubble, loop, roadmap_only(), skip)
             if loop:  # detached: the TUI is a launcher, not a supervisor
                 pid, logf = _launch_detached(self.cfg, cmd)
                 self.notify(f"pid {pid}  →  {logf}\nstop it:  kill {pid}", title="loop launched", timeout=10)

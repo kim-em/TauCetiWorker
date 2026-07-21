@@ -62,13 +62,13 @@ the cascade (priority order; a round does the first that applies):
   --skip drops a subset (and the two combine by subtraction).
 
 examples:
-  tauceti work                          one round: auto agent, in a bubble
+  tauceti work                          one round: auto agent, on the host
   tauceti work --loop                   the driver: keep picking the best job
   tauceti work --loop --only review     a focused reviewer
   tauceti work --loop --skip roadmap    the whole cascade except authoring new PRs
   tauceti work --only roadmap --roadmap-only ReductiveGroups
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
-  tauceti work --agent claude --host    run Opus directly on the host
+  tauceti work --agent claude --bubble  run Opus inside the bubble sandbox
   tauceti work --dry-run                show what it WOULD do; act on nothing
 
 multiple workers (share a host, coordinate through GitHub; a distinct id isolates each):
@@ -123,10 +123,17 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "(default: $TAUCETI_AGENT or auto)",
     )
     p.add_argument(
+        "--bubble",
+        action="store_true",
+        help="run the agent inside the bubble sandbox — its own container, TauCeti-scoped "
+        "credentials, and no open network — instead of directly on the host. Slower to start, "
+        "but the agent never gets your full credentials or network (default: run on the host)",
+    )
+    p.add_argument(
         "--host",
         action="store_true",
-        help="opt OUT of the bubble sandbox and run the agent directly on the host "
-        "(faster, but the agent gets your full credentials and network; default: bubble)",
+        help="DEPRECATED, now the default: the agent already runs directly on the host, so this "
+        "is a no-op that only warns. Pass --bubble to run inside the sandbox instead",
     )
     p.add_argument(
         "--stream",
@@ -274,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Do one unit of work and exit, or pass --loop to run the driver. A round picks the\n"
         "first applicable job from the cascade (or from --only), paces subscription agents\n"
-        "against your quota, and runs it on --agent inside a bubble sandbox (or --host).",
+        "against your quota, and runs it on --agent directly on the host (or --bubble for the sandbox).",
         epilog=WORK_EPILOG,
     )
     add_work_flags(w)
@@ -349,6 +356,13 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
+    # --host used to opt OUT of the bubble sandbox; running on the host is now the default, so the flag
+    # is a no-op we only warn about. --bubble is the way to opt back INTO the sandbox.
+    if getattr(args, "host", False):
+        warn_red(
+            "--host is now the default (the agent runs directly on the host); it is a no-op. "
+            "Pass --bubble to run inside the sandbox instead"
+        )
     # --roadmap-only overrides the env for this run (and is inherited by loop children, which read it
     # live via roadmap_only()). Empty string is a meaningful value: "all areas".
     if getattr(args, "roadmap_only", None) is not None:
@@ -439,7 +453,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             only=only,
             agent=agent,
             work_model=work_model,
-            sandbox_host=getattr(args, "host", False),
+            sandbox_host=not getattr(args, "bubble", False),
             dry_run=dry,
         )
         if not dry:
@@ -486,9 +500,9 @@ def cmd_doctor(args) -> int:
     rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
-    rows.append(("bubble", _have("bubble"), "default sandbox (fetched on demand if absent)"))
-    rows.append(("incus", _have("incus"), "bubble's container runtime — install it, or use --host"))
-    rows.append(("lake", _have("lake"), "only --host authoring builds with it"))
+    rows.append(("bubble", _have("bubble"), "the --bubble sandbox (fetched on demand if absent)"))
+    rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
+    rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("codex creds", _safe_exists(cfg.home / ".codex" / "auth.json"), "~/.codex/auth.json"))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
@@ -517,8 +531,11 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             raise Die(f"preflight: missing '{t}' on PATH")
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s))
     if needs_host_build and not _have("lake") and not opts.dry_run:
-        raise Die("preflight: --host authoring needs an elan/lake toolchain on PATH (or drop --host)")
-    # bubble (the default sandbox) runs each model on untrusted PR content inside an Incus container.
+        raise Die(
+            "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
+            "(or pass --bubble to build inside the sandbox instead)"
+        )
+    # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";
     # catch it here with a pointer to the two ways out.
     uses_bubble = any(_bubble(s, opts) for s in WORK_TASKS if want(opts.only, s))
@@ -530,7 +547,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "preflight: the bubble sandbox needs a working Incus runtime, but `incus` is not on PATH.\n"
             "  bubble runs each model on untrusted PR content inside an Incus container. Either:\n"
             "    - install Incus (https://linuxcontainers.org/incus/), then re-run; or\n"
-            "    - re-run with --host to skip the sandbox and run on this host directly (the agent then\n"
+            "    - drop --bubble to run on this host directly (the default; the agent then\n"
             "      has your full gh credentials and network, so use it only on trusted/disposable machines).\n"
             "  `tauceti doctor` reports this too."
         )

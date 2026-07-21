@@ -60,7 +60,7 @@ class RoundOpts:
     only: list[str]
     agent: str  # auto|codex|claude|deepseek|minimax (the requested dial)
     work_model: str  # the concrete model to run (codex|claude|deepseek|minimax), or 'auto' for dry-run
-    sandbox_host: bool  # True = --host (opt out of bubble)
+    sandbox_host: bool  # True = run on the host (the default); False = --bubble (use the sandbox)
     dry_run: bool
 
     @property
@@ -79,7 +79,8 @@ class Worker:
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
-    """True = run this stage in bubble. Every model-running stage defaults to bubble; --host opts out."""
+    """True = run this stage in bubble. Only model-running stages are eligible; among those, the host is
+    the default and --bubble (sandbox_host=False) opts into the sandbox."""
     if not SANDBOX_DEFAULT.get(stage, False):
         return False
     return not opts.sandbox_host
@@ -88,7 +89,7 @@ def _bubble(stage: str, opts: RoundOpts) -> bool:
 def run_round(w: Worker, opts: RoundOpts) -> int:
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
     # before any work runs. The quota pacer does this too, but the --ignore-quota + pinned --agent
-    # fast path in resolve_work_model skips the pacer, and --host review never hits the bubble-seed
+    # fast path in resolve_work_model skips the pacer, and host-mode review never hits the bubble-seed
     # mirror — so without this an operator token refresh (or account switch) never reaches a host
     # worker, and its mirror ages out into 401s that silently burn review rounds. No-op when not
     # isolated / on macOS, and a handful of small local reads + compares in steady state, so it is
@@ -288,7 +289,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     return rc
 
 
-# --- the work units (each runs in bubble by default, or on the host with --host) ---
+# --- the work units (each runs on the host by default, or in bubble with --bubble) ---
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int:
