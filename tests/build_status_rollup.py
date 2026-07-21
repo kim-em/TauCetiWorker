@@ -62,8 +62,10 @@ def main():
         p = pr(rollup)
         ok = p.build_success == want_s and p.build_failed == want_f
         flag = "OK " if ok else "XX "
-        print(f"[{flag}] {label:48} success={p.build_success!s:5} failed={p.build_failed!s:5} "
-              f"(want success={want_s!s:5} failed={want_f})")
+        print(
+            f"[{flag}] {label:48} success={p.build_success!s:5} failed={p.build_failed!s:5} "
+            f"(want success={want_s!s:5} failed={want_f})"
+        )
         if not ok:
             fails += 1
     # build_success and build_failed must never both be true.

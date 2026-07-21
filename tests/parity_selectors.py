@@ -52,7 +52,7 @@ TAUCETI = tc.TAUCETI
 BUILD_STATES = (
     '([.statusCheckRollup[]? | select(.context=="build") | .state]) as $st '
     '| ([.statusCheckRollup[]? | select(.name=="build") | .conclusion]) as $cr '
-    '| (if ($st|length)>0 then $st else $cr end) as $b '
+    "| (if ($st|length)>0 then $st else $cr end) as $b "
 )
 
 
@@ -94,8 +94,7 @@ def run_checks(data, label):
     # n_reviewable: non-draft AND the authoritative build signal is SUCCESS (non-empty, all SUCCESS).
     check(
         "reviewable*",
-        ".[] | select(.isDraft|not) "
-        '| select(%s | ($b|length)>0 and (all($b[]; .=="SUCCESS")))' % BUILD_STATES,
+        '.[] | select(.isDraft|not) | select(%s | ($b|length)>0 and (all($b[]; .=="SUCCESS")))' % BUILD_STATES,
         [p.number for p in prs if not p.is_draft and p.build_success],
     )
 
