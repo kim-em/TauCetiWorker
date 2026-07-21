@@ -529,7 +529,10 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     for t in ("gh", "git", "uvx"):
         if not _have(t):
             raise Die(f"preflight: missing '{t}' on PATH")
-    needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s))
+    # Only authoring/fixing stages build with lake on the host; review runs the fetched-on-demand review
+    # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
+    # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
+    needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s != "review")
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "

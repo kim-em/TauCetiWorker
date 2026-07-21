@@ -34,6 +34,7 @@ RUN_STDLIB=(
   ledger_blocking.py
   mirror_creds.py
   pace_curve.py
+  preflight_review_lake.py
   quota_cache_fp.py
   quota_claude_windows.py
   quota_codex_windows.py

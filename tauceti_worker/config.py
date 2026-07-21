@@ -136,7 +136,7 @@ class Config:
         wid = sanitize_wid(worker_id or os.environ.get("TAUCETI_WORKER_ID", "default") or "default")
         # Export the resolved id so claim.sh (acquire / heartbeat-renew / git-safe-push's lease check)
         # all share ONE stable owner identity. Without this it falls back to `hostname-$$`, a different
-        # owner per claim.sh invocation, so on the --host path a worker can't renew or recognise its own
+        # owner per claim.sh invocation, so in host mode a worker can't renew or recognise its own
         # branch/<pr> lease and git-safe-push fails closed with "lease lost (another agent took over)".
         os.environ["TAUCETI_WORKER_ID"] = wid
         h = home or Path(os.environ.get("HOME", os.path.expanduser("~")))

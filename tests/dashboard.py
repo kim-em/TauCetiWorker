@@ -390,6 +390,35 @@ async def test_skip_dashboard():
             os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
+def test_dashboard_migrates_host_pref():
+    """The sandbox pref key was renamed host -> bubble when the default flipped to host. An old prefs
+    file (only the `host` key) must migrate as bubble = not host, so a user who was reviewing untrusted
+    PRs in bubble (host=false) is NOT silently un-sandboxed on upgrade. A present `bubble` key wins."""
+    cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-mig-")
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    old_only = os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+    old_skip = os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+    os.environ["XDG_CONFIG_HOME"] = cfgdir
+    try:
+        cfg = SimpleNamespace(home=Path(cfgdir), state=Path(cfgdir) / "state", logdir=Path("/tmp/x"))
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": False})  # old bubble default
+        check("old host=false migrates to bubble mode", tc._dashboard_app(cfg, loader=loader).bubble is True)
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "host": True})  # old host toggle
+        check("old host=true migrates to host mode", tc._dashboard_app(cfg, loader=loader).bubble is False)
+        tc.save_dashboard_prefs(cfg, {"model": "auto", "bubble": True, "host": False})  # new key wins
+        check("new bubble key takes precedence over legacy host", tc._dashboard_app(cfg, loader=loader).bubble is True)
+        tc.save_dashboard_prefs(cfg, {"model": "auto"})  # neither key -> new host default
+        check("no sandbox pref defaults to host", tc._dashboard_app(cfg, loader=loader).bubble is False)
+    finally:
+        os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
+        if old_only is not None:
+            os.environ["TAUCETI_ROADMAP_ONLY"] = old_only
+        if old_skip is not None:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
+
+
 async def run_all():
     await test_dashboard()
     await test_cursor_before_load()
@@ -401,6 +430,7 @@ async def run_all():
     test_roadmap_skip_parse()
     test_bare_cli_ignores_prefs()
     test_dashboard_uses_saved_pref()
+    test_dashboard_migrates_host_pref()
     await test_skip_dashboard()
 
 

@@ -368,7 +368,16 @@ def _dashboard_app(cfg, loader=None):
             super().__init__()
             self.cfg = cfg
             self.model_dial = prefs["model"] if prefs.get("model") in MODELS else "auto"
-            self.bubble = bool(prefs.get("bubble", False))
+            # Migrate the pre-flip pref. Older dashboards persisted `host` (host=false was the old bubble
+            # default); when the new `bubble` key is absent, honour it as bubble = not host so an upgrade
+            # never silently un-sandboxes a user who was reviewing untrusted PRs in bubble. The stale `host`
+            # key is dropped the next time _save_prefs writes (it only emits `bubble`).
+            if "bubble" in prefs:
+                self.bubble = bool(prefs.get("bubble"))
+            elif "host" in prefs:
+                self.bubble = not bool(prefs.get("host"))
+            else:
+                self.bubble = False
             self.sel = 0
             self.expanded = set()
             self.areas = None
