@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -31,6 +32,82 @@ WEEK_WINDOW_S = 7 * 24 * 3600
 QUOTA_TTL = {"codex": 600, "claude": 3600}
 
 
+# --- pacing curve --------------------------------------------------------------------------------
+# The pacer decides a window is "under pace" while used% stays under a BUDGET that grows with elapsed
+# time. By default that budget is elapsed% itself (the legacy "used% <= elapsed%" identity line), but
+# the operator can supply a custom piecewise-linear curve via $TAUCETI_PACE / --pace as "time%:budget%"
+# control points, e.g. "0:10,50:70,90:90": allow 10% immediately, ramp to 70% by the halfway mark and
+# 90% by 90% of the window, then (unspecified time 100 defaults to budget 100) ramp to the full quota by
+# the deadline. Budget is a % of quota and MAY exceed 100 (a value >=100 means "no cap" — used% can't
+# exceed 100 anyway). This shapes only the soft PACE; a window at 100% used is still 'exhausted', and
+# missing/limit-reached data still fail-closed, both independent of the curve.
+_LEGACY_PACE = [(0.0, 0.0), (100.0, 100.0)]  # used% <= elapsed%
+
+_PACE_CACHE: dict[str, list[tuple[float, float]]] = {}
+
+
+def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
+    """Parse "t:b,t:b,..." into sorted (time%, budget%) control points, filling the endpoints the
+    operator omits: time 0 -> budget 0, time 100 -> budget 100 (full quota by the deadline). An empty /
+    None spec is the legacy identity curve (used% <= elapsed%). Raises ValueError on a malformed spec so
+    the CLI can reject it up front."""
+    pts: dict[float, float] = {}
+    for tok in (t.strip() for t in (spec or "").split(",")):
+        if not tok:
+            continue
+        if ":" not in tok:
+            raise ValueError(f"pace point {tok!r} is not in 'time:budget' form (e.g. 50:70)")
+        ts, bs = tok.split(":", 1)
+        try:
+            t, b = float(ts), float(bs)
+        except ValueError as e:
+            raise ValueError(f"pace point {tok!r} has a non-numeric value") from e
+        if not math.isfinite(t) or not math.isfinite(b):  # float() accepts nan/inf/1e999 — reject them
+            raise ValueError(f"pace point {tok!r} has a non-finite value")
+        if not 0 <= t <= 100:
+            raise ValueError(f"pace time {t} is outside 0..100 in {tok!r}")
+        if b < 0:
+            raise ValueError(f"pace budget {b} must be >= 0 in {tok!r}")
+        if t in pts and pts[t] != b:
+            raise ValueError(f"pace time {t} given twice with different budgets ({pts[t]} and {b})")
+        pts[t] = b
+    if not pts:
+        # No usable points: a blank/whitespace spec means "unset" (legacy identity); a spec with real
+        # structure that parsed to nothing (e.g. "," or ",,") is a typo, not a request for identity —
+        # reject it loudly.
+        if (spec or "").strip():
+            raise ValueError(f"no pace points in {spec!r} (want time:budget, e.g. 0:10,50:70)")
+        return list(_LEGACY_PACE)
+    pts.setdefault(0.0, 0.0)
+    pts.setdefault(100.0, 100.0)
+    return sorted(pts.items())
+
+
+def pace_curve() -> list[tuple[float, float]]:
+    """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
+    see it; parse cached per raw spec). A spec that somehow reaches here malformed — the CLI validates
+    --pace up front — falls back to the strict legacy curve rather than silently unlocking spend."""
+    raw = os.environ.get("TAUCETI_PACE", "") or ""
+    if raw not in _PACE_CACHE:
+        try:
+            _PACE_CACHE[raw] = parse_pace_curve(raw)
+        except ValueError:
+            _PACE_CACHE[raw] = list(_LEGACY_PACE)
+    return _PACE_CACHE[raw]
+
+
+def pace_budget(curve: list[tuple[float, float]], elapsed: float) -> float:
+    """The max allowed used% at this elapsed%, linearly interpolated over `curve` (sorted, spanning
+    time 0..100)."""
+    e = max(0.0, min(100.0, elapsed))
+    prev_t, prev_b = curve[0]
+    for t, b in curve:
+        if e <= t:
+            return b if t == prev_t else prev_b + (e - prev_t) / (t - prev_t) * (b - prev_b)
+        prev_t, prev_b = t, b
+    return curve[-1][1]
+
+
 @dataclass
 class Window:
     name: str
@@ -38,6 +115,7 @@ class Window:
     elapsed: float | None  # percent 0..100 (None = unknown)
     resets_at: float | None  # epoch seconds
     status: str  # under-pace | over-pace | exhausted | unknown
+    budget: float | None = None  # pace budget (max allowed used%) at this window's elapsed%, if computed
 
 
 @dataclass
@@ -53,20 +131,29 @@ class Provider:
     # quota reset — must not be classified as exhausted/next_eligible
 
 
+def _finite_num(x: object) -> bool:
+    """A usable numeric percentage: a real int/float that isn't a bool and isn't NaN/inf. The usage
+    endpoints are reverse-engineered JSON (whose decoder even accepts NaN/Infinity), so anything else is
+    treated as missing telemetry — fail-closed — rather than clamped into a spurious value."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
 def _classify_window(
     name: str, used: float | None, elapsed: float | None, resets_at: float | None, limit_reached: bool
 ) -> Window:
-    # Fail CLOSED on missing data. These endpoints are reverse-engineered: a schema drift that drops
-    # `used` or the reset clock must read as 'unknown' (⇒ provider unavailable), NEVER as fresh /
-    # under-pace, so it can't silently unlock spending. Clamp both percentages to [0,100].
-    e = None if elapsed is None else max(0.0, min(100.0, elapsed))
+    # Fail CLOSED on missing OR garbage data. These endpoints are reverse-engineered: a schema drift that
+    # drops `used`/the reset clock, or hands us a non-number / NaN / inf, must read as 'unknown' (⇒
+    # provider unavailable), NEVER as fresh / under-pace, so it can't silently unlock spending. A hard
+    # limit_reached still exhausts regardless of the elapsed value. Clamp valid percentages to [0,100].
+    e = max(0.0, min(100.0, elapsed)) if _finite_num(elapsed) else None
     if limit_reached:
         return Window(name, used, e, resets_at, "exhausted")
-    if used is None or e is None:
+    if not _finite_num(used) or e is None:
         return Window(name, used, e, resets_at, "unknown")
     u = max(0.0, min(100.0, used))
-    st = "exhausted" if u >= 100 else ("under-pace" if u <= e else "over-pace")
-    return Window(name, used, e, resets_at, st)
+    thr = pace_budget(pace_curve(), e)  # max allowed used% at this elapsed%, per the operator's curve
+    st = "exhausted" if u >= 100 else ("under-pace" if u <= thr else "over-pace")
+    return Window(name, used, e, resets_at, st, thr)
 
 
 def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict, float | None]:
@@ -583,8 +670,10 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
     if ahead:
         bits = []
         for w in ahead:
+            # Show the curve budget it exceeded (so a custom --pace is observable), plus quota remaining.
+            vs = "" if (w.used is None or w.budget is None) else f" (used {round(w.used)}% > {round(w.budget)}% budget)"
             left = "" if w.used is None else f", {max(0, round(100 - w.used))}% left"
-            bits.append(f"{w.name} ahead of pace{left}")
+            bits.append(f"{w.name} ahead of pace{vs}{left}")
         return True, "; ".join(bits)
     return False, "unavailable"
 

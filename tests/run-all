@@ -33,6 +33,7 @@ RUN_STDLIB=(
   isolate_home_paths.py
   ledger_blocking.py
   mirror_creds.py
+  pace_curve.py
   quota_cache_fp.py
   quota_codex_windows.py
   quota_reason.py

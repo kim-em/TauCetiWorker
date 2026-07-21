@@ -184,6 +184,15 @@ scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
 can't read usage, it treats the provider as unavailable rather than guessing it's
 free.
 
+`--pace` (or `TAUCETI_PACE`) reshapes that rule into any piecewise-linear budget
+you like, as `time%:budget%` control points: `--pace 0:10,50:70,90:90` allows up to
+10% used immediately, ramps to 70% by the halfway mark and 90% by 90% of the window,
+then to the full quota by the deadline. The budget is a percent of quota (values ≥ 100
+mean "no cap") and is linearly interpolated between points; an unspecified time 0
+defaults to budget 0 and time 100 to budget 100. The default (unset) is the strict
+identity `used% ≤ elapsed%`. This shapes only the soft pace — a window at 100% used,
+or usage the pacer can't read, still backs off regardless.
+
 `--ignore-quota` turns the pacer off (then pass an explicit `--agent`).
 `--quota-cmd <cmd>` (or `TAUCETI_QUOTA_CMD`) swaps in your own pacer instead: it's
 run as `<cmd> <agent>`, and its first line of stdout is the model to run now, or
@@ -263,6 +272,7 @@ is in `tauceti work -h`.
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
 | `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
+| `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): allow ≤ budget% used by elapsed%, interpolated; time 0/100 default to 0/100. Default is `used% ≤ elapsed%`. |
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its `$HOME`. |
 | `--isolate-home` | Force the per-worker `$HOME` even for the `default` id (a distinct id already implies it). |
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
@@ -280,6 +290,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own, for `--roadmap-extra-identities`. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
+| `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for `--host` rounds; split as a shell word list, the usual flags appended. |

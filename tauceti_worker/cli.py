@@ -38,7 +38,7 @@ from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, TAUCETI, WORK_TASKS
 from .github import GitHub
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir
+from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .survey import Counters, survey
@@ -82,6 +82,7 @@ environment (flags win; see README.md for the full list):
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_QUOTA_CMD      default for --quota-cmd
+  TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% <= elapsed%); see --pace
   TAUCETI_STREAM=1       same as --stream
   CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
                          (account switching, where the creds live in a file)
@@ -190,6 +191,17 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "overrides the built-in pacer (or $TAUCETI_QUOTA_CMD)",
     )
     p.add_argument(
+        "--pace",
+        dest="pace",
+        default=None,
+        metavar="T:B[,T:B...]",
+        help="pacing curve as `time%%:budget%%` control points, e.g. `0:10,50:70,90:90`: cap used%% at "
+        "budget%% once time%% of the window has elapsed, linearly interpolated between points. An "
+        "unspecified time 0 defaults to budget 0 and time 100 to budget 100. Default (unset) is the "
+        "strict identity used%% <= elapsed%%. Overrides $TAUCETI_PACE for this run (inherited by loop "
+        "children)",
+    )
+    p.add_argument(
         "--worker-id",
         dest="worker_id",
         default=None,
@@ -289,6 +301,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.cmd
 
+    # A malformed $TAUCETI_PACE must fail loudly, not silently degrade to identity pacing (which can be
+    # LOOSER than intended). Validate the effective env for every subcommand up front; --pace itself is
+    # validated (and sets this env) in cmd_work.
+    pace_env = os.environ.get("TAUCETI_PACE")
+    if pace_env is not None:
+        try:
+            parse_pace_curve(pace_env)
+        except ValueError as e:
+            raise Die(f"$TAUCETI_PACE: {e}") from None
+
     if cmd is None:
         return cmd_tui(args)
     if cmd == "status":
@@ -341,6 +363,14 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
     if getattr(args, "respect_claims", None) is False:
         os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
+    # --pace overrides the env and is inherited by loop children (read live via pace_curve()). Validate
+    # up front so a typo fails loudly here rather than silently falling back to the strict legacy curve.
+    if getattr(args, "pace", None) is not None:
+        try:
+            parse_pace_curve(args.pace)
+        except ValueError as e:
+            raise Die(f"--pace: {e}") from None
+        os.environ["TAUCETI_PACE"] = args.pace
     # --stream restores live agent output (default redirects it to a log file). Set in the env so loop
     # children inherit it.
     if getattr(args, "stream", False):
