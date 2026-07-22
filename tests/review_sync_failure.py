@@ -75,9 +75,7 @@ class FakeWorker:
 
 
 def opts(work_model="codex"):
-    return tc.RoundOpts(
-        only=["review"], agent=work_model, work_model=work_model, sandbox_host=True, dry_run=False
-    )
+    return tc.RoundOpts(only=["review"], agent=work_model, work_model=work_model, sandbox_host=True, dry_run=False)
 
 
 # Stub the engine (posts fine, rc=0) and the module-level helpers do_review calls on the host path.

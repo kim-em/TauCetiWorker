@@ -368,9 +368,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     f"fail the same way), so it is NOT charged to any PR's review-error budget. Check "
                     f"the host's git/gh credentials; the loop re-drains on its own once it is fixed."
                 )
-                raise NoProgress(
-                    f"review #{pr}: TauCetiData publish failed — machine-wide, not charged to the PR"
-                )
+                raise NoProgress(f"review #{pr}: TauCetiData publish failed — machine-wide, not charged to the PR")
             if c.contest:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply
                 # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀
