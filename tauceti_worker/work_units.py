@@ -346,13 +346,25 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # outbox mean the merge gate can't see this round, so don't report the round as a success.
             srv = _sync_review_outbox(w, pr)
             if srv != 0:
-                log(
-                    f"  review #{pr}: archived but the TauCetiData sync FAILED — records remain in "
-                    f"{w.cfg.store_dir / 'outbox'} (the merge gate can't see this round until they "
-                    f"land); a later round retries the drain"
+                # The sync failed: publishing this round's records to TauCetiData (a git push, after
+                # archive.sync's own retries) did not land — auth, network, or the remote being down.
+                # That is MACHINE-WIDE: every PR's publish would fail identically, so it must NOT be
+                # charged to this PR's review-error budget. Charging it did exactly the damage the
+                # host-binary preflight above guards against — a stale gh credential helper made every
+                # push fail, and green PRs marched one-by-one to the "needs a human" cap even though
+                # each review posted fine. Mirror that preflight: warn loudly and raise NoProgress
+                # (⇒ backoff, no counter bump). The review IS posted and its records are kept in the
+                # outbox; a later round re-drains them once the machine-wide cause clears.
+                warn_red(
+                    f"review #{pr}: the review posted, but publishing its records to TauCetiData "
+                    f"FAILED — records kept in {w.cfg.store_dir / 'outbox'}, so the merge gate can't "
+                    f"see this round until they land. This is machine-wide (every PR's publish would "
+                    f"fail the same way), so it is NOT charged to any PR's review-error budget. Check "
+                    f"the host's git/gh credentials; the loop re-drains on its own once it is fixed."
                 )
-                w.counters.incr(errkey)
-                return srv
+                raise NoProgress(
+                    f"review #{pr}: TauCetiData publish failed — machine-wide, not charged to the PR"
+                )
             w.counters.write(errkey, 0)
             if c.contest:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply

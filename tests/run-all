@@ -37,6 +37,7 @@ RUN_STDLIB=(
   pace_curve.py
   preflight_review_lake.py
   quota_cache_fp.py
+  review_sync_failure.py
   quota_claude_windows.py
   quota_codex_windows.py
   quota_reason.py
