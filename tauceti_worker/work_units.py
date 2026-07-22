@@ -341,6 +341,12 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             )
         log(f"  review #{pr}: engine rc={rc}")
         if rc == 0:
+            # The engine posted a verdict this round (scoreboard + threads are on the PR now), so clear
+            # the "errored without posting a verdict" streak up front — BEFORE the publish step, which is
+            # a separate machine-wide concern. Otherwise a pre-post error streak (e.g. errkey=2) could
+            # combine with one later engine error to trip the escalation cap a round after a verdict was
+            # in fact posted, contradicting the "errored Nx without posting a verdict" message.
+            w.counters.write(errkey, 0)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
             # outbox mean the merge gate can't see this round, so don't report the round as a success.
@@ -365,7 +371,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 raise NoProgress(
                     f"review #{pr}: TauCetiData publish failed — machine-wide, not charged to the PR"
                 )
-            w.counters.write(errkey, 0)
             if c.contest:
                 # The engine advanced replies_through in the new scoreboard (the durable per-reply
                 # watermark); rs.bust below re-fetches it, so this contest won't re-fire once the 👀

@@ -91,9 +91,11 @@ CAND = tc.Candidate(726, "deadbeef", "build-green")
 
 try:
     # 1) engine posts, but the TauCetiData publish FAILS -> NoProgress, no per-PR counter bump, warned.
+    #    The engine posted a verdict, so a prior error streak is CLEARED (reset on post, before the
+    #    publish step) rather than bumped — the publish failure is machine-wide, never charged to the PR.
     wu._sync_review_outbox = lambda w, pr: 1  # push failed after retries
     w = FakeWorker()
-    w.counters.write("review-err-726", 2)  # a prior genuine error must be left untouched, not bumped
+    w.counters.write("review-err-726", 2)  # a prior genuine error streak...
     warns.clear()
     raised, msg = False, ""
     try:
@@ -101,11 +103,25 @@ try:
     except tc.NoProgress as e:
         raised, msg = True, str(e)
     check("publish fails -> NoProgress raised", raised, True)
-    check("publish fails -> errkey NOT bumped (stays 2)", w.counters.read("review-err-726"), 2)
+    check("publish fails -> errkey reset on post (not bumped)", w.counters.read("review-err-726"), 0)
     check("publish fails -> warned red once", len(warns), 1)
     check("publish fails -> warning says machine-wide / not charged", "not charged" in warns[0].lower(), True)
     check("publish fails -> NoProgress msg names TauCetiData", "TauCetiData" in msg, True)
     check("publish fails -> ledger NOT busted (round did not fully land)", w.rs.busted, [])
+
+    # 1b) reset-on-post prevents false escalation: a posted verdict (even with a failed publish) clears
+    #     the streak, so a single later engine error cannot combine with pre-post errors to hit the cap.
+    wu._sync_review_outbox = lambda w, pr: 1
+    w = FakeWorker()
+    w.counters.write("review-err-726", 2)
+    try:
+        wu.do_review(w, None, CAND, opts(), bubble=False)  # posts, publish fails -> streak reset to 0
+    except tc.NoProgress:
+        pass
+    wu.run_to_logfile = lambda argv, logf, label: 4  # now the engine genuinely errors (no verdict posted)
+    wu.do_review(w, None, CAND, opts(), bubble=False)
+    check("reset-on-post -> later engine error starts a fresh streak (1, not 3)", w.counters.read("review-err-726"), 1)
+    wu.run_to_logfile = lambda argv, logf, label: 0  # restore for the cases below
 
     # 2) engine posts and the publish SUCCEEDS -> errkey reset to 0, ledger busted, no warning.
     wu._sync_review_outbox = lambda w, pr: 0
