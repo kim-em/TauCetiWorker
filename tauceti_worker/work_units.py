@@ -100,7 +100,7 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     if sv.github_failed:
         raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
 
-    log(f"open PRs: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green")
+    log(f"open PRs: {sv.status_label_line()}")
     for pr, providers in sv.review_inflight:
         log(f"  review #{pr}: a peer reviewer ({providers}) holds this head — skipping (no duplicate spend)")
     for pr, count in sv.review_capped:

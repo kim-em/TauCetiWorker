@@ -25,6 +25,7 @@ from .constants import (
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
     MAX_REVIEW_ERRORS,
     REVIEW_DAILY_CAP,
+    STATUS_LABELS,
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, me
@@ -82,6 +83,7 @@ class PRInfo:
     build_failed: bool
     author_is_bot: bool = False  # a GitHub App / bot author (e.g. the review bot's bump PRs)
     title: str = ""
+    labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -121,6 +123,7 @@ class PRInfo:
             author_is_bot=bool((d.get("author") or {}).get("is_bot")),
             build_success=bool(build_states) and all(s == "SUCCESS" for s in build_states),
             build_failed=any(s in BUILD_FAIL for s in build_states),
+            labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
         )
 
 
@@ -152,6 +155,10 @@ class Survey:
     open_prs: list[PRInfo] = field(default_factory=list)
     n_open_nondraft: int = 0
     n_reviewable: int = 0
+    # Open non-draft PRs bucketed by the STATUS_LABELS pipeline, in that fixed order: (label, total,
+    # mine) where `mine` is the subset authored by the worker's own GitHub identity. Drives the
+    # per-round "open PRs" line; a zero bucket is still listed so the columns line up round to round.
+    status_labels: list[tuple[str, int, int]] = field(default_factory=list)
     rebaseable: WorkKind = field(default_factory=lambda: WorkKind("rebase"))
     reviewable: WorkKind = field(default_factory=lambda: WorkKind("review"))
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
@@ -191,6 +198,15 @@ class Survey:
             "fix-ci": self.red_ci,
             "bump": self.bump,
         }[name]
+
+    def status_label_line(self) -> str:
+        """One-line breakdown of open PRs by status label: 'N label (M mine), N label (M), ...'. Each
+        entry pairs the repo-wide total with the subset the worker itself authored; the first entry
+        spells out 'mine' so the trailing parenthesized numbers read unambiguously."""
+        parts = []
+        for i, (label, total, mine) in enumerate(self.status_labels):
+            parts.append(f"{total} {label} ({mine} mine)" if i == 0 else f"{total} {label} ({mine})")
+        return ", ".join(parts)
 
 
 def _review_rounds_today(store_dir: Path, pr: int) -> int | None:
@@ -297,6 +313,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
                 "statusCheckRollup",
                 "author",
                 "mergeable",
+                "labels",
             ]
         )
     except GitHubError as e:
@@ -319,6 +336,16 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)
     sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
+    # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
+    # repo-wide total with the subset this identity authored, for the per-round "open PRs" line.
+    sv.status_labels = [
+        (
+            label,
+            sum(1 for p in nondraft if label in p.labels),
+            sum(1 for p in nondraft if label in p.labels and p.author == me_login),
+        )
+        for label in STATUS_LABELS
+    ]
 
     # 1) rebase: tended (ours or bot-authored), CONFLICTING, under the per-PR rebase-attempt budget.
     #    Covers a bot bump PR that main moved out from under — no bump-specific conflict resolver

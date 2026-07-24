@@ -60,6 +60,14 @@ BUMP_HEAD_PREFIX = "bump-mathlib/"  # branch prefix the review bot opens its mat
 
 MAX_OPEN_PRS = 8  # backpressure: don't author new roadmap PRs while this many of ours are open
 
+# The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
+# The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
+# (a PR climbs CI -> review -> author fixes -> merge). Fixed set: a new status label won't appear here
+# until it is added, which keeps the line stable and its columns comparable round to round. These are
+# not a partition — a PR carrying none of them lands in no bucket, and the roadmap/* area labels are a
+# separate axis that this line ignores.
+STATUS_LABELS = ("awaiting-CI", "awaiting-review", "review-in-progress", "awaiting-author", "ready-to-merge")
+
 
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting

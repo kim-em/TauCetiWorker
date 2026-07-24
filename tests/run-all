@@ -48,6 +48,7 @@ RUN_STDLIB=(
   safe_exists.py
   scoreboard_trust.py
   spread_candidates.py
+  status_labels.py
 )
 # special-cased python tests (handled explicitly below)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
