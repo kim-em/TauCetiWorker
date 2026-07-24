@@ -59,7 +59,13 @@ def fake_survey(next_stage="review"):
     ]
     sv.n_open_nondraft = 2
     sv.n_reviewable = 2
-    sv.status_labels = [("awaiting-CI", 0, 0), ("awaiting-review", 2, 1), ("review-in-progress", 0, 0), ("awaiting-author", 0, 0), ("ready-to-merge", 0, 0)]
+    sv.status_labels = [
+        ("awaiting-CI", 0, 0),
+        ("awaiting-review", 2, 1),
+        ("review-in-progress", 0, 0),
+        ("awaiting-author", 0, 0),
+        ("ready-to-merge", 0, 0),
+    ]
     sv.reviewable.actionable = [tc.Candidate(101, "x"), tc.Candidate(102, "x")]
     _f = tc.roadmap_only()  # mirror survey()'s sanitization: None → "auto"
     sv.roadmap_only = "auto" if _f is None else (_f or "any")
