@@ -113,7 +113,7 @@ def render_survey(
 
     header = (
         f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   "
-        f"open: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green"
+        f"open: {sv.status_label_line()}"
     )
     if quota_snap is not None:
         header += "\nquota: " + quota_line(quota_snap)
@@ -453,9 +453,7 @@ def _dashboard_app(cfg, loader=None):
                 return
             head = Text()
             head.append(TAUCETI, style="bold")
-            head.append(
-                f"   worker: {sv.worker_id}   open: {sv.n_open_nondraft} non-draft, {sv.n_reviewable} build-green"
-            )
+            head.append(f"   worker: {sv.worker_id}   open: {sv.status_label_line()}")
             if self.quota is not None:
                 head.append("\nquota: ")
                 head.append_text(Text.from_markup(quota_line(self.quota)))
