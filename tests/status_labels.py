@@ -16,22 +16,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tauceti_worker as tc
-from tauceti_worker.survey import Survey
+from tauceti_worker.survey import Survey, bucket_status_labels
 
 ME = "kim-em"
 PEER = "someone-else"
 
 
 def bucket(prinfos, me):
+    # Exercise the SAME function survey() uses, so a regression in the production bucketing fails here.
     nondraft = [p for p in prinfos if not p.is_draft]
-    return [
-        (
-            label,
-            sum(1 for p in nondraft if label in p.labels),
-            sum(1 for p in nondraft if label in p.labels and p.author == me),
-        )
-        for label in tc.STATUS_LABELS
-    ]
+    return bucket_status_labels(nondraft, me)
 
 
 def prinfo(number, author, labels, *, draft=False):
@@ -64,7 +58,7 @@ def main():
         prinfo(5, ME, ["awaiting-author"], draft=True),  # draft: excluded from every bucket
         prinfo(6, ME, ["enhancement"]),  # a non-status label: in no bucket
     ]
-    sl = bucket(prs, ME)
+    sl, unlabeled = bucket(prs, ME)
     counts = {label: (total, mine) for label, total, mine in sl}
 
     # Order and completeness: exactly STATUS_LABELS, in that order.
@@ -77,16 +71,25 @@ def main():
     check(counts["awaiting-review"] == (0, 0), "awaiting-review: zero bucket still present")
     check(counts["review-in-progress"] == (0, 0), "review-in-progress: zero bucket still present")
 
-    # Formatter: 'mine' spelled out first, then bare parens; total precedes each label.
+    # PR #6 (enhancement only) carries no status label; PR #5 is a draft and excluded entirely.
+    check(unlabeled == 1, "unlabeled: 1 (non-status label only; draft excluded)")
+
+    # Formatter: 'mine' spelled out first, then bare parens; total precedes each label; unlabeled tail.
     sv = Survey(worker_id=ME)
-    sv.status_labels = sl
+    sv.status_labels, sv.n_status_unlabeled = sl, unlabeled
     line = sv.status_label_line()
     check(line.startswith("1 awaiting-CI (1 mine), "), f"first entry spells out 'mine': {line!r}")
     check("2 awaiting-author (1), " in line, "later entry pairs (total, mine) without 'mine' word")
     check("0 review-in-progress (0)" in line, "zero bucket rendered in the line")
+    check(line.endswith("1 unlabeled"), "nonzero unlabeled tail is appended")
+
+    # A zero unlabeled count is omitted entirely (no noisy '0 unlabeled').
+    sv0 = Survey(worker_id=ME)
+    sv0.status_labels, sv0.n_status_unlabeled = sl, 0
+    check("unlabeled" not in sv0.status_label_line(), "zero unlabeled is omitted from the line")
 
     # 'mine' is identity-relative: from the peer's view the mine counts flip.
-    sl_peer = bucket(prs, PEER)
+    sl_peer, _ = bucket(prs, PEER)
     peer_counts = {label: (total, mine) for label, total, mine in sl_peer}
     check(peer_counts["awaiting-author"] == (2, 1), "peer view: awaiting-author 2 total, 1 mine (PR #2)")
     check(peer_counts["awaiting-CI"] == (1, 0), "peer view: awaiting-CI 1 total, 0 mine")
