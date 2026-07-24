@@ -46,16 +46,11 @@ except tc.Die:
 TAUCETI = tc.TAUCETI
 
 # jq mirror of PRInfo.from_json's build signal: the commit STATUS (a StatusContext with
-# context=="build", carrying `state`) is authoritative — that is what branch protection and the merge
-# gate read. Fall back to the check-run (name=="build", carrying `conclusion`) ONLY for a same-repo PR
-# (head in the base repo), where that check-run is the real build; a fork/cross-repo PR with no build
-# status trusts neither and waits. Binds $b to the chosen list of state strings; callers append the
-# predicate.
-BUILD_STATES = (
-    '([.statusCheckRollup[]? | select(.context=="build") | .state]) as $st '
-    '| ([.statusCheckRollup[]? | select(.name=="build") | .conclusion]) as $cr '
-    '| (if ($st|length)>0 then $st elif (.headRepositoryOwner.login=="%s") then $cr else [] end) as $b '
-) % tc.TAUCETI_OWNER
+# context=="build", carrying `state`) is the sole authority — that is what branch protection and the
+# merge gate read. A check-run is never consulted (it reflects a JOB's outcome, which can go red on a
+# transient hiccup while the authoritative status is green). Binds $b to the list of build state
+# strings; callers append the predicate.
+BUILD_STATES = '([.statusCheckRollup[]? | select(.context=="build") | .state]) as $b '
 
 
 def jq(data, expr, args=None):

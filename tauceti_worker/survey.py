@@ -91,25 +91,14 @@ class PRInfo:
         head_owner = (d.get("headRepositoryOwner") or {}).get("login", "")
         # The required `build` signal is a commit STATUS (a StatusContext with context=="build",
         # carrying `state`), posted by the trusted sandboxed-build workflow — that is exactly what
-        # branch protection and the merge gate read. The rollup ALSO contains a check-run named
-        # "build" (the pull_request_target job). For a fork PR that check-run is NOT the real build: it
-        # can fail (e.g. at the actions/checkout fork-refusal step, "Refusing to check out fork pull
-        # request code…") or otherwise finish without the trusted sandboxed build ever running. Reading
-        # name=="build" alone saw only that check-run and missed the passing status, so a green,
-        # mergeable fork PR looked red — routed to fix-ci, never reviewed, budget-exhausted, wedged.
-        #
-        # So: the commit status is authoritative whenever present. Fall back to the check-run ONLY for a
-        # SAME-REPO PR (head in the base repo), where the `build` check-run IS the real build. For a
-        # fork/cross-repo PR with no build status yet, trust neither — classify as pending and wait for
-        # the trusted build to post, rather than routing an unbuilt fork PR to fix-ci on check-run noise.
-        status_states = [c.get("state") for c in rollup if c.get("context") == "build"]
-        checkrun_states = [c.get("conclusion") for c in rollup if c.get("name") == "build"]
-        if status_states:
-            build_states = status_states
-        elif head_owner == TAUCETI_OWNER:
-            build_states = checkrun_states
-        else:
-            build_states = []
+        # branch protection and the merge gate read. We read ONLY that status, never a check-run. A
+        # check-run reflects a JOB's outcome, which can go red on a transient INFRA / status-report
+        # hiccup while the authoritative `build` status is green — the false-red that once routed a
+        # green PR to fix-ci and wedged it. (The sandboxed-build job used to be named `build`, so its
+        # check-run collided with this status context; TauCeti#1156 renamed it to `sandboxed-build`, so
+        # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
+        # neither success nor failed — and simply waits for the trusted build to post.
+        build_states = [c.get("state") for c in rollup if c.get("context") == "build"]
         return PRInfo(
             number=d["number"],
             title=d.get("title", ""),
