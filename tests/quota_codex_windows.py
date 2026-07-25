@@ -12,6 +12,7 @@ drift and must never silently unlock spending. And a payload with NO usable wind
 fail-open on a vacuously-true all(...). Dependency-free; no network.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -40,10 +41,11 @@ def win(used, lim, ra):
 WEEK = 604800
 HOUR5 = 5 * 3600
 
-# The new single-window schema: a fresh weekly window, secondary explicitly null. Codex is AVAILABLE, and
-# the one window is labelled by its length ('weekly'), not by its 'primary' slot.
+# The new single-window schema: a barely-started weekly window, secondary explicitly null. Codex is
+# AVAILABLE, and the one window is labelled by its length ('weekly'), not by its 'primary' slot.
+# (`ra` a touch under `lim` = a window that has actually started; see the elapsed-0 case at the end.)
 p = q._codex_from_payload(
-    {"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK), "secondary_window": None}}
+    {"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK - 3600), "secondary_window": None}}
 )
 check("single weekly window ⇒ available", p.available, True)
 check("single weekly window ⇒ gpt-5", p.model, "gpt-5")
@@ -81,7 +83,7 @@ check("present window missing used_percent ⇒ unavailable", p.available, False)
 # 'not-applicable' signal like null ⇒ it must fail-CLOSED (unknown), never be silently dropped.
 for bad in ("corrupt", [], 42):
     p = q._codex_from_payload(
-        {"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK), "secondary_window": bad}}
+        {"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK - 3600), "secondary_window": bad}}
     )
     check(f"malformed secondary {bad!r} ⇒ unknown window", [w.status for w in p.windows], ["under-pace", "unknown"])
     check(f"malformed secondary {bad!r} ⇒ unavailable (fail-closed)", p.available, False)
@@ -95,10 +97,29 @@ check("no windows is a HARD block", soft, False)
 
 # limit_reached still dominates even with a healthy-looking window.
 p = q._codex_from_payload(
-    {"rate_limit": {"limit_reached": True, "primary_window": win(0, WEEK, WEEK), "secondary_window": None}}
+    {"rate_limit": {"limit_reached": True, "primary_window": win(0, WEEK, WEEK - 3600), "secondary_window": None}}
 )
 check("limit_reached ⇒ exhausted", p.windows[0].status, "exhausted")
 check("limit_reached ⇒ unavailable", p.available, False)
+
+# Positive headroom, not "not over budget": a window with ZERO elapsed time has a zero budget under the
+# default identity curve, so 0% used sits exactly ON the line and there is no room for the request we
+# would be starting. It is a SOFT pacing block (real quota, wrong moment), and it clears itself seconds
+# later as the window ages — or immediately under a curve that grants budget up front.
+p = q._codex_from_payload(
+    {"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK), "secondary_window": None}}
+)
+check("elapsed-0 window sits AT budget, not under it", [w.status for w in p.windows], ["at-budget"])
+check("at budget ⇒ not available", p.available, False)
+check("at budget is a SOFT block", tc._unavail_reason(p)[0], True)
+os.environ["TAUCETI_PACE"] = "0:10,100:100"  # 10% allowed immediately ⇒ real headroom at elapsed 0
+p = q._codex_from_payload(
+    {"rate_limit": {"limit_reached": False, "primary_window": win(0, WEEK, WEEK), "secondary_window": None}}
+)
+check(
+    "a curve with budget up front gives that window headroom", (p.windows[0].status, p.available), ("under-pace", True)
+)
+os.environ.pop("TAUCETI_PACE", None)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

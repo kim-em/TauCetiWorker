@@ -41,7 +41,7 @@ from .constants import (
 from .github import GitHub, GitHubError, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import HERE
-from .quota import mirror_creds
+from .quota import Quota, _unavail_reason, mirror_creds
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
@@ -65,6 +65,9 @@ class RoundOpts:
     sandbox_host: bool  # True = run on the host (the default); False = --bubble (use the sandbox)
     dry_run: bool
     source: str | None = None  # local directory or Git URL used read-only by a single-area roadmap PR
+    # Claude was selected while one of its quota windows was reset-but-unopened. The round may spend ONE
+    # small claude request to open it — at its LAUNCH STAGE (dispatch), never before there is work.
+    claude_bootstrap: bool = False
 
     @property
     def agent_name(self) -> str:
@@ -259,6 +262,15 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 f"the worker's PATH and the loop resumes on its own."
             )
             raise NoProgress(f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host")
+    # LAUNCH STAGE for a Claude round selected on an unopened window. Everything the bootstrap decision
+    # requires is true exactly here and not earlier: a concrete work unit is in hand, the survey (and so
+    # the GitHub preflight) succeeded, Claude is the model actually about to run, and the agent binary
+    # exists. A round that surveys and finds nothing never reaches this line, so deciding that there is
+    # nothing to do costs no quota.
+    if opts.claude_bootstrap and opts.work_model == "claude":
+        prov = Quota(w.cfg).authorize_claude_launch()
+        if not prov.available:
+            raise NoProgress(f"claude: {prov.error or _unavail_reason(prov)[1]} — not launching this round")
     fn = {
         "review": do_review,
         "fix": do_fix,

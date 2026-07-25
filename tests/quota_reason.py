@@ -55,6 +55,26 @@ reason_cases = [
         prov(W("session", 55.0, 40.0, "over-pace"), W("weekly", 48.0, 46.0, "over-pace")),
         (True, "session ahead of pace, 45% left; weekly ahead of pace, 52% left"),
     ),
+    # Sitting exactly ON the budget is a soft block of its own: there is quota left and the burn line is
+    # simply not ahead of us yet. Saying "ahead of pace" there would be a lie about which way to wait.
+    (
+        "at budget is soft, and reads as an equality",
+        prov(W("session", 50.0, 50.0, "at-budget"), W("weekly", 20.0, 80.0, "under-pace")),
+        (True, "session at budget, 50% left"),
+    ),
+    (
+        "at budget and over pace are both pacing blocks",
+        prov(W("session", 50.0, 50.0, "at-budget"), W("weekly", 60.0, 40.0, "over-pace")),
+        (True, "session at budget, 50% left; weekly ahead of pace, 40% left"),
+    ),
+    (
+        "a hard window still dominates a pacing one",
+        prov(
+            W("session", 50.0, 50.0, "at-budget"),
+            W("weekly", None, None, "absent", "limit missing from usage response"),
+        ),
+        (False, "weekly limit missing from usage response"),
+    ),
     # The states the redesigned Claude reader distinguishes. Each is a HARD block that says what
     # actually happened — "usage unknown" would send an operator looking for the wrong problem.
     (
