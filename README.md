@@ -215,8 +215,11 @@ the container:
   engine, the roadmap, and the review store are mounted in, and it runs on the
   image's `python3` with no PyPI or cross-repo fetch. The only traffic crossing
   the proxy is the TauCeti clone, the PR API, and the scoreboard post.
-- The shared Mathlib cache is an overlay, so one round can't poison a later build,
-  and the container is ephemeral.
+- Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
+  `lake exe cache get`, fetches TauCeti's own main-built outputs with `lake cache get`,
+  and runs an advisory `lake build` (a red tree still reaches the repair agent). Bubble
+  fetches both caches into a per-round writable view that is discarded when the container
+  is popped, so an untrusted round can neither poison nor be poisoned by a later one.
 
 The sandbox itself lives at [kim-em/bubble](https://github.com/kim-em/bubble).
 The OpenRouter agents (`--agent deepseek|minimax`) run in the bubble too: the

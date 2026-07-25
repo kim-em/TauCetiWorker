@@ -166,6 +166,18 @@ def _shq(s: str) -> str:
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
 
+# TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
+# `lake exe cache get`; this one contains TauCeti's own main-built outputs.
+TAUCETI_CACHE_DOMAIN = "pub-1825e93d97ca45b2a98d9ad45a5972f8.r2.dev"
+TAUCETI_CACHE_CONFIG = f"""cache.defaultService = "tauceti-public"
+
+[[cache.service]]
+name = "tauceti-public"
+kind = "s3"
+artifactEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/artifacts"
+revisionEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/revisions"
+"""
+
 
 def bubble_cmd() -> list[str]:
     """The bubble CLI. Fetched on demand via uvx when not installed, so the operator never has to
@@ -181,15 +193,24 @@ def bubble_cmd() -> list[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def bubble_supports_allow_push() -> bool:
-    """Does the resolved bubble support `--allow-push` (fork-PR write support, kim-em/bubble#320)? The
-    worker hands that flag to bubble for fork authoring/maintenance, so an OLD cached build would error
-    only after the model launches — wasting the round. Probe `bubble open --help` once per process."""
+def _bubble_open_help() -> str:
+    """The resolved Bubble's `open --help`, fetched once for all capability probes."""
     try:
         p = subprocess.run([*bubble_cmd(), "open", "--help"], capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return "--allow-push" in (p.stdout or "") + (p.stderr or "")
+        return ""
+    return (p.stdout or "") + (p.stderr or "")
+
+
+def bubble_supports_allow_push() -> bool:
+    """Does the resolved Bubble support repo-scoped fork pushes?"""
+    return "--allow-push" in _bubble_open_help()
+
+
+def bubble_supports_allow_domain() -> bool:
+    """Does the resolved bubble support the per-bubble `--allow-domain` extension? TauCeti's Lake
+    artifact cache lives on its own public R2 host, outside Bubble's built-in Lean allowlist."""
+    return "--allow-domain" in _bubble_open_help()
 
 
 def _bubble_version() -> str:
@@ -302,15 +323,42 @@ def bubble_home(cfg: Config) -> Path:
 
 
 def ensure_bubble_home(cfg: Config) -> dict:
-    """One-time hardening of the private bubble home (read-only shared Mathlib cache + per-round
-    overlay). Returns the env (with BUBBLE_HOME set) for bubble subprocesses."""
+    """Fail-closed hardening of the private Bubble home.
+
+    Both shared Lean caches must be writable only through a per-round overlay. A persistent writable
+    cache would let one untrusted agent poison artifacts restored by later rounds, so verify the actual
+    config rather than trusting the legacy `.worker-init` sentinel.
+    """
+    import tomllib
+
     home = bubble_home(cfg)
     env = {**os.environ, "BUBBLE_HOME": str(home)}
-    if (home / ".worker-init").exists():
-        return env
     home.mkdir(parents=True, exist_ok=True)
-    subprocess.run([*bubble_cmd(), "security", "set", "shared-cache", "overlay"], env=env, capture_output=True)
-    (home / ".worker-init").touch()
+
+    def overlay_configured() -> bool:
+        try:
+            with open(home / "config.toml", "rb") as f:
+                return tomllib.load(f).get("security", {}).get("shared_cache") == "overlay"
+        except (OSError, tomllib.TOMLDecodeError):
+            return False
+
+    if not overlay_configured():
+        try:
+            p = subprocess.run(
+                [*bubble_cmd(), "security", "set", "shared-cache", "overlay"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Die(f"could not configure Bubble's shared-cache overlay; refusing unsafe cache mounts: {e}") from e
+        if p.returncode != 0 or not overlay_configured():
+            detail = (p.stderr or p.stdout or "Bubble did not persist security.shared-cache=overlay").strip()[-300:]
+            raise Die(
+                "could not configure Bubble's shared-cache overlay; refusing to expose persistent "
+                f"writable Lean caches to the agent. Bubble said: {detail}"
+            )
     return env
 
 
@@ -364,6 +412,31 @@ def agent_inner_cmd(work_model: str) -> str:
     return (
         'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
         "--dangerously-skip-permissions --model opus"
+    )
+
+
+def bubble_work_cmd(inner: str) -> str:
+    """Trusted bootstrap run before the work agent inside Bubble.
+
+    Bubble's noninteractive `--command` mode deliberately does not run a hook-generated build, so do
+    both cache fetches explicitly: Mathlib's `lake exe cache`, then Lake's built-in cache for TauCeti's
+    own outputs. Keep a Lake-cache miss and the preliminary build non-fatal: fix/fix-ci/bump/rebase
+    rounds often start from a red tree, and repairing it is the agent's job. A Mathlib-cache failure is
+    fatal because compiling Mathlib would consume the round. The exports remain in the environment
+    inherited by the agent, so later `lake build`s restore from the same per-round cache too.
+    """
+    return (
+        "set -e; "
+        "export LAKE_CONFIG=/opt/round/lake-cache.toml LAKE_ARTIFACT_CACHE=true "
+        "LAKE_RESTORE_ARTIFACTS=true; "
+        "lake exe cache get || lake exe cache get; "
+        f"if ! lake cache get --service tauceti-public --repo {TAUCETI}; then "
+        "echo 'warning: TauCeti Lake cache miss; building missing outputs' >&2; "
+        "fi; "
+        "if ! timeout 1800 lake build; then "
+        "echo 'warning: pre-agent lake build failed or timed out; the agent starts from a red tree' >&2; "
+        "fi; "
+        f"exec {inner}"
     )
 
 
@@ -427,6 +500,7 @@ def run_in_bubble(
     shutil.rmtree(rounddir, ignore_errors=True)
     rounddir.mkdir(parents=True, exist_ok=True)
     (rounddir / "prompt.txt").write_text(prompt)
+    (rounddir / "lake-cache.toml").write_text(TAUCETI_CACHE_CONFIG)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
@@ -465,7 +539,14 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    command = f"{tcenv} {inner_cmd or agent_inner_cmd(wm)}"
+    command_inner = inner_cmd or agent_inner_cmd(wm)
+    if inner_cmd is None:
+        command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
+    command = f"{tcenv} {command_inner}"
+
+    # Only work-agent rounds compile TauCeti. Review/probe commands remain usable with older Bubble
+    # releases and do not need access to the artifact-cache host.
+    cache_flags = ["--allow-domain", TAUCETI_CACHE_DOMAIN] if inner_cmd is None else []
 
     argv = [
         *bubble_cmd(),
@@ -479,6 +560,7 @@ def run_in_bubble(
         "--github-security",
         "allowlist-write-graphql",
         *push_flags,
+        *cache_flags,
         *mount_flags,
         *agent_cred_flags(cred_model),
         "--command",

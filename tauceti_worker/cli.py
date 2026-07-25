@@ -22,7 +22,13 @@ import subprocess
 import sys
 import time
 
-from .agents import bubble_supports_allow_push, ensure_fork_proxy_current, isolate_home, run_in_bubble
+from .agents import (
+    bubble_supports_allow_domain,
+    bubble_supports_allow_push,
+    ensure_fork_proxy_current,
+    isolate_home,
+    run_in_bubble,
+)
 from .config import (
     Config,
     Die,
@@ -561,6 +567,16 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
         raise Die(
             "preflight: this bubble is too old for fork-PR authoring — it has no `--allow-push` "
             "(needs kim-em/bubble#320). Refresh the cached build, e.g.\n"
+            "    uvx --refresh --from git+https://github.com/kim-em/bubble.git bubble --version\n"
+            "  or update your installed `bubble`, then re-run. (Override the executable with $TAUCETI_BUBBLE.)"
+        )
+    # Work-agent bubble rounds warm both Mathlib's cache and TauCeti's public Lake artifact cache before
+    # launching the model. The latter is hosted on a project-specific R2 domain, so Bubble must support
+    # extending one bubble's network allowlist without broadening its global policy.
+    if uses_fork and not opts.dry_run and not bubble_supports_allow_domain():
+        raise Die(
+            "preflight: this bubble is too old for TauCeti's Lake artifact cache — it has no "
+            "`--allow-domain`. Refresh the cached build, e.g.\n"
             "    uvx --refresh --from git+https://github.com/kim-em/bubble.git bubble --version\n"
             "  or update your installed `bubble`, then re-run. (Override the executable with $TAUCETI_BUBBLE.)"
         )
