@@ -187,6 +187,25 @@ scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
 can't read usage, it treats the provider as unavailable rather than guessing it's
 free.
 
+Claude's two windows are read independently — they reset on separate clocks, so
+neither is inferred from the other — and each window's raw state is kept before
+any pacing is applied. A window with a usage figure and a valid reset clock paces
+normally. A window the response doesn't carry, or carries as garbage (an
+unreadable reset timestamp, a non-numeric usage), is a hard block that says what
+it saw (`weekly limit missing from usage response`, `session reset timestamp
+invalid`) rather than a generic "usage unknown": a quota constraint you can't
+read is not the same as no constraint. The one special case is the gap right
+after a window rolls, when the endpoint reports it with no usage and no reset
+clock. There `tauceti` makes ONE small `claude -p` request to open the new
+window, drops the cached usage and re-reads — the only way out of the deadlock,
+since the worker won't launch Claude on telemetry it can't read and only a Claude
+request opens the window. That is bounded to a single request per reset: if the
+window still isn't reporting afterwards the status reads `session bootstrap
+attempted; awaiting fresh usage` and the worker stays parked. `tauceti status`
+and the dashboard never make that request — they only report the state they find.
+Cached usage is dropped as soon as the wall clock passes any reset inside it, so
+a cached response can never pace a new window against the old one's numbers.
+
 `--pace` (or `TAUCETI_PACE`) reshapes that rule into any piecewise-linear budget
 you like, as `time%:budget%` control points: `--pace 0:10,50:70,90:90` allows up to
 10% used immediately, ramps to 70% by the halfway mark and 90% by 90% of the window,

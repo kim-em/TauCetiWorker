@@ -25,8 +25,8 @@ from .constants import (
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
     MAX_REVIEW_ERRORS,
     REVIEW_DAILY_CAP,
-    TAUCETI,
     STATUS_LABELS,
+    TAUCETI,
     TAUCETI_OWNER,
 )
 from .github import GitHub, GitHubError, can_push, me
@@ -361,7 +361,9 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     # to the base repo: a contributor can't push to those branches, so tending them only wastes a round.
     # Roadmap backpressure still counts only `mine`: it bounds how many PRs WE author, not a bot's.
     tend_bot = _tends_first_party_bot_prs()
-    tended = [p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
+    tended = [
+        p for p in nondraft if p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER)
+    ]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
     sv.n_mine_open = len(mine)

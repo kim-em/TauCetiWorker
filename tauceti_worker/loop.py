@@ -134,7 +134,12 @@ def choose_model(cfg: Config, agent: str, quota_cmd: str | None) -> tuple[str | 
     """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
     command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
     `<quota_cmd> <agent>`; its first stdout token is the model to run (codex/claude/deepseek/minimax)
-    or empty = none available. Otherwise use the self-contained pacer."""
+    or empty = none available. Otherwise use the self-contained pacer.
+
+    This is the LAUNCH path — the caller is about to run work — so it is the one that may spend to
+    break a post-reset deadlock (bootstrap=True: at most one small claude request when a window reports
+    itself reset but uninitialized). Read-only callers (`tauceti status`, the dashboard refresh)
+    construct their own Quota and only report the state they find."""
     if quota_cmd:
         import shlex
 
@@ -142,7 +147,7 @@ def choose_model(cfg: Config, agent: str, quota_cmd: str | None) -> tuple[str | 
         out = (r.stdout or "").split()
         model = out[0] if (r.returncode == 0 and out) else None
         return (model or None), {"quota-cmd": Provider("quota-cmd", bool(model), model)}
-    return Quota(cfg).choose(None if agent == "auto" else agent)
+    return Quota(cfg, bootstrap=True).choose(None if agent == "auto" else agent)
 
 
 def resolve_work_model(cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None) -> str:
