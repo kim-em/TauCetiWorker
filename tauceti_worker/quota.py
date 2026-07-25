@@ -580,14 +580,29 @@ class Quota:
                     "claude token expired; refresh left to the operator" if code == 401 else f"claude usage HTTP {code}"
                 )
                 return Provider("claude", False, None, error=err, retry_after=retry_after)
-            self._store_raw("claude", payload, fp)
+            session, weekly = self._claude_windows(payload)
+            # Cache only a fully-resolved payload — BOTH windows carrying a real reset clock. A window with
+            # no reset clock is a just-reset / transient reading (skipped as absent, or read as fresh
+            # below); pinning it for the hour-long TTL would keep launching opus blind to the usage that
+            # starts accruing the moment we run, straight through the reset. Leaving it uncached costs one
+            # extra fetch next poll, by which point the window has re-opened with real data.
+            if session.resets_at is not None and weekly.resets_at is not None:
+                self._store_raw("claude", payload, fp)
+            return self._provider_from_windows(session, weekly)
         return self._claude_from_payload(payload)
 
     def _claude_win(self, name: str, used: object, resets_raw: object, window_s: float) -> Window:
         """One Claude window from a utilization% + a reset timestamp. The endpoint gives a reset clock,
-        not an elapsed fraction, so elapsed is derived from the fixed window length."""
+        not an elapsed fraction, so elapsed is derived from the fixed window length.
+
+        A window reported with a usage% but NO reset clock is a just-reset window that hasn't started its
+        next cycle yet (Anthropic returns the 5h/weekly window with a null `resets_at` right after it
+        rolls). Read it as fresh — elapsed 0, the smallest pace budget, i.e. the most conservative
+        reading — so a `0%` window bootstraps the next cycle (under pace) while any real usage still paces
+        (over-pace / exhausted). A MISSING usage% still fails closed as 'unknown' in _classify_window; a
+        clockless window with no usage figure at all is handled as 'absent' by _claude_absent."""
         resets = self._parse_iso(resets_raw if isinstance(resets_raw, str) else None)
-        elapsed = None if resets is None else (window_s - (resets - time.time())) / window_s * 100
+        elapsed = 0.0 if resets is None else (window_s - (resets - time.time())) / window_s * 100
         return _classify_window(name, used, elapsed, resets, False)
 
     def _claude_windows_from_flat(self, payload: dict) -> tuple[Window, Window]:
@@ -623,21 +638,41 @@ class Quota:
             self._claude_win("weekly", weekly_l.get("percent"), weekly_l.get("resets_at"), WEEK_WINDOW_S),
         )
 
-    def _claude_from_payload(self, payload: dict) -> Provider:
+    def _claude_windows(self, payload: dict) -> tuple[Window, Window]:
         # The usage schema is moving from flat five_hour/seven_day objects to a structured `limits` array
         # (kind=session | weekly_all | weekly_scoped, each with a `percent` and `resets_at`). Prefer the
         # array when it yields both windows; fall back to the flat keys so a leaner/older response still
         # paces. Only the session and the overall (unscoped) weekly gate the worker's opus; the per-model
         # weekly caps (the old seven_day_sonnet, now null; weekly_scoped in the array) do not.
-        session, weekly = self._claude_windows_from_limits(payload.get("limits")) or self._claude_windows_from_flat(
-            payload
-        )
-        # All-null ⇒ API unreachable / auth broken / schema drift ⇒ unavailable (fail-closed).
-        if session.used is None and weekly.used is None:
+        return self._claude_windows_from_limits(payload.get("limits")) or self._claude_windows_from_flat(payload)
+
+    @staticmethod
+    def _claude_absent(w: Window) -> bool:
+        """A window the endpoint isn't reporting right now: no usage figure AND no reset clock. This is the
+        just-reset / not-yet-started shape (Anthropic briefly returns the 5h or the weekly window with a
+        null usage and null reset the moment it rolls), NOT corrupt telemetry — so it must be SKIPPED, the
+        way codex skips a null `secondary_window`, not read as 'unknown'. Emitting an unknown window here
+        would fail closed and pin opus out until someone manually ran claude to re-open the window: a
+        bootstrap deadlock that would otherwise recur every time a window resets. A present-but-garbage
+        window (a NaN usage, a usage% with no reset clock) is NOT absent — _claude_win reads a clockless
+        *known* usage as a fresh window, and a NaN usage stays 'unknown' (used is not None) and fails
+        closed."""
+        return w.status == "unknown" and w.used is None and w.resets_at is None
+
+    def _provider_from_windows(self, session: Window, weekly: Window) -> Provider:
+        # Gate opus on the windows the endpoint IS reporting, skipping any that are absent (just reset).
+        # Skipping is symmetric — a session reset gates on the weekly, a weekly reset gates on the session —
+        # so no single window's reset can strand the worker. Only a payload with NO readable window at all
+        # (both absent, or genuine schema drift / auth failure) fails closed, matching codex's empty-`wins`
+        # behavior; we keep the explicit "all usage null" so the operator sees why.
+        gating = [w for w in (session, weekly) if not self._claude_absent(w)]
+        if not gating:
             return Provider("claude", False, None, [session, weekly], error="all usage null")
-        avail = session.status == "under-pace" and weekly.status == "under-pace"
-        nxt = self._next_eligible([session, weekly])
-        return Provider("claude", avail, "opus" if avail else None, [session, weekly], None, nxt)
+        avail = all(w.status == "under-pace" for w in gating)
+        return Provider("claude", avail, "opus" if avail else None, gating, None, self._next_eligible(gating))
+
+    def _claude_from_payload(self, payload: dict) -> Provider:
+        return self._provider_from_windows(*self._claude_windows(payload))
 
     @staticmethod
     def _parse_iso(s: str | None) -> float | None:
