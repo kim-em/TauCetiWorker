@@ -15,8 +15,8 @@ sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 
 
-def W(name, used, elapsed, status):
-    return tc.Window(name, used, elapsed, None, status)
+def W(name, used, elapsed, status, detail=None):
+    return tc.Window(name, used, elapsed, None, status, None, detail)
 
 
 def prov(*windows):
@@ -41,19 +41,68 @@ reason_cases = [
         (False, "session exhausted"),
     ),
     (
-        "unknown gating window is a hard block",
+        "unknown gating window is a hard block, named",
         prov(W("session", None, None, "unknown"), W("weekly", 20.0, 80.0, "under-pace")),
-        (False, "usage unknown"),
+        (False, "session usage unknown"),
     ),
     (
         "unknown dominates a co-occurring over-pace window (fail-closed, not soft)",
         prov(W("session", None, None, "unknown"), W("weekly", 60.0, 40.0, "over-pace")),
-        (False, "usage unknown"),
+        (False, "session usage unknown"),
     ),
     (
         "two over-pace windows are both listed",
         prov(W("session", 55.0, 40.0, "over-pace"), W("weekly", 48.0, 46.0, "over-pace")),
         (True, "session ahead of pace, 45% left; weekly ahead of pace, 52% left"),
+    ),
+    # The states the redesigned Claude reader distinguishes. Each is a HARD block that says what
+    # actually happened — "usage unknown" would send an operator looking for the wrong problem.
+    (
+        "a reset window awaiting its first request",
+        prov(
+            W("session", None, None, "idle", "window reset; awaiting initialization"),
+            W("weekly", 20.0, 80.0, "under-pace"),
+        ),
+        (False, "session window reset; awaiting initialization"),
+    ),
+    (
+        "a bootstrap request that has been made but not yet reflected",
+        prov(
+            W("session", None, None, "idle", "bootstrap attempted; awaiting fresh usage"),
+            W("weekly", 20.0, 80.0, "under-pace"),
+        ),
+        (False, "session bootstrap attempted; awaiting fresh usage"),
+    ),
+    (
+        "a bootstrap request that failed",
+        prov(
+            W("session", None, None, "idle", "bootstrap failed: claude exited 1"), W("weekly", 20.0, 80.0, "under-pace")
+        ),
+        (False, "session bootstrap failed: claude exited 1"),
+    ),
+    (
+        "a window missing from the response",
+        prov(
+            W("session", 5.0, 20.0, "under-pace"),
+            W("weekly", None, None, "absent", "limit missing from usage response"),
+        ),
+        (False, "weekly limit missing from usage response"),
+    ),
+    (
+        "an unreadable reset clock",
+        prov(
+            W("session", None, None, "malformed", "reset timestamp invalid (five_hour)"),
+            W("weekly", 20.0, 80.0, "under-pace"),
+        ),
+        (False, "session reset timestamp invalid (five_hour)"),
+    ),
+    (
+        "two hard conditions at once are both reported",
+        prov(
+            W("session", 100.0, 50.0, "exhausted"),
+            W("weekly", None, None, "malformed", "usage figure is not a usable percentage (seven_day)"),
+        ),
+        (False, "session exhausted; weekly usage figure is not a usable percentage (seven_day)"),
     ),
 ]
 
