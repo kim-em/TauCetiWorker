@@ -181,30 +181,49 @@ token expiry it just reports Claude unavailable for the cycle, and your next `cl
 run (interactive, or one `--ignore-quota --agent claude` round) refreshes the
 Keychain so the pacer can read it again. A locked Keychain (headless/SSH) reports
 unavailable with a hint to `security unlock-keychain` first. The rule is
-"keep usage under elapsed time": a provider is available while `used% ≤ elapsed%`
-on both its 5-hour and its weekly window. Auto mode prefers Codex (to spare the
-scarcer Opus), falls back to Opus, and sleeps when neither is under pace. If it
-can't read usage, it treats the provider as unavailable rather than guessing it's
-free.
+"keep usage under elapsed time": a provider is available while `used%` is
+*strictly* under the budget for the elapsed fraction of both its 5-hour and its
+weekly window. Strictly, because the request being decided costs something —
+sitting exactly on the budget (`session at budget (used 50% = 50% budget)`) is a
+pause, not a green light. Auto mode prefers Codex (to spare the scarcer Opus),
+falls back to Opus, and sleeps when neither has headroom. If it can't read usage,
+it treats the provider as unavailable rather than guessing it's free.
 
 Claude's two windows are read independently — they reset on separate clocks, so
 neither is inferred from the other — and each window's raw state is kept before
-any pacing is applied. A window with a usage figure and a valid reset clock paces
-normally. A window the response doesn't carry, or carries as garbage (an
-unreadable reset timestamp, a non-numeric usage), is a hard block that says what
-it saw (`weekly limit missing from usage response`, `session reset timestamp
-invalid`) rather than a generic "usage unknown": a quota constraint you can't
-read is not the same as no constraint. The one special case is the gap right
-after a window rolls, when the endpoint reports it with no usage and no reset
-clock. There `tauceti` makes ONE small `claude -p` request to open the new
-window, drops the cached usage and re-reads — the only way out of the deadlock,
-since the worker won't launch Claude on telemetry it can't read and only a Claude
-request opens the window. That is bounded to a single request per reset: if the
-window still isn't reporting afterwards the status reads `session bootstrap
-attempted; awaiting fresh usage` and the worker stays parked. `tauceti status`
-and the dashboard never make that request — they only report the state they find.
+any pacing is applied. The structured `limits` array is authoritative per window;
+the legacy flat keys are a fallback for a window `limits` doesn't mention, not a
+second opinion that can overrule a broken one. A window the response doesn't
+carry, or carries as garbage (an unreadable or implausible reset timestamp, a
+non-numeric usage), is a hard block that says what it saw (`weekly limit missing
+from usage response`, `session reset timestamp invalid`) rather than a generic
+"usage unknown": a quota constraint you can't read is not the same as no
+constraint.
+
+The one special case is the gap right after a window rolls, when the endpoint
+reports it with no usage and no reset clock. Only a Claude request can open the
+new window, so `tauceti` makes ONE small `claude -p` turn to do it, drops the
+cached usage and re-reads — and the fresh telemetry, not the request, decides
+whether a round runs. That spend is fenced in on every side. It happens at the
+launch stage of a round that has already found work to do, so a poll that finds
+nothing to run costs nothing; reading quota never spends, so `tauceti status`,
+the dashboard, and an auto selection that lands on Codex make no request at all.
+It needs the *other* window to be active with real headroom — a weekly that is at
+budget, over pace, exhausted, missing or unreadable forbids it. It respects your
+pace curve: under a curve whose budget stays at 0 for the first stretch of a
+window (say `--pace 0:0,90:0,100:95`), a fresh window may not be opened at all,
+and the status says so (`pace budget stays 0% through 90% of the window`) rather
+than quietly opening one to manufacture a clock. And it is claimed under a lock
+in a shared ledger beside your credentials *before* the request goes out, so
+every worker on that account — whatever its worker id, checkout or isolated
+`$HOME` — makes at most one request per window period, even if one of them
+crashes mid-flight. If the window still isn't reporting afterwards the status
+reads `session bootstrap attempted; awaiting fresh usage` and the worker stays
+parked.
+
 Cached usage is dropped as soon as the wall clock passes any reset inside it, so
-a cached response can never pace a new window against the old one's numbers.
+a cached response can never pace a new window against the old one's numbers, and
+anything unresolved (idle, missing, malformed) is never cached at all.
 
 `--pace` (or `TAUCETI_PACE`) reshapes that rule into any piecewise-linear budget
 you like, as `time%:budget%` control points: `--pace 0:10,50:70,90:90` allows up to

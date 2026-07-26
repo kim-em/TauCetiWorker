@@ -90,6 +90,32 @@ check("over-pace window records the budget it exceeded", w.status == "over-pace"
 os.environ.pop("TAUCETI_PACE", None)
 
 # Garbage telemetry fails CLOSED (unknown), never fresh/under-pace — even under a permissive curve.
+os.environ.pop("TAUCETI_PACE", None)
+
+# --- positive headroom: under-pace means room for the NEXT request, not merely "not over" -----------
+check("used < budget -> under-pace", status(49, 50, "0:50,100:50") == "under-pace")
+check("used == budget -> at-budget (its own status)", status(50, 50, "0:50,100:50") == "at-budget")
+check("used > budget -> over-pace", status(51, 50, "0:50,100:50") == "over-pace")
+check("equality at zero is not special-cased", status(0, 0, "") == "at-budget")
+check("equality at the tail too", status(90, 90, "0:0,90:90,100:90") == "at-budget")
+check(
+    "at-budget still records the budget it met", tc._classify_window("session", 50, 50, None, False).budget is not None
+)
+
+# --- τ₀: how long a fresh window stays completely unspendable under a curve -------------------------
+# This is what decides whether a just-reset window may be INITIALIZED at all: with τ₀ > 0 the operator's
+# curve says a window this fresh has no budget, and an unopened window has no clock to wait it out on.
+for spec, want in (
+    ("", 0.0),
+    ("0:0,100:100", 0.0),
+    ("0:0,100:95", 0.0),
+    ("0:10,100:100", 0.0),
+    ("0:0,90:0,100:95", 90.0),
+    ("0:0,50:0,100:0", 100.0),
+):
+    got = tc.pace_zero_plateau(tc.parse_pace_curve(spec))
+    check(f"tau0({spec or 'default'}) == {want}", got == want)
+
 os.environ["TAUCETI_PACE"] = "0:100"
 check("NaN elapsed -> unknown", tc._classify_window("session", 50, float("nan"), None, False).status == "unknown")
 check("inf used -> unknown", tc._classify_window("session", float("inf"), 50, None, False).status == "unknown")
