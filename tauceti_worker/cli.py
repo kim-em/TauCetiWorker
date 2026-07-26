@@ -98,7 +98,7 @@ environment (flags win; see README.md for the full list):
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% <= elapsed%); see --pace
   TAUCETI_STREAM=1       same as --stream
-  CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
+  CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
 """
 

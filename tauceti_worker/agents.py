@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import functools
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -462,13 +464,18 @@ def ensure_bubble_home(cfg: Config) -> dict:
     return env
 
 
+def _uses_claude_credentials(work_model: str) -> bool:
+    """Keep Bubble's Claude credential flag and macOS private-seed decision on one predicate."""
+    return work_model != "codex" and work_model not in OPENROUTER_MODELS
+
+
 def agent_cred_flags(work_model: str) -> list[str]:
     """Bubble flags seeding ONLY the work model's credential; all config and other models' creds stay out."""
     if work_model == "codex":
         return ["--codex-credentials", "--no-codex-config", "--no-claude-credentials", "--no-claude-config"]
-    if work_model in OPENROUTER_MODELS:
-        return ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
-    return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+    if _uses_claude_credentials(work_model):
+        return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+    return ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
 
 
 def _codex_model() -> str:
@@ -545,30 +552,52 @@ def _bubble_pop(cfg: Config, env: dict) -> None:
     subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
 
 
-def _ensure_claude_creds_for_bubble(cfg: Config) -> None:
-    """bubble seeds the in-container claude from <CLAUDE_CONFIG_DIR>/.credentials.json (it can't read the
-    macOS Keychain). On Linux that file is the store, so leave it to bubble. On macOS, where Claude Code
-    keeps creds in the Keychain, write the credential INTO the configured dir from the Keychain, every
-    round: the Keychain is authoritative and may hold a token rotated by a host claude since we last
-    wrote, and re-mirroring it keeps both the access AND refresh token current (a stale refresh token in
-    an unexpired-looking mirror would fail mid-round). The read is interactive (unlock if locked). The
-    pacer reads the Keychain directly (keychain-first), so it never refreshes this mirror. If the Keychain
-    can't be read but a credentials file already exists, fall back to it; otherwise Die."""
+def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
+    """Return a private Claude config dir for one macOS Bubble launch, or ``None`` off macOS.
+
+    Bubble seeds the in-container Claude from ``<CLAUDE_CONFIG_DIR>/.credentials.json`` but cannot read
+    the macOS Keychain. The Keychain is authoritative and may hold tokens rotated since the prior round,
+    so read it interactively and write the current blob into a mode-0700 temporary directory owned by the
+    worker. ``run_in_bubble`` exposes that directory only through the Bubble subprocess environment and
+    removes it after the container exits. In particular, never create or overwrite the operator's
+    configured credential file: a persistent Keychain snapshot can later shadow the live Keychain in a
+    host review process. If the Keychain is unavailable, copy an existing configured credential file into
+    the private directory as the same fallback the old in-place handoff provided.
+
+    The caller owns and must remove the returned directory."""
     if sys.platform != "darwin":
-        return  # Linux/Windows: the file is the store; bubble seeds it (or reports none)
-    f = claude_dir(cfg.home) / ".credentials.json"
+        return None  # Linux/Windows: the configured file is the store; Bubble reads it directly
+    cfg.state.mkdir(parents=True, exist_ok=True)
+    # A SIGKILL bypasses both finally and RoundContext's signal/atexit cleanup. Bound the lifetime and
+    # number of those orphaned snapshots by removing them before the next staging attempt.
+    for stale in cfg.state.glob("bubble-claude-seed-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+
+    source = claude_dir(cfg.home) / ".credentials.json"
     blob = _claude_keychain_creds_interactive()
-    if blob and blob.get("claudeAiOauth"):
-        f.parent.mkdir(parents=True, exist_ok=True)
-        _write_json_atomic(f, blob)  # 0600, temp + atomic rename (no partial-read or perms window)
-        return
-    if (_read_json_file(f) or {}).get("claudeAiOauth"):
-        return  # Keychain unreadable but a credentials file exists; let bubble use it
-    raise Die(
-        "no Claude credentials to seed the bubble: none in "
-        f'{f} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
-        "the Keychain and retry, or drop --bubble (the host claude reads the Keychain itself)."
-    )
+    if not (blob or {}).get("claudeAiOauth"):
+        blob = _read_json_file(source)
+        if (blob or {}).get("claudeAiOauth"):
+            expires = blob["claudeAiOauth"].get("expiresAt")
+            expired = (
+                isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires <= time.time() * 1000
+            )
+            suffix = " (access token is already expired)" if expired else ""
+            log(f"claude creds: Keychain unavailable; seeding Bubble from file snapshot {source}{suffix}")
+    if not (blob or {}).get("claudeAiOauth"):
+        raise Die(
+            "no Claude credentials to seed the bubble: none in "
+            f'{source} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
+            "the Keychain and retry, or drop --bubble (the host claude reads the Keychain itself)."
+        )
+
+    seed_dir = Path(tempfile.mkdtemp(prefix="bubble-claude-seed-", dir=cfg.state))
+    try:
+        _write_json_atomic(seed_dir / ".credentials.json", blob)
+    except BaseException:
+        shutil.rmtree(seed_dir, ignore_errors=True)
+        raise
+    return seed_dir
 
 
 def run_in_bubble(
@@ -591,12 +620,11 @@ def run_in_bubble(
     cred_model = cred_model or wm
     # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
     # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
-    # bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317), reading it
-    # from this subprocess's inherited env, so the in-bubble claude and the pacer agree on the account
-    # with no extra plumbing here.
+    # Bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317). On macOS we
+    # replace it in this subprocess env with a private, transient Keychain handoff below; the process-wide
+    # value and any operator-owned credential file remain untouched.
     env = ensure_bubble_home(cfg)
     rounddir = cfg.state / "bubble-round"
-    import shutil
 
     shutil.rmtree(rounddir, ignore_errors=True)
     rounddir.mkdir(parents=True, exist_ok=True)
@@ -681,11 +709,17 @@ def run_in_bubble(
     # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that
     # never call the pacer). No-op when not isolated or on macOS.
     mirror_creds(cfg)
-    # On macOS, Claude Code keeps creds in the Keychain, not a file; make sure the configured
-    # CLAUDE_CONFIG_DIR holds a current credentials file so bubble can seed it (done after the echo path
-    # so a dry-run never prompts the Keychain).
-    if cred_model == "claude":
-        _ensure_claude_creds_for_bubble(cfg)
+    # On macOS, Claude Code keeps creds in the Keychain, not a file. Stage a current snapshot privately
+    # and override only Bubble's subprocess env (done after the echo path so a dry-run never prompts the
+    # Keychain). Register cleanup before launch for signals; the normal finally removes it promptly too.
+    claude_seed: Path | None = None
+    if _uses_claude_credentials(cred_model):
+        claude_seed = _stage_claude_creds_for_bubble(cfg)
+        if claude_seed is not None:
+            env = {**env, "CLAUDE_CONFIG_DIR": str(claude_seed)}
+            # Register the seed first: RoundContext cleans up LIFO, so the pop registered next runs
+            # before the container's credential source disappears.
+            w.rc.add_cleanup(lambda p=claude_seed: shutil.rmtree(p, ignore_errors=True))
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
@@ -693,7 +727,11 @@ def run_in_bubble(
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode
     finally:
-        _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+        try:
+            _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+        finally:
+            if claude_seed is not None:
+                shutil.rmtree(claude_seed, ignore_errors=True)
     return rc
 
 

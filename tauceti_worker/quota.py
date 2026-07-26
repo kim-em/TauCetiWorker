@@ -385,7 +385,7 @@ def mirror_creds(cfg: Config) -> None:
     only READS those and mirrors any changed access token into its isolated home, refresh token stripped
     (including across an operator account switch, whose new token may carry an earlier expiry).
     No-op when not isolated (no seed marker ⇒ the worker reads the live file directly) or on macOS (the
-    Keychain is the store; the keychain-first pacer and _ensure_claude_creds_for_bubble handle it). Safe to
+    Keychain is the store; the keychain-first pacer and _stage_claude_creds_for_bubble handle it). Safe to
     call every pacer cycle and before every bubble launch: in steady state it is two small reads + a string
     compare and no write."""
     if sys.platform == "darwin":

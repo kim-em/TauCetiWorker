@@ -2,10 +2,11 @@
 """macOS Keychain support. The pacer reads Claude Code's OAuth blob from the login Keychain (read-only,
 keychain-first, marked from_keychain so the 401 path never refreshes a token shared with the operator's
 claude). For bubble rounds, where the in-container claude needs a .credentials.json, the credential is
-materialized from the Keychain INTO the configured CLAUDE_CONFIG_DIR when the file is missing/stale."""
+staged from the Keychain in a private, transient CLAUDE_CONFIG_DIR without touching the host file."""
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -108,44 +109,167 @@ try:
     check("interactive read unlocks then reads", tc._claude_keychain_creds_interactive(), FRESH)
     check("interactive read runs unlock-keychain", fr.calls[2], ["security", "unlock-keychain"])
 
-    # 9. Bubble seeding on macOS with no file: materialize the Keychain blob INTO the configured dir, 0600.
+    # 9. Bubble seeding on macOS with no file: stage the Keychain blob privately, 0700 dir + 0600 file.
     seed_home = Path(tempfile.mkdtemp())
-    cfg2 = types.SimpleNamespace(home=seed_home)
+    cfg2 = types.SimpleNamespace(home=seed_home, state=seed_home / "state")
+    orphan = cfg2.state / "bubble-claude-seed-orphan"
+    orphan.mkdir(parents=True)
+    (orphan / ".credentials.json").write_text("old secret")
     tc.subprocess.run = FakeRun([(0, json.dumps(FRESH))])
-    tc._ensure_claude_creds_for_bubble(cfg2)
-    target = seed_home / ".claude" / ".credentials.json"
-    check("materializes the keychain blob into the config dir", json.loads(target.read_text()), FRESH)
-    check("materialized file is 0600", oct(os.stat(target).st_mode & 0o777), "0o600")
+    private = tc._stage_claude_creds_for_bubble(cfg2)
+    target = private / ".credentials.json"
+    check("removes a seed orphaned by a prior SIGKILL", orphan.exists(), False)
+    check("does not create a host credentials file", (seed_home / ".claude" / ".credentials.json").exists(), False)
+    check("does not create the host config directory", (seed_home / ".claude").exists(), False)
+    check("stages the keychain blob in the private dir", json.loads(target.read_text()), FRESH)
+    check("private config dir is 0700", oct(os.stat(private).st_mode & 0o777), "0o700")
+    check("staged file is 0600", oct(os.stat(target).st_mode & 0o777), "0o600")
+    shutil.rmtree(private)
 
-    # 10. macOS always re-mirrors from the authoritative Keychain (a stale refresh token in an unexpired
-    #     file would fail mid-round), so an existing file is overwritten with the current Keychain blob.
-    target.write_text(json.dumps(OAUTH))  # a stale mirror
+    # 10. A pre-existing host file is operator-owned: Keychain wins for the seed, but the file is untouched.
+    host_target = seed_home / ".claude" / ".credentials.json"
+    host_target.parent.mkdir()
+    host_target.write_text(json.dumps(OAUTH))
     tc.subprocess.run = FakeRun([(0, json.dumps(FRESH))])
-    tc._ensure_claude_creds_for_bubble(cfg2)
-    check("existing file is re-mirrored from the keychain", json.loads(target.read_text()), FRESH)
+    private2 = tc._stage_claude_creds_for_bubble(cfg2)
+    check(
+        "private seed prefers the authoritative keychain",
+        json.loads((private2 / ".credentials.json").read_text()),
+        FRESH,
+    )
+    check("existing host file is not overwritten", json.loads(host_target.read_text()), OAUTH)
+    shutil.rmtree(private2)
 
-    # 11. Keychain unreadable (locked/absent) but a credentials file exists → keep it (don't Die).
-    target.write_text(json.dumps(FRESH))
+    # 11. Keychain unreadable but a host file exists: copy it privately without modifying the source.
     tc.subprocess.run = FakeRun([(44, ""), (44, "")])
-    tc._ensure_claude_creds_for_bubble(cfg2)
-    check("keychain unreadable keeps the existing file", json.loads(target.read_text()), FRESH)
+    private3 = tc._stage_claude_creds_for_bubble(cfg2)
+    check(
+        "keychain unreadable copies the existing file", json.loads((private3 / ".credentials.json").read_text()), OAUTH
+    )
+    check("file fallback leaves the host source untouched", json.loads(host_target.read_text()), OAUTH)
+    shutil.rmtree(private3)
 
     # 12. Off darwin: a no-op (the file is the store there) — never reads a Keychain.
     tc.sys.platform = "linux"
     fr = FakeRun([(0, json.dumps(FRESH))])
     tc.subprocess.run = fr
-    tc._ensure_claude_creds_for_bubble(types.SimpleNamespace(home=Path(tempfile.mkdtemp())))
+    staged = tc._stage_claude_creds_for_bubble(
+        types.SimpleNamespace(home=Path(tempfile.mkdtemp()), state=Path(tempfile.mkdtemp()))
+    )
     check("ensure is a no-op off darwin", fr.calls, [])
+    check("off-darwin returns no private seed", staged, None)
     tc.sys.platform = "darwin"
 
     # 13. macOS, no file, and the Keychain has nothing → a clear Die rather than a silent empty seed.
     tc.subprocess.run = FakeRun([(44, ""), (44, "")])
     raised = False
     try:
-        tc._ensure_claude_creds_for_bubble(types.SimpleNamespace(home=Path(tempfile.mkdtemp())))
+        missing_home = Path(tempfile.mkdtemp())
+        tc._stage_claude_creds_for_bubble(types.SimpleNamespace(home=missing_home, state=missing_home / "state"))
     except tc.Die:
         raised = True
     check("ensure raises Die when no creds anywhere", raised, True)
+
+    # 14. The launch path overrides CLAUDE_CONFIG_DIR only in Bubble's env and removes the private seed
+    #     after the subprocess exits. The host env and its credential file stay byte-for-byte unchanged.
+    class Cleanup:
+        def __init__(self):
+            self.steps = []
+
+        def add_cleanup(self, fn):
+            self.steps.append(fn)
+
+    launch_home = Path(tempfile.mkdtemp())
+    launch_cfgdir = launch_home / "operator-claude"
+    launch_cfgdir.mkdir()
+    launch_host_file = launch_cfgdir / ".credentials.json"
+    launch_host_file.write_text(json.dumps(OAUTH))
+    launch_cfg = types.SimpleNamespace(
+        home=launch_home,
+        state=launch_home / "state",
+        wid="seed-test",
+        logdir=launch_home / "logs",
+    )
+    cleanup = Cleanup()
+    w = types.SimpleNamespace(cfg=launch_cfg, rc=cleanup)
+    opts = types.SimpleNamespace(work_model="claude")
+    old_cfgdir = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(launch_cfgdir)
+    old_ensure_home = tc.agents.ensure_bubble_home
+    old_pop = tc.agents._bubble_pop
+    old_keychain = tc.agents._claude_keychain_creds_interactive
+    old_subprocess_run = tc.agents.subprocess.run
+    seen = {}
+
+    def fake_bubble_run(_argv, *, env):
+        private_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        seen["private_dir"] = private_dir
+        seen["blob"] = json.loads((private_dir / ".credentials.json").read_text())
+        return types.SimpleNamespace(returncode=0)
+
+    try:
+        tc.agents.ensure_bubble_home = lambda _cfg: dict(os.environ)
+        tc.agents._bubble_pop = lambda _cfg, _env: None
+        tc.agents._claude_keychain_creds_interactive = lambda: FRESH
+        tc.agents.subprocess.run = fake_bubble_run
+        rc = tc.run_in_bubble(w, "review", "PROMPT", opts, inner_cmd="true", cred_model="claude")
+        check("bubble launch succeeds with a private seed", rc, 0)
+        check("bubble subprocess receives current Keychain creds", seen["blob"], FRESH)
+        check("bubble subprocess does not receive the host config dir", seen["private_dir"] != launch_cfgdir, True)
+        check("private seed is removed after bubble exits", seen["private_dir"].exists(), False)
+        check("process CLAUDE_CONFIG_DIR is unchanged", os.environ["CLAUDE_CONFIG_DIR"], str(launch_cfgdir))
+        check("bubble launch leaves the host file unchanged", json.loads(launch_host_file.read_text()), OAUTH)
+        for cleanup_step in reversed(cleanup.steps):
+            cleanup_step()  # signal/atexit cleanups remain idempotent after prompt normal cleanup
+        check("registered seed cleanup is idempotent", seen["private_dir"].exists(), False)
+
+        # An exception from Bubble must propagate without leaking the private credential directory.
+        failed_cleanup = Cleanup()
+        failed_w = types.SimpleNamespace(cfg=launch_cfg, rc=failed_cleanup)
+        failed_seen = {}
+
+        def failing_bubble_run(_argv, *, env):
+            failed_seen["private_dir"] = Path(env["CLAUDE_CONFIG_DIR"])
+            check(
+                "exception path stages creds before launch",
+                (failed_seen["private_dir"] / ".credentials.json").exists(),
+                True,
+            )
+            raise RuntimeError("bubble launch failed")
+
+        tc.agents.subprocess.run = failing_bubble_run
+        propagated = False
+        try:
+            tc.run_in_bubble(failed_w, "review", "PROMPT", opts, inner_cmd="true", cred_model="claude")
+        except RuntimeError:
+            propagated = True
+        check("bubble exception propagates", propagated, True)
+        check("bubble exception removes the private seed", failed_seen["private_dir"].exists(), False)
+
+        # Off macOS the launch must keep using the configured credential store; no private override.
+        tc.sys.platform = "linux"
+        linux_cleanup = Cleanup()
+        linux_w = types.SimpleNamespace(cfg=launch_cfg, rc=linux_cleanup)
+        linux_seen = {}
+
+        def linux_bubble_run(_argv, *, env):
+            linux_seen["config_dir"] = env["CLAUDE_CONFIG_DIR"]
+            return types.SimpleNamespace(returncode=0)
+
+        tc.agents.subprocess.run = linux_bubble_run
+        linux_rc = tc.run_in_bubble(linux_w, "review", "PROMPT", opts, inner_cmd="true", cred_model="claude")
+        check("Linux bubble launch succeeds", linux_rc, 0)
+        check("Linux bubble env keeps the configured store", linux_seen["config_dir"], str(launch_cfgdir))
+        tc.sys.platform = "darwin"
+    finally:
+        tc.agents.ensure_bubble_home = old_ensure_home
+        tc.agents._bubble_pop = old_pop
+        tc.agents._claude_keychain_creds_interactive = old_keychain
+        tc.agents.subprocess.run = old_subprocess_run
+        if old_cfgdir is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = old_cfgdir
 finally:
     tc.subprocess.run, tc.sys.platform = orig_run, orig_platform
     if orig_user is None:

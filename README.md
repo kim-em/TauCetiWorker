@@ -187,9 +187,10 @@ exits non-zero). Pass `--stream` to watch it live on the terminal instead.
 credential files the official CLIs already maintain (`~/.claude/.credentials.json`,
 `~/.codex/auth.json`) and queries each provider's usage endpoint. It honors
 `$CLAUDE_CONFIG_DIR` for the Claude credentials, so personal/work account switching
-is paced correctly; bubble honors the same var, so it seeds the matching credentials
-into the sandbox too. On macOS, where Claude Code keeps its creds in the login Keychain
-rather than a file, the pacer reads them from the Keychain instead, read-only: it
+is paced correctly. Bubble uses that credential source directly when Claude stores
+credentials in a file; on macOS it receives the Keychain credential through the
+private handoff described below. On macOS, where Claude Code keeps its creds in the
+login Keychain rather than a file, the pacer reads them from the Keychain instead, read-only: it
 never refreshes the Keychain (that would log out your interactive `claude`), so on
 token expiry it just reports Claude unavailable for the cycle, and your next `claude`
 run (interactive, or one `--ignore-quota --agent claude` round) refreshes the
@@ -266,14 +267,25 @@ up.
 
 On macOS, Claude Code keeps its creds in the login Keychain rather than a file.
 Bubble rounds still work: bubble seeds the in-container `claude` from a
-`.credentials.json`, so when one isn't present `tauceti` writes the credential into
-your `$CLAUDE_CONFIG_DIR` (or `~/.claude`) from the Keychain, refreshing it when it's
-missing or expired (read-only on the Keychain, which is never written; the first
-round unlocks it interactively if it's locked). The pacer reads the Keychain
-directly, so it never refreshes that file and never rotates the shared login token.
+`.credentials.json`, so `tauceti` copies the current credential from the Keychain
+into a private, transient config directory used only by the Bubble subprocess
+(read-only on the Keychain, which is never written; the first round unlocks it
+interactively if it's locked). The directory is removed after the bubble exits, or
+before the next round if the worker was hard-killed; your `$CLAUDE_CONFIG_DIR` (or
+`~/.claude`) is never created or overwritten. The pacer
+reads the Keychain directly and never rotates the shared login token.
 Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
 can't give a host worker its own Claude account there; host-mode multi-worker
 isolation on macOS applies to Codex only.
+
+Worker versions before this private handoff may already have left a Keychain
+snapshot at `.claude/.credentials.json` under your configured Claude directory.
+This version does not delete an existing file because it may be operator-owned. If
+host subscription reviews fail with a 401 while an interactive `claude` still works,
+move that old file aside once so the review can fall back to the live Keychain. A
+headless worker whose Keychain cannot be unlocked still needs a file fallback; point
+`CLAUDE_CONFIG_DIR` at a dedicated directory containing a current
+`.credentials.json` instead of moving away its only credential source.
 
 ## `tauceti work` reference
 
@@ -315,7 +327,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
 | `TAUCETI_CODEX_MODEL` | host's configured model (authoring); engine default `gpt-5.6-sol` (review) | The Codex model for authoring rounds; when set it also pins the Codex **review** model (`TAUCETI_CODEX_MODEL=gpt-5.6-terra tauceti work --only review`), like `DEEPSEEK_MODEL`/`MINIMAX_MODEL`. Left unset, reviews use the engine's default with its automatic `gpt-5.6-terra` fallback for accounts that can't run Sol. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
