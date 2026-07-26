@@ -27,8 +27,8 @@ from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
     bubble_cmd_is_disposable,
-    bubble_supports_allow_domain,
     bubble_supports_allow_push,
+    bubble_supports_lake_cache_service,
     bubble_version_meets_minimum,
     ensure_fork_proxy_current,
     installed_bubble_version,
@@ -622,7 +622,8 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             found = bubble_version or "unreadable"
             raise Die(
                 f"preflight: --bubble needs Bubble {BUBBLE_MIN_VERSION} or newer; found {found}. "
-                "Older versions generate a broken Incus SSH target on macOS. Update the stable install with\n"
+                "Older versions do not fail closed when a requested Lake cache service cannot be "
+                "configured. Update the stable install with\n"
                 f"    uv tool install --force {BUBBLE_REPO}\n"
                 "  or point $TAUCETI_BUBBLE at an updated stable executable, then re-run."
             )
@@ -636,12 +637,12 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "(override the executable with $TAUCETI_BUBBLE)."
         )
     # Work-agent bubble rounds warm both Mathlib's cache and TauCeti's public Lake artifact cache before
-    # launching the model. The latter is hosted on a project-specific R2 domain, so Bubble must support
-    # extending one bubble's network allowlist without broadening its global policy.
-    if uses_fork and not opts.dry_run and not bubble_supports_allow_domain():
+    # launching the model. Require Bubble's host-global download proxy rather than exposing the cache's
+    # public R2 domain directly to the container.
+    if uses_fork and not opts.dry_run and not bubble_supports_lake_cache_service():
         raise Die(
             "preflight: this bubble is too old for TauCeti's Lake artifact cache — it has no "
-            "`--allow-domain`. Install or update Bubble from kim-em/bubble, then re-run "
+            "`--lake-cache-service`. Install or update Bubble from kim-em/bubble, then re-run "
             "(override the executable with $TAUCETI_BUBBLE)."
         )
     # The CLI may advertise --allow-push while an older live daemon keeps rejecting fork pushes (403).

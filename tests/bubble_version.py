@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bubble rounds must use the stable 0.7.28+ SSH-target fix instead of starting a doomed round."""
+"""Bubble rounds must use the stable release containing SSH and artifact-cache fixes."""
 
 import sys
 from pathlib import Path
@@ -20,8 +20,9 @@ def check(name, ok):
 
 for version, accepted in (
     ("0.7.27", False),
-    ("0.7.28", True),
-    ("0.7.28+local", True),
+    ("0.7.28", False),
+    ("0.7.29", True),
+    ("0.7.29+local", True),
     ("0.8.0", True),
     ("", False),
     ("not-a-version", False),
@@ -49,21 +50,21 @@ try:
     tc.cli._have = lambda _tool: True
     tc.cli.bubble_cmd_is_disposable = lambda: False
 
-    tc.cli.installed_bubble_version = lambda: "0.7.27"
+    tc.cli.installed_bubble_version = lambda: "0.7.28"
     try:
         tc.cli.preflight(SimpleNamespace(), opts())
         blocked = False
     except tc.Die as exc:
-        blocked = "0.7.28" in str(exc) and "--force" in str(exc)
-    check("real bubble round rejects 0.7.27 with update guidance", blocked)
+        blocked = "0.7.29" in str(exc) and "--force" in str(exc)
+    check("real bubble round rejects 0.7.28 with update guidance", blocked)
 
-    tc.cli.installed_bubble_version = lambda: "0.7.28"
+    tc.cli.installed_bubble_version = lambda: "0.7.29"
     try:
         tc.cli.preflight(SimpleNamespace(), opts())
         accepted = True
     except tc.Die:
         accepted = False
-    check("real bubble review accepts 0.7.28", accepted)
+    check("real bubble review accepts 0.7.29", accepted)
 
     tc.cli.installed_bubble_version = lambda: "0.7.27"
     try:

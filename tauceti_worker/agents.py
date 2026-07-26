@@ -184,19 +184,14 @@ def _shq(s: str) -> str:
 # crosses the boundary. The in-container agent invocation is a frozen contract (see agent_inner_cmd).
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
-BUBBLE_MIN_VERSION = "0.7.28"
+BUBBLE_MIN_VERSION = "0.7.29"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
 TAUCETI_CACHE_DOMAIN = "pub-1825e93d97ca45b2a98d9ad45a5972f8.r2.dev"
-TAUCETI_CACHE_CONFIG = f"""cache.defaultService = "tauceti-public"
-
-[[cache.service]]
-name = "tauceti-public"
-kind = "s3"
-artifactEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/artifacts"
-revisionEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/revisions"
-"""
+TAUCETI_CACHE_SERVICE = "tauceti-public"
+TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
+TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
 
 
 def bubble_cmd() -> list[str]:
@@ -227,10 +222,11 @@ def bubble_supports_allow_push() -> bool:
     return "--allow-push" in _bubble_open_help()
 
 
-def bubble_supports_allow_domain() -> bool:
-    """Does the resolved bubble support the per-bubble `--allow-domain` extension? TauCeti's Lake
-    artifact cache lives on its own public R2 host, outside Bubble's built-in Lean allowlist."""
-    return "--allow-domain" in _bubble_open_help()
+def bubble_supports_lake_cache_service() -> bool:
+    """Does the resolved Bubble support its host-global, download-only Lake cache proxy?"""
+    import re
+
+    return re.search(r"(?<![\w-])--lake-cache-service(?=[\s=,]|$)", _bubble_open_help()) is not None
 
 
 def _host_home() -> Path:
@@ -528,17 +524,15 @@ def bubble_work_cmd(inner: str) -> str:
 
     Bubble's noninteractive `--command` mode deliberately does not run a hook-generated build, so do
     both cache fetches explicitly: Mathlib's `lake exe cache`, then Lake's built-in cache for TauCeti's
-    own outputs. Keep a Lake-cache miss and the preliminary build non-fatal: fix/fix-ci/bump/rebase
-    rounds often start from a red tree, and repairing it is the agent's job. A Mathlib-cache failure is
-    fatal because compiling Mathlib would consume the round. The exports remain in the environment
-    inherited by the agent, so later `lake build`s restore from the same per-round cache too.
+    own outputs. Bubble's login shell supplies `MATHLIB_CACHE_GET_URL` and the generated user-level Lake
+    cache config for the host-global proxy. Keep a Lake-cache miss and the preliminary build non-fatal:
+    fix/fix-ci/bump/rebase rounds often start from a red tree, and repairing it is the agent's job. A
+    Mathlib-cache failure is fatal because compiling Mathlib would consume the round.
     """
     return (
         "set -e; "
-        "export LAKE_CONFIG=/opt/round/lake-cache.toml LAKE_ARTIFACT_CACHE=true "
-        "LAKE_RESTORE_ARTIFACTS=true; "
         "lake exe cache get || lake exe cache get; "
-        f"if ! lake cache get --service tauceti-public --repo {TAUCETI}; then "
+        f"if ! lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}; then "
         "echo 'warning: TauCeti Lake cache miss; building missing outputs' >&2; "
         "fi; "
         "if ! timeout 1800 lake build; then "
@@ -629,7 +623,6 @@ def run_in_bubble(
     shutil.rmtree(rounddir, ignore_errors=True)
     rounddir.mkdir(parents=True, exist_ok=True)
     (rounddir / "prompt.txt").write_text(prompt)
-    (rounddir / "lake-cache.toml").write_text(TAUCETI_CACHE_CONFIG)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
@@ -673,9 +666,19 @@ def run_in_bubble(
         command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
     command = f"{tcenv} {command_inner}"
 
-    # Only work-agent rounds compile TauCeti. Review/probe commands remain usable with older Bubble
-    # releases and do not need access to the artifact-cache host.
-    cache_flags = ["--allow-domain", TAUCETI_CACHE_DOMAIN] if inner_cmd is None else []
+    # Only work-agent rounds compile TauCeti. Bubble turns the two immutable public endpoints into
+    # capability-scoped routes through its host-global download cache; the upstream host is not exposed
+    # to the container. Review/probe commands neither compile nor need an artifact-cache capability.
+    cache_flags = (
+        [
+            "--lake-cache-service",
+            TAUCETI_CACHE_SERVICE,
+            TAUCETI_CACHE_ARTIFACT_URL,
+            TAUCETI_CACHE_REVISION_URL,
+        ]
+        if inner_cmd is None
+        else []
+    )
 
     argv = [
         *bubble_cmd(),

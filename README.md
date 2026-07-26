@@ -233,9 +233,10 @@ the container:
 - Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
   `lake exe cache get`, fetches TauCeti's own main-built outputs with `lake cache get`,
   and runs an advisory `lake build` (a red tree still reaches the repair agent). Bubble
-  allows TauCeti's public R2 cache host as the work round's only extra egress domain and
-  fetches both caches into a per-round writable view that is discarded when the container
-  is popped, so an untrusted round can neither poison nor be poisoned by a later one.
+  routes both download-only caches through its host-global proxy, so TauCeti's public R2
+  host is never reachable from inside the container. Its exact revision/content-addressed
+  GET routes are shared across rounds; containers cannot select another origin or upload,
+  while their writable Lake views are still discarded when the container is popped.
 
 The sandbox itself lives at [kim-em/bubble](https://github.com/kim-em/bubble).
 The OpenRouter agents (`--agent deepseek|minimax`) run in the bubble too: the
@@ -353,8 +354,11 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 - The `--bubble` sandbox: a working Incus runtime and a stable Bubble install
   for the host-global auth daemon (for example,
   `uv tool install git+https://github.com/kim-em/bubble.git`). TauCetiWorker
-  requires Bubble 0.7.28 or newer so macOS SSH commands target Bubble's named
-  Colima Incus remote correctly.
+  requires Bubble 0.7.29 or newer. Bubble 0.7.28 introduced the named Colima
+  Incus SSH target fix and `--lake-cache-service`; 0.7.29 makes an unavailable
+  requested Lake service fail closed. Together with Bubble's automatic Mathlib
+  proxy, this keeps both download streams in the host-global cache without
+  exposing the TauCeti cache host inside the sandbox.
 - The agents you want: `codex` and/or `claude` logged in, and for
   `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
   bubble image; you only need it on the host for host-mode rounds).
