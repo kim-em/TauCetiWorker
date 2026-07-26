@@ -112,13 +112,18 @@ def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd:
     output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
     On a non-zero exit we always tail the log so failures aren't silent."""
     cwds = str(cwd) if cwd is not None else None
+    # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
+    # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
+    # Codex then treats it as additional prompt input and waits forever for EOF.
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv, cwd=cwds, env=env).returncode
+        return subprocess.run(argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL).returncode
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     log(f"{label}: output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = subprocess.run(argv, cwd=cwds, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
+        rc = subprocess.run(
+            argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT
+        ).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         try:
@@ -180,8 +185,8 @@ revisionEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/revisions"
 
 
 def bubble_cmd() -> list[str]:
-    """The bubble CLI. Fetched on demand via uvx when not installed, so the operator never has to
-    preinstall it (uvx caches the build after first use). $TAUCETI_BUBBLE overrides the executable."""
+    """Resolve the Bubble CLI. The uvx fallback is suitable for dry-run capability probes only;
+    real sandbox rounds require an installed executable because Bubble owns host-global services."""
     import shutil
 
     override = os.environ.get("TAUCETI_BUBBLE")
@@ -213,29 +218,93 @@ def bubble_supports_allow_domain() -> bool:
     return "--allow-domain" in _bubble_open_help()
 
 
-def _bubble_version() -> str:
-    """`bubble --version` of the resolved CLI, or '' if it can't be read. NOT cached: a long-lived
-    `--loop` must notice a bubble upgrade applied mid-run so the next round refreshes the daemon."""
-    try:
-        p = subprocess.run([*bubble_cmd(), "--version"], capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return (p.stdout or p.stderr or "").strip()
-
-
-def _auth_proxy_stamp() -> Path:
-    """Where we record the bubble version the auth-proxy daemon was last (re)started for. The daemon is
-    host-global (one launchd/systemd service per OS user), so the stamp is too — keyed off the real login
-    user's home via `pwd`, NOT $HOME, which isolate_home() repoints per worker. A host-global stamp means
-    concurrent workers share one refresh instead of each restarting the daemon on a version bump."""
-    home = None
+def _host_home() -> Path:
+    """The login user's real home, unaffected by per-worker ``$HOME`` isolation."""
     try:
         import pwd
 
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (ImportError, KeyError, OSError):
-        home = Path(os.path.expanduser("~"))
-    return home / ".cache" / "tauceti-worker" / ".auth-proxy-bubble-version"
+        return Path(os.path.expanduser("~"))
+
+
+def bubble_cmd_is_disposable(cmd: list[str] | None = None) -> bool:
+    """Whether Bubble would run from uv's disposable one-shot tool cache."""
+    cmd = cmd or bubble_cmd()
+    names = [Path(arg).name for arg in cmd]
+    return bool(names) and (names[0] == "uvx" or names[:3] == ["uv", "tool", "run"])
+
+
+def _bubble_version(cmd: list[str]) -> str:
+    """Return the installed Bubble package version, or ``""`` when it cannot be read."""
+    import re
+
+    try:
+        result = subprocess.run([*cmd, "--version"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    match = re.search(r"\bversion\s+([^\s,]+)", (result.stdout or result.stderr or ""))
+    return match.group(1) if result.returncode == 0 and match else ""
+
+
+def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_version: str | None = None) -> bool:
+    """Whether Bubble's host-global endpoint describes a live compatible daemon.
+
+    Validate pid liveness, the fork-push capability, and (when known) the installed
+    Bubble version. The version check restarts the daemon once after upgrades so
+    fixes inside the proxy process take effect even when its protocol is unchanged.
+    """
+    import json
+
+    endpoint_file = _host_home() / ".bubble" / "auth-proxy.endpoint"
+    try:
+        if newer_than is not None and endpoint_file.stat().st_mtime_ns <= newer_than:
+            return False
+        endpoint = json.loads(endpoint_file.read_text())
+        tcp = endpoint["tcp"]
+        host, port = tcp["host"], tcp["port"]
+        capabilities = endpoint.get("capabilities")
+        if not isinstance(capabilities, list) or "allow-push" not in capabilities:
+            return False
+        if expected_version is not None and endpoint.get("bubble_version") != expected_version:
+            return False
+        pid = endpoint.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+        if not isinstance(host, str) or not host or not isinstance(port, int) or isinstance(port, bool):
+            return False
+        os.kill(pid, 0)
+        return True
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return False
+
+
+def _wait_bubble_proxy_endpoint_healthy(
+    *, newer_than: int | None = None, expected_version: str | None = None, timeout: float = 30
+) -> bool:
+    """Wait for a freshly started daemon to publish and bind its endpoint."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if _bubble_proxy_endpoint_healthy(newer_than=newer_than, expected_version=expected_version):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _bubble_proxy_endpoint_mtime() -> int | None:
+    try:
+        return (_host_home() / ".bubble" / "auth-proxy.endpoint").stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _auth_proxy_lock_path() -> Path:
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / f"tauceti-worker-auth-proxy-{os.getuid()}.lock"
 
 
 def ensure_fork_proxy_current() -> None:
@@ -248,28 +317,16 @@ def ensure_fork_proxy_current() -> None:
     account with canonical write) or fails outright (a read-only contributor). The CLI capability probe
     can't catch this: it inspects the binary, not the running daemon.
 
-    There is no daemon version/status query, so we stamp the `bubble` version each time we (re)start the
-    daemon (via bubble's own `gh proxy start` — TauCeti stays out of the launchd/systemd details) and
-    restart it whenever that version changes. Version-gated so steady-state rounds never churn a host-shared
-    daemon (a restart is ~instant and tokens persist on disk, but it briefly blips any concurrent bubble),
-    and serialized under a host-global file lock so concurrent workers refresh once, not N racing restarts
-    (interleaved launchd/systemd reloads could otherwise leave the daemon down). Fail-CLOSED throughout: a
-    stale-or-unverifiable daemon is refreshed, and if the refresh can't be confirmed we Die rather than burn
-    a ~30-minute round on a push the proxy will 403. Call this ONLY for rounds that push to a fork — a
-    review-only worker never does, and must not be blocked by it."""
+    A healthy endpoint explicitly advertises fork-push support, so unrelated Bubble upgrades do not churn
+    the shared daemon. Missing, dead, or pre-capability endpoints are refreshed through Bubble's own
+    `gh proxy start`. The refresh is serialized under a host-global file lock so concurrent TauCeti workers
+    do not race; Bubble separately serializes all service installers. Fail-CLOSED throughout: if the refresh
+    cannot publish a fresh endpoint we Die rather than burn a long round that cannot authenticate. Call this
+    ONLY for rounds that push to a fork — a review-only worker must not be blocked by it."""
     import fcntl
-    import tempfile
 
-    ver = _bubble_version()  # '' if unreadable — treated as "currency unverifiable", so refresh anyway
-    stamp = _auth_proxy_stamp()
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails
-    # (Codex's fallback for "lock can't be acquired"). The stamp stays in the user's home so it survives a
-    # reboot that would clear /tmp (a cleared stamp only costs one extra restart).
-    lockpath = Path(tempfile.gettempdir()) / f"tauceti-worker-auth-proxy-{os.getuid()}.lock"
+    # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails.
+    lockpath = _auth_proxy_lock_path()
     lockf = None
     try:
         try:
@@ -277,28 +334,41 @@ def ensure_fork_proxy_current() -> None:
             fcntl.flock(lockf, fcntl.LOCK_EX)
         except OSError:
             lockf = None  # extraordinary (temp dir unwritable) — fall through and refresh anyway
-        try:
-            if ver and stamp.read_text().strip() == ver:
-                return  # another worker (or an earlier round) already refreshed the daemon for this version
-        except OSError:
-            pass  # no stamp yet (first fork round) — refresh
-        # Stale, never-stamped, or a version we couldn't read (can't vouch for currency) → refresh, fail closed.
-        try:
-            subprocess.run(
-                [*bubble_cmd(), "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True
+        cmd = bubble_cmd()
+        if bubble_cmd_is_disposable(cmd):
+            if _bubble_proxy_endpoint_healthy():
+                return
+            raise Die(
+                "preflight: fork authoring needs Bubble installed at a stable path; the uvx fallback "
+                "cannot safely own a host-global launchd/systemd daemon. Install dev-bubble or set "
+                "$TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
             )
+        version = _bubble_version(cmd)
+        if _bubble_proxy_endpoint_healthy(expected_version=version or None):
+            return
+        endpoint_mtime = _bubble_proxy_endpoint_mtime()
+        try:
+            subprocess.run([*cmd, "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True)
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or e.stdout or "").strip()[-500:]
+            suffix = f"\n  Bubble said: {detail}" if detail else ""
+            raise Die(
+                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                f"refreshed: {e}{suffix}"
+            ) from e
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(
-                "preflight: bubble's git auth-proxy daemon is stale for fork-PR authoring (it predates the "
-                f"installed bubble and would 403 fork pushes) and could not be refreshed: {e}\n"
+                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                f"refreshed: {e}\n"
                 "  Restart it yourself with `bubble gh proxy start`, then re-run."
             ) from e
-        if ver:
-            try:
-                stamp.write_text(ver)  # only with a known version; an unreadable read refreshes again next round
-            except OSError:
-                pass
-        log(f"bubble auth-proxy: restarted daemon to match {ver or 'the installed bubble'} (fork --allow-push)")
+        if not _wait_bubble_proxy_endpoint_healthy(newer_than=endpoint_mtime, expected_version=version or None):
+            raise Die(
+                "preflight: `bubble gh proxy start` returned success but did not publish a reachable "
+                "fresh auth-proxy endpoint with fork-push support. Check ~/.bubble/auth-proxy.log and "
+                "/tmp/bubble-auth-proxy.log, then re-run."
+            )
+        log("bubble auth-proxy: restarted daemon with fork --allow-push support")
     finally:
         if lockf is not None:
             try:
@@ -378,13 +448,14 @@ def _codex_model() -> str:
     if m:
         return m
     try:
-        for ln in (Path.home() / ".codex" / "config.toml").read_text().splitlines():
-            s = ln.strip()
-            if s.startswith("model") and "=" in s:
-                return s.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
+        import tomllib
+
+        configured = tomllib.loads((_host_home() / ".codex" / "config.toml").read_text()).get("model")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+    except (OSError, tomllib.TOMLDecodeError):
         pass
-    return "gpt-5"
+    return "gpt-5.6-terra"
 
 
 def agent_inner_cmd(work_model: str) -> str:
@@ -570,6 +641,11 @@ def run_in_bubble(
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
         return 0
+
+    if allow_push and not _wait_bubble_proxy_endpoint_healthy(timeout=5):
+        raise Die(
+            "bubble auth-proxy became unavailable before the fork-writing round started; re-run to refresh it safely"
+        )
 
     # Re-mirror the operator's fresh creds into the isolated home at the last moment before bubble seeds
     # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that

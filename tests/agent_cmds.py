@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """M8: verify the host agent argv is byte-for-byte what round.sh's run_agent builds."""
 
+import os
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -35,6 +38,49 @@ check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"],
 # PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
+
+# Agent prompts are always passed in argv. In Bubble, an inherited terminal crosses SSH as a non-TTY
+# stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.
+saved_run = tc.agents.subprocess.run
+saved_stream = os.environ.get("TAUCETI_STREAM")
+calls = []
+tc.agents.subprocess.run = lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=0)
+try:
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["TAUCETI_STREAM"] = "1"
+        tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test")
+        check("streamed agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
+        os.environ.pop("TAUCETI_STREAM")
+        tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test")
+        check("logged agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
+finally:
+    tc.agents.subprocess.run = saved_run
+    if saved_stream is None:
+        os.environ.pop("TAUCETI_STREAM", None)
+    else:
+        os.environ["TAUCETI_STREAM"] = saved_stream
+
+# Per-worker HOME isolation must not hide the host Codex model: Bubble seeds credentials but deliberately
+# excludes host config, so the worker has to pass the host's configured subscription-compatible model.
+saved_host_home = tc.agents._host_home
+saved_model = os.environ.pop("TAUCETI_CODEX_MODEL", None)
+try:
+    with tempfile.TemporaryDirectory() as td:
+        host_home = Path(td)
+        (host_home / ".codex").mkdir()
+        (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+        tc.agents._host_home = lambda: host_home
+        check("bubble Codex model comes from host home", tc.agents._codex_model(), "gpt-5.6-sol")
+        (host_home / ".codex" / "config.toml").write_text("not valid [")
+        check("bubble Codex model has a supported fallback", tc.agents._codex_model(), "gpt-5.6-terra")
+        os.environ["TAUCETI_CODEX_MODEL"] = "operator-model"
+        check("bubble Codex model operator override", tc.agents._codex_model(), "operator-model")
+finally:
+    tc.agents._host_home = saved_host_home
+    if saved_model is None:
+        os.environ.pop("TAUCETI_CODEX_MODEL", None)
+    else:
+        os.environ["TAUCETI_CODEX_MODEL"] = saved_model
 
 # $TAUCETI_CLAUDE_CMD wraps/replaces the host claude executable; the standard flags are still appended,
 # and an empty / whitespace-only value falls back to bare `claude` rather than a broken argv.

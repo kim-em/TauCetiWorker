@@ -176,9 +176,17 @@ def test_roadmap():
 # ---- 4. ensure_fork_proxy_current: version-gated auth-proxy daemon restart -------------------
 def test_proxy_current():
     tmp = Path(tempfile.mkdtemp(prefix="fork-proxy-"))
-    stamp = tmp / ".auth-proxy-bubble-version"
-    tc.agents._auth_proxy_stamp = lambda: stamp  # host-global stamp (real path uses pwd, not $HOME)
-    tc.agents._bubble_version = lambda: "bubble, version 0.7.25"
+    real_health = tc.agents._bubble_proxy_endpoint_healthy
+    real_wait = tc.agents._wait_bubble_proxy_endpoint_healthy
+    real_mtime = tc.agents._bubble_proxy_endpoint_mtime
+    real_lock = tc.agents._auth_proxy_lock_path
+    real_cmd = tc.agents.bubble_cmd
+    healthy = {"value": True}
+    tc.agents._bubble_proxy_endpoint_healthy = lambda **_kwargs: healthy["value"]
+    tc.agents._wait_bubble_proxy_endpoint_healthy = lambda **_kwargs: healthy["value"]
+    tc.agents._bubble_proxy_endpoint_mtime = lambda: 123
+    tc.agents._auth_proxy_lock_path = lambda: tmp / "auth-proxy.lock"
+    tc.agents.bubble_cmd = lambda: ["/stable/bin/bubble"]
 
     calls = []
 
@@ -192,29 +200,29 @@ def test_proxy_current():
     real_run = tc.agents.subprocess.run
     tc.agents.subprocess.run = fake_run
     try:
-        # no stamp yet -> restart the daemon and record the version
+        # A healthy capable endpoint needs no daemon churn.
         tc.agents.ensure_fork_proxy_current()
-        check("proxy: unstamped -> gh proxy start", started())
-        check("proxy: stamp written with current version", stamp.read_text().strip() == "bubble, version 0.7.25")
+        check("proxy: healthy capable endpoint -> no restart", not started())
 
-        # stamp matches -> no restart
+        # A dead or pre-capability endpoint is refreshed.
         calls.clear()
-        tc.agents.ensure_fork_proxy_current()
-        check("proxy: matching stamp -> no restart", not started())
+        healthy["value"] = False
 
-        # version changed -> restart again and update the stamp
-        calls.clear()
-        tc.agents._bubble_version = lambda: "bubble, version 0.7.26"
-        tc.agents.ensure_fork_proxy_current()
-        check("proxy: version change -> restart", started())
-        check("proxy: stamp updated", stamp.read_text().strip() == "bubble, version 0.7.26")
+        def restart_and_heal(argv, **kw):
+            calls.append(argv)
+            if argv[-3:] == ["gh", "proxy", "start"]:
+                healthy["value"] = True
+            return _cp(0, "bubble, version 0.7.27\n")
 
-        # restart failure is fail-CLOSED: Die, and leave the stamp stale so a later round retries
-        stamp.write_text("bubble, version 0.7.25")  # pretend stale again
-        tc.agents._bubble_version = lambda: "bubble, version 0.7.27"
+        tc.agents.subprocess.run = restart_and_heal
+        tc.agents.ensure_fork_proxy_current()
+        check("proxy: dead endpoint -> gh proxy start", started())
+
+        # Restart failure is fail-CLOSED and includes Bubble's useful diagnostic.
+        healthy["value"] = False
 
         def boom(argv, **kw):
-            raise subprocess.CalledProcessError(1, argv)
+            raise subprocess.CalledProcessError(1, argv, stderr="launchd exploded")
 
         tc.agents.subprocess.run = boom
         try:
@@ -222,18 +230,124 @@ def test_proxy_current():
             check("proxy: restart failure -> Die", False)
         except tc.Die:
             check("proxy: restart failure -> Die", True)
-        check("proxy: failed restart leaves stamp stale", stamp.read_text().strip() == "bubble, version 0.7.25")
+        try:
+            tc.agents.ensure_fork_proxy_current()
+        except tc.Die as exc:
+            check("proxy: restart diagnostic is preserved", "launchd exploded" in str(exc))
+        else:
+            check("proxy: restart diagnostic is preserved", False)
 
-        # unreadable version -> refresh anyway (fail-closed: currency unverifiable), leave the stamp untouched
+        # A zero exit from Bubble must still fail closed if no reachable endpoint appears.
         calls.clear()
         tc.agents.subprocess.run = fake_run
-        stamp.write_text("bubble, version 0.7.99")
-        tc.agents._bubble_version = lambda: ""
-        tc.agents.ensure_fork_proxy_current()
-        check("proxy: unreadable version -> refresh", started())
-        check("proxy: unreadable version -> stamp untouched", stamp.read_text().strip() == "bubble, version 0.7.99")
+        healthy["value"] = False
+        try:
+            tc.agents.ensure_fork_proxy_current()
+            check("proxy: successful command + dead endpoint -> Die", False)
+        except tc.Die:
+            check("proxy: successful command + dead endpoint -> Die", True)
+
+        # Never install a host-global service from uvx's disposable tool cache.
+        calls.clear()
+        tc.agents.bubble_cmd = lambda: ["uvx", "--from", "dev-bubble", "bubble"]
+        try:
+            tc.agents.ensure_fork_proxy_current()
+            check("proxy: uvx daemon path -> Die", False)
+        except tc.Die:
+            check("proxy: uvx daemon path -> Die", True)
+        check("proxy: uvx rejection happens before start", not started())
+        tc.agents.bubble_cmd = lambda: ["/stable/bin/bubble"]
     finally:
         tc.agents.subprocess.run = real_run
+        tc.agents._bubble_proxy_endpoint_healthy = real_health
+        tc.agents._wait_bubble_proxy_endpoint_healthy = real_wait
+        tc.agents._bubble_proxy_endpoint_mtime = real_mtime
+        tc.agents._auth_proxy_lock_path = real_lock
+        tc.agents.bubble_cmd = real_cmd
+
+
+def test_proxy_endpoint_health():
+    import json
+
+    tmp = Path(tempfile.mkdtemp(prefix="fork-proxy-endpoint-"))
+    endpoint_file = tmp / ".bubble" / "auth-proxy.endpoint"
+    endpoint_file.parent.mkdir(parents=True)
+    real_home = tc.agents._host_home
+    tc.agents._host_home = lambda: tmp
+    try:
+        check("proxy endpoint: missing file is unhealthy", not tc.agents._bubble_proxy_endpoint_healthy())
+        endpoint_file.write_text("not json")
+        check("proxy endpoint: malformed JSON is unhealthy", not tc.agents._bubble_proxy_endpoint_healthy())
+        endpoint_file.write_text(
+            json.dumps(
+                {
+                    "tcp": {"host": "127.0.0.1", "port": True},
+                    "version": 3,
+                    "capabilities": ["allow-push"],
+                    "pid": os.getpid(),
+                }
+            )
+        )
+        check("proxy endpoint: bool port is unhealthy", not tc.agents._bubble_proxy_endpoint_healthy())
+
+        host, port = "127.0.0.1", 7654
+        endpoint_file.write_text(json.dumps({"tcp": {"host": host, "port": port}, "version": 3, "pid": os.getpid()}))
+        check(
+            "proxy endpoint: missing fork capability is unhealthy",
+            not tc.agents._bubble_proxy_endpoint_healthy(),
+        )
+        endpoint_file.write_text(
+            json.dumps(
+                {
+                    "tcp": {"host": host, "port": port},
+                    "version": 3,
+                    "bubble_version": "0.7.27",
+                    "capabilities": ["allow-push"],
+                    "pid": os.getpid(),
+                }
+            )
+        )
+        mtime = endpoint_file.stat().st_mtime_ns
+        check("proxy endpoint: live capable listener is healthy", tc.agents._bubble_proxy_endpoint_healthy())
+        check(
+            "proxy endpoint: matching Bubble version is healthy",
+            tc.agents._bubble_proxy_endpoint_healthy(expected_version="0.7.27"),
+        )
+        check(
+            "proxy endpoint: Bubble upgrade requires refresh",
+            not tc.agents._bubble_proxy_endpoint_healthy(expected_version="0.7.28"),
+        )
+        check(
+            "proxy endpoint: restart requires a freshly written endpoint",
+            not tc.agents._bubble_proxy_endpoint_healthy(newer_than=mtime),
+        )
+    finally:
+        tc.agents._host_home = real_home
+
+
+def test_proxy_endpoint_waits_for_startup():
+    real_health = tc.agents._bubble_proxy_endpoint_healthy
+    probes = iter([False, False, True])
+    tc.agents._bubble_proxy_endpoint_healthy = lambda **_kwargs: next(probes)
+    try:
+        check(
+            "proxy endpoint: startup settle window retries",
+            tc.agents._wait_bubble_proxy_endpoint_healthy(timeout=2),
+        )
+    finally:
+        tc.agents._bubble_proxy_endpoint_healthy = real_health
+
+
+def test_disposable_bubble_commands():
+    check("bubble command: uvx is disposable", tc.agents.bubble_cmd_is_disposable(["uvx", "bubble"]))
+    check(
+        "bubble command: uv tool run is disposable",
+        tc.agents.bubble_cmd_is_disposable(["uv", "tool", "run", "bubble"]),
+    )
+    check(
+        "bubble command: installed executable is stable",
+        not tc.agents.bubble_cmd_is_disposable(["/opt/tools/bin/bubble"]),
+    )
 
 
 def main():
@@ -241,6 +355,9 @@ def main():
     test_fixlike()
     test_roadmap()
     test_proxy_current()
+    test_proxy_endpoint_health()
+    test_proxy_endpoint_waits_for_startup()
+    test_disposable_bubble_commands()
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
     return 1 if fails else 0
 
