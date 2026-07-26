@@ -247,9 +247,7 @@ def _bubble_version(cmd: list[str]) -> str:
     return match.group(1) if result.returncode == 0 and match else ""
 
 
-def _bubble_proxy_endpoint_healthy(
-    *, newer_than: int | None = None, expected_version: str | None = None
-) -> bool:
+def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_version: str | None = None) -> bool:
     """Whether Bubble's host-global endpoint describes a live compatible daemon.
 
     Validate pid liveness, the fork-push capability, and (when known) the installed
@@ -326,6 +324,7 @@ def ensure_fork_proxy_current() -> None:
     cannot publish a fresh endpoint we Die rather than burn a long round that cannot authenticate. Call this
     ONLY for rounds that push to a fork — a review-only worker must not be blocked by it."""
     import fcntl
+
     # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails.
     lockpath = _auth_proxy_lock_path()
     lockf = None
@@ -349,9 +348,7 @@ def ensure_fork_proxy_current() -> None:
             return
         endpoint_mtime = _bubble_proxy_endpoint_mtime()
         try:
-            subprocess.run(
-                [*cmd, "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True
-            )
+            subprocess.run([*cmd, "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True)
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or e.stdout or "").strip()[-500:]
             suffix = f"\n  Bubble said: {detail}" if detail else ""
@@ -365,9 +362,7 @@ def ensure_fork_proxy_current() -> None:
                 f"refreshed: {e}\n"
                 "  Restart it yourself with `bubble gh proxy start`, then re-run."
             ) from e
-        if not _wait_bubble_proxy_endpoint_healthy(
-            newer_than=endpoint_mtime, expected_version=version or None
-        ):
+        if not _wait_bubble_proxy_endpoint_healthy(newer_than=endpoint_mtime, expected_version=version or None):
             raise Die(
                 "preflight: `bubble gh proxy start` returned success but did not publish a reachable "
                 "fresh auth-proxy endpoint with fork-push support. Check ~/.bubble/auth-proxy.log and "
@@ -649,8 +644,7 @@ def run_in_bubble(
 
     if allow_push and not _wait_bubble_proxy_endpoint_healthy(timeout=5):
         raise Die(
-            "bubble auth-proxy became unavailable before the fork-writing round started; "
-            "re-run to refresh it safely"
+            "bubble auth-proxy became unavailable before the fork-writing round started; re-run to refresh it safely"
         )
 
     # Re-mirror the operator's fresh creds into the isolated home at the last moment before bubble seeds

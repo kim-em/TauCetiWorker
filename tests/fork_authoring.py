@@ -291,9 +291,7 @@ def test_proxy_endpoint_health():
         check("proxy endpoint: bool port is unhealthy", not tc.agents._bubble_proxy_endpoint_healthy())
 
         host, port = "127.0.0.1", 7654
-        endpoint_file.write_text(
-            json.dumps({"tcp": {"host": host, "port": port}, "version": 3, "pid": os.getpid()})
-        )
+        endpoint_file.write_text(json.dumps({"tcp": {"host": host, "port": port}, "version": 3, "pid": os.getpid()}))
         check(
             "proxy endpoint: missing fork capability is unhealthy",
             not tc.agents._bubble_proxy_endpoint_healthy(),
