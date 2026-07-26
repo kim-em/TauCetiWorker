@@ -16,7 +16,7 @@ REVIEW = "TauCetiProject/TauCetiReview"
 
 
 # Per-PR budgets (a PR can never churn forever).
-MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't change (a stuck
+MAX_FIX_ATTEMPTS = 6  # per-head: stop re-running the fixer on a commit it can't change (a stuck
 
 # head never advances a review round, so CI's round cap can't catch it).
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
@@ -72,7 +72,7 @@ STATUS_LABELS = ("awaiting-CI", "awaiting-review", "review-in-progress", "awaiti
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
-ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "10800"))  # 90 min hard cap per round
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
