@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from .agents import (
     bubble_cmd_is_disposable,
@@ -36,7 +37,9 @@ from .config import (
     NoProgress,
     acquire_slot,
     auto_assign_wid,
+    is_git_url,
     log,
+    roadmap_only,
     sanitize_wid,
     set_log_file,
     warn_red,
@@ -161,6 +164,14 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "$TAUCETI_ROADMAP_ONLY for this run",
     )
     p.add_argument(
+        "--source",
+        default=None,
+        metavar="PATH_OR_URL",
+        help="supplementary source material from a local Git repository directory or Git repository URL (checked-out/default HEAD) for a new roadmap PR. Requires an effective "
+        "--only roadmap and one specific --roadmap-only area; the source is mounted read-only in "
+        "bubble mode and treated as non-definitive reference material",
+    )
+    p.add_argument(
         "--roadmap-skip",
         dest="roadmap_skip",
         default=None,
@@ -272,6 +283,37 @@ def resolve_agent(args) -> str:
     return getattr(args, "agent", None) or os.environ.get("TAUCETI_AGENT") or "auto"
 
 
+def resolve_source(args, only: list[str]) -> str | None:
+    """Validate and resolve --source after CLI roadmap overrides have reached the environment.
+
+    A source is meaningful only when this invocation can do exactly one kind of work (author a
+    roadmap PR) and the target is pinned to one concrete roadmap area. Resolving it here also gives
+    loop children and bubble mounts a stable absolute path even if their working directory differs.
+    """
+    raw = getattr(args, "source", None)
+    if raw is None:
+        return None
+    if not only or set(only) != {"roadmap"}:
+        raise SystemExit("--source requires running only the 'roadmap' goal (use --only roadmap)")
+    area = roadmap_only()
+    if area is None or area.strip().lower() in ("", "any", "auto"):
+        raise SystemExit("--source requires a single roadmap area (use --roadmap-only AREA)")
+    if not raw.strip():
+        raise SystemExit("--source value must not be empty")
+    if is_git_url(raw):
+        return raw
+    source = Path(raw).expanduser().resolve()
+    if not source.exists():
+        raise SystemExit(f"--source is neither a Git repository URL nor an existing Git repository directory: {source}")
+    if not source.is_dir():
+        raise SystemExit(f"--source local path must name a directory: {source}")
+    if subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "--git-dir"], capture_output=True, text=True
+    ).returncode:
+        raise SystemExit(f"--source local directory is not a Git repository: {source}")
+    return str(source)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tauceti",
@@ -374,6 +416,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # live via roadmap_only()). Empty string is a meaningful value: "all areas".
     if getattr(args, "roadmap_only", None) is not None:
         os.environ["TAUCETI_ROADMAP_ONLY"] = args.roadmap_only
+    source = resolve_source(args, only)
+    if source is not None:
+        args.source = source
     # --roadmap-skip likewise overrides the env and is inherited by loop children (read live via
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
@@ -462,6 +507,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             work_model=work_model,
             sandbox_host=not getattr(args, "bubble", False),
             dry_run=dry,
+            source=source,
         )
         if not dry:
             preflight(cfg, opts)

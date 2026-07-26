@@ -95,6 +95,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 tail += ["--agent", model, "--ignore-quota"]  # loop already paced; child must not re-pace
             if bubble:
                 tail.append("--bubble")
+            source = getattr(args, "source", None)
+            if source is not None:
+                tail += ["--source", source]
             rc = run_round_subprocess(tail)
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.

@@ -116,6 +116,20 @@ To stay out of areas other contributors are working on, exclude them with
 `x` key): skipped areas drop out of the random pick and the all-areas case.
 `--roadmap-only` wins if it names a skipped area.
 
+To adapt compatible material from an existing local Git repository directory or Git repository URL,
+pin both the roadmap goal and one area, then pass it with `--source`:
+
+```bash
+tauceti work --only roadmap --roadmap-only Topology --source ../existing-library
+tauceti work --only roadmap --roadmap-only Topology --source https://github.com/example/library.git
+```
+
+Sources are shallow-cloned at their checked-out/default `HEAD` into worker-owned state and
+refreshed on later rounds. The snapshot is mounted read-only at `/opt/source` in bubble mode.
+It is supplementary:
+the agent is told to prioritize the roadmap as written, then review-quality library
+code, and only then migration of source material compatible with those requirements.
+
 Within an area, roadmap workers also respect finer-grained **claims** registered by other
 contributors on the [intentions board](https://github.com/leanprover-community/intentions):
 an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that someone has
@@ -275,6 +289,7 @@ is in `tauceti work -h`.
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. It is copied into worker state and mounted read-only in bubble mode. Requires `--only roadmap` and one specific `--roadmap-only AREA`; the roadmap and review quality remain authoritative. |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |

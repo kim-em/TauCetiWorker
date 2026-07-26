@@ -48,6 +48,7 @@ RUN_STDLIB=(
   round_group_sweep.py
   safe_exists.py
   scoreboard_trust.py
+  source_argument.py
   spread_candidates.py
   status_labels.py
 )

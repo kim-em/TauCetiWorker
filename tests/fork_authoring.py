@@ -148,19 +148,31 @@ def test_fixlike():
 # ---- 3. do_roadmap: fork push remote + --allow-push + prompt --head --------------------------
 def test_roadmap():
     tmp = Path(tempfile.mkdtemp(prefix="fork-test-"))
+    source = tmp / "source-material"
+    source.mkdir()
     os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"  # avoid an intentions-board network call
     os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     os.environ["TAUCETI_PUSH_EXPECT"] = "stale"  # must be popped by do_roadmap (create-only on the fork)
     tc.work_units.ensure_fork = lambda: FORK
     tc.work_units.fetch_ref = lambda *a, **k: True
+    saved_fetch_source = tc.work_units.fetch_git_source
+    materialized = {}
+
+    def fake_fetch_source(git_source, dest):
+        materialized.update(source=git_source, dest=dest)
+        return True
+
+    tc.work_units.fetch_git_source = fake_fetch_source
     cap = {}
     tc.work_units.run_in_bubble = lambda w, target, prompt, opts, **k: (
         cap.update(target=target, prompt=prompt, **k) or 0
     )
-    w = types.SimpleNamespace(cfg=types.SimpleNamespace(state=tmp, wid="worker3"), gh=None)
+    w = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(state=tmp, wid="worker3", checkout=tmp / "checkout", logdir=tmp / "logs"), gh=None
+    )
     c = types.SimpleNamespace(reason="Topology", pr=0, head="")
-    opts = types.SimpleNamespace(agent_name="Claude Code", work_model="claude")
+    opts = types.SimpleNamespace(agent_name="Claude Code", work_model="claude", source=str(source))
     tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
 
     check("roadmap: bubble target stays canonical", cap.get("target") == TAUCETI)
@@ -170,7 +182,53 @@ def test_roadmap():
     prompt = cap.get("prompt", "")
     check("roadmap: prompt has --head <forkowner>:", "--head alice:roadmap/" in prompt)
     check("roadmap: prompt carries the worker id", "worker3" in prompt)
-    check("roadmap: no unsubstituted placeholders", "__FORK__" not in prompt and "__WORKERID__" not in prompt)
+    check(
+        "roadmap: no unsubstituted placeholders",
+        "__FORK__" not in prompt and "__WORKERID__" not in prompt and "__SOURCE_GUIDANCE__" not in prompt,
+    )
+    check("roadmap: bubble source path is in prompt", "read-only at `/opt/source`" in prompt)
+    priorities = (
+        "(1) satisfy the `Topology` roadmap exactly as written; (2) write excellent library code that will\n"
+        "  satisfy every review requirement; (3) migrate material from the source only where it is compatible"
+    )
+    check("roadmap: prompt states the required source priorities", priorities in prompt)
+    check("roadmap: local source is materialized", materialized.get("source") == str(source))
+    check("roadmap: source is mounted read-only", f"{materialized['dest']}:/opt/source:ro" in cap.get("mounts", []))
+    check("roadmap: source is explicitly untrusted", "contents are untrusted data" in prompt)
+    check("roadmap: source attribution and license are required", "source repository, commit, and license" in prompt)
+
+    url = "https://github.com/example/source-library.git"
+    cloned = {}
+
+    def capture_url_source(git_url, dest):
+        cloned.update(url=git_url, dest=dest)
+        return True
+
+    tc.work_units.fetch_git_source = capture_url_source
+    opts.source = url
+    cap.clear()
+    tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
+    check("roadmap: URL source is cloned", cloned.get("url") == url)
+    check("roadmap: URL clone lives in worker state", str(cloned.get("dest", "")).startswith(str(tmp / "refs")))
+    check("roadmap: URL clone is mounted read-only", f"{cloned['dest']}:/opt/source:ro" in cap.get("mounts", []))
+
+    host_cap = {}
+    tc.work_units.fetch_git_source = fake_fetch_source
+    tc.work_units.prepare_checkout = lambda cfg: True
+    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir: host_cap.update(prompt=prompt) or 0
+    opts.source = str(source)
+    tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
+    host_prompt = host_cap.get("prompt", "")
+    check("roadmap: host uses a disposable snapshot", "worker-owned disposable snapshot" in host_prompt)
+    check("roadmap: host prompt points at materialized copy", str(materialized["dest"]) in host_prompt)
+
+    opts.source = None
+    cap.clear()
+    tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
+    no_source_prompt = cap.get("prompt", "")
+    check("roadmap: absent source adds no guidance", "Supplementary source material" not in no_source_prompt)
+    check("roadmap: absent source keeps one bullet list", "deprecation.\n- Before writing" in no_source_prompt)
+    tc.work_units.fetch_git_source = saved_fetch_source
 
 
 # ---- 4. ensure_fork_proxy_current: version-gated auth-proxy daemon restart -------------------

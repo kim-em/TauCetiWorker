@@ -65,22 +65,36 @@ def prepare_checkout(cfg: Config) -> bool:
     return True
 
 
-def fetch_ref(repo: str, dir: Path) -> bool:
-    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+def _fetch_shallow(url: str, dir: Path) -> bool:
+    """Clone or refresh a worker-owned shallow checkout and make its origin fetch-only."""
     if (dir / ".git").is_dir():
         ok = (
             subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"]).returncode == 0
             and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0
         )
-        subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"])
-        return ok
+        clean = subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"]).returncode == 0
+        no_push = subprocess.run(
+            ["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]
+        ).returncode == 0
+        return ok and clean and no_push
     import shutil
 
     shutil.rmtree(dir, ignore_errors=True)
     dir.parent.mkdir(parents=True, exist_ok=True)
-    return (
-        subprocess.run(["git", "clone", "-q", "--depth", "1", f"https://github.com/{repo}", str(dir)]).returncode == 0
-    )
+    cloned = subprocess.run(["git", "clone", "-q", "--depth", "1", "--", url, str(dir)]).returncode == 0
+    return cloned and subprocess.run(
+        ["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]
+    ).returncode == 0
+
+
+def fetch_ref(repo: str, dir: Path) -> bool:
+    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+    return _fetch_shallow(f"https://github.com/{repo}", dir)
+
+
+def fetch_git_source(url: str, dir: Path) -> bool:
+    """Clone or refresh a worker-owned shallow snapshot of a source Git repository."""
+    return _fetch_shallow(url, dir)
 
 
 def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
