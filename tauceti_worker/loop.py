@@ -13,6 +13,57 @@ from .quota import Provider, Quota, _unavail_reason, quota_line
 from .round import run_round_subprocess
 
 
+def _pace_wait_reason(window) -> str:
+    """One soft pacing condition, formatted like quota.py without changing its control verdict."""
+    relation = "=" if window.status == "at-budget" else ">"
+    label = "at budget" if window.status == "at-budget" else "ahead of pace"
+    comparison = (
+        ""
+        if window.used is None or window.budget is None
+        else f" (used {round(window.used)}% {relation} {round(window.budget)}% budget)"
+    )
+    left = "" if window.used is None else f", {max(0, round(100 - window.used))}% left"
+    return f"{window.name} {label}{comparison}{left}"
+
+
+def _wait_quota_line(snap: dict) -> str:
+    """Render the immediate pacing bottleneck when it defers an otherwise-initializable idle window.
+
+    The provider remains HARD-blocked for launch-control purposes until the window is initialized; this
+    is display-only. But when the only hard state is a plain post-reset idle window and a sibling window
+    is pacing-blocked, the sibling is what must clear first. Show that condition first instead of hiding
+    it behind the latent idle state.
+    """
+    line = quota_line(snap)
+    prov = snap.get("claude")
+    if prov is None or prov.error or prov.available:
+        return line
+
+    windows = prov.windows or []
+    idle = [w for w in windows if w.status == "idle"]
+    paced = [w for w in windows if w.status in ("at-budget", "over-pace")]
+    other_hard = [
+        w for w in windows if w.status not in ("under-pace", "at-budget", "over-pace", "idle")
+    ]
+    if (
+        not idle
+        or not paced
+        or other_hard
+        or any(w.detail != "window reset; awaiting initialization" for w in idle)
+    ):
+        return line
+
+    why = "; ".join(
+        [
+            *(_pace_wait_reason(w) for w in paced),
+            *(f"{w.name} window reset — initialization deferred until pacing permits" for w in idle),
+        ]
+    )
+    old = quota_line({"claude": prov})
+    new = f"claude [yellow]~[/] ({why})"
+    return line.replace(old, new, 1)
+
+
 def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     """The driver: pace against quota (codex preferred), run ONE round as a child under a hard timeout,
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
@@ -72,7 +123,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     # Honor a provider's Retry-After (e.g. a 429 asking for 580s) over the fixed poll, so
                     # we don't re-trip a rate limit by polling sooner than the server asked.
                     nap = max(POLL, max((p.retry_after or 0 for p in snap.values()), default=0))
-                    log(f"quota: {quota_line(snap)} — sleeping {nap}s")
+                    log(f"quota: {_wait_quota_line(snap)} — sleeping {nap}s")
                     time.sleep(nap)
                     continue
 
