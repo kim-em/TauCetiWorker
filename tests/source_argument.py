@@ -58,10 +58,10 @@ try:
         "omitted source needs no roadmap restrictions",
         tc.resolve_source(types.SimpleNamespace(source=None), []) is None,
     )
-    rejects("full cascade is rejected", args, [], "--only roadmap")
-    rejects("non-roadmap goal is rejected", args, ["review"], "--only roadmap")
+    rejects("non-roadmap goal is rejected", args, ["review"], "roadmap' phase")
 
     rejects("unpinned roadmap is rejected", args, ["roadmap"], "single roadmap area")
+    rejects("unpinned full cascade is rejected", args, [], "single roadmap area")
     os.environ["TAUCETI_ROADMAP_ONLY"] = ""
     rejects("all-roadmaps selection is rejected", args, ["roadmap"], "single roadmap area")
     os.environ["TAUCETI_ROADMAP_ONLY"] = "any"
@@ -71,6 +71,21 @@ try:
     resolved = tc.resolve_source(args, ["roadmap"])
     check(
         "pinned roadmap resolves source absolutely", resolved == str(source.resolve()) and Path(resolved).is_absolute()
+    )
+    check("pinned full cascade accepts source", tc.resolve_source(args, []) == str(source.resolve()))
+    check(
+        "pinned mixed phases accept source",
+        tc.resolve_source(args, ["review", "roadmap"]) == str(source.resolve()),
+    )
+    check(
+        "effective cascade with another phase skipped accepts source",
+        tc.resolve_source(args, tc.resolve_tasks([], ["review"])) == str(source.resolve()),
+    )
+    rejects(
+        "effective cascade with roadmap skipped rejects source",
+        args,
+        tc.resolve_tasks([], ["roadmap"]),
+        "roadmap' phase",
     )
     check(
         "Git repository URL is accepted",

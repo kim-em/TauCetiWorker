@@ -167,9 +167,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--source",
         default=None,
         metavar="PATH_OR_URL",
-        help="supplementary source material from a local Git repository directory or Git repository URL (checked-out/default HEAD) for a new roadmap PR. Requires an effective "
-        "--only roadmap and one specific --roadmap-only area; the source is mounted read-only in "
-        "bubble mode and treated as non-definitive reference material",
+        help="supplementary source material from a local Git repository directory or Git repository URL "
+        "(checked-out/default HEAD) for a new roadmap PR. Requires the roadmap phase to be enabled and "
+        "one specific --roadmap-only area; the source is mounted read-only in bubble mode and treated "
+        "as non-definitive reference material",
     )
     p.add_argument(
         "--roadmap-skip",
@@ -286,15 +287,15 @@ def resolve_agent(args) -> str:
 def resolve_source(args, only: list[str]) -> str | None:
     """Validate and resolve --source after CLI roadmap overrides have reached the environment.
 
-    A source is meaningful only when this invocation can do exactly one kind of work (author a
-    roadmap PR) and the target is pinned to one concrete roadmap area. Resolving it here also gives
-    loop children and bubble mounts a stable absolute path even if their working directory differs.
+    A source is meaningful only when this invocation may author a roadmap PR and the target is pinned
+    to one concrete roadmap area. Other phases may remain enabled: they simply ignore the source.
+    Resolving it here also gives loop children a stable absolute path even if their cwd differs.
     """
     raw = getattr(args, "source", None)
     if raw is None:
         return None
-    if not only or set(only) != {"roadmap"}:
-        raise SystemExit("--source requires running only the 'roadmap' goal (use --only roadmap)")
+    if only and "roadmap" not in only:
+        raise SystemExit("--source requires the 'roadmap' phase to be enabled")
     area = roadmap_only()
     if area is None or area.strip().lower() in ("", "any", "auto"):
         raise SystemExit("--source requires a single roadmap area (use --roadmap-only AREA)")
