@@ -218,6 +218,7 @@ the container:
 - Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
   `lake exe cache get`, fetches TauCeti's own main-built outputs with `lake cache get`,
   and runs an advisory `lake build` (a red tree still reaches the repair agent). Bubble
+  allows TauCeti's public R2 cache host as the work round's only extra egress domain and
   fetches both caches into a per-round writable view that is discarded when the container
   is popped, so an untrusted round can neither poison nor be poisoned by a later one.
 
@@ -305,7 +306,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
 | `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
 | `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |
-| `TAUCETI_BUBBLE` | `bubble` (else `uvx`-fetched) | Override the bubble executable. |
+| `TAUCETI_BUBBLE` | `bubble` (else `uvx` for dry-run probes only) | Override the Bubble executable. Real sandbox rounds require a stable installed executable because it owns a host-global auth daemon. |
 | `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
@@ -322,8 +323,9 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 - Always: `gh` (logged in as the account the worker should act as), `git`, `uv`,
   and `jq`.
 - Host authoring (the default): an `elan`/`lake` toolchain on the host.
-- The `--bubble` sandbox: a working Incus runtime. `tauceti` fetches the bubble
-  CLI itself.
+- The `--bubble` sandbox: a working Incus runtime and a stable Bubble install
+  for the host-global auth daemon (for example,
+  `uv tool install git+https://github.com/kim-em/bubble.git`).
 - The agents you want: `codex` and/or `claude` logged in, and for
   `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
   bubble image; you only need it on the host for host-mode rounds).

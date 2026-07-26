@@ -23,6 +23,7 @@ import sys
 import time
 
 from .agents import (
+    bubble_cmd_is_disposable,
     bubble_supports_allow_domain,
     bubble_supports_allow_push,
     ensure_fork_proxy_current,
@@ -496,17 +497,17 @@ def _have(tool: str) -> bool:
 
 
 def cmd_doctor(args) -> int:
-    """Report what the environment can do. bubble and the review engine are fetched on demand, so they
-    are informational, not required."""
+    """Report what the environment can do. The review engine is fetched on demand; a stable Bubble
+    install is required only for real ``--bubble`` rounds."""
     cfg = Config.resolve(getattr(args, "worker_id", None))
     rows: list[tuple[str, bool, str]] = []
     rows.append(("gh", _have("gh"), "required"))
     rows.append(("git", _have("git"), "required"))
-    rows.append(("uv/uvx", _have("uvx"), "required (runs tauceti, fetches bubble + review engine)"))
+    rows.append(("uv/uvx", _have("uvx"), "required (runs tauceti and fetches the review engine)"))
     rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
-    rows.append(("bubble", _have("bubble"), "the --bubble sandbox (fetched on demand if absent)"))
+    rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
@@ -560,15 +561,21 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "      has your full gh credentials and network, so use it only on trusted/disposable machines).\n"
             "  `tauceti doctor` reports this too."
         )
+    if uses_bubble and not opts.dry_run and bubble_cmd_is_disposable():
+        raise Die(
+            "preflight: --bubble needs Bubble installed at a stable path because its auth proxy is a "
+            "host-global service; uvx/`uv tool run` environments are disposable. Install it with\n"
+            "    uv tool install git+https://github.com/kim-em/bubble.git\n"
+            "  or set $TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
+        )
     # The worker authors/fixes from the contributor's fork, handing bubble `--allow-push <fork>` for the
     # fork's git access (kim-em/bubble#320). An older cached bubble rejects that flag only AFTER the model
     # launches — a wasted round — so verify support up front (probes `bubble open --help` once).
     if uses_fork and not opts.dry_run and not bubble_supports_allow_push():
         raise Die(
             "preflight: this bubble is too old for fork-PR authoring — it has no `--allow-push` "
-            "(needs kim-em/bubble#320). Refresh the cached build, e.g.\n"
-            "    uvx --refresh --from git+https://github.com/kim-em/bubble.git bubble --version\n"
-            "  or update your installed `bubble`, then re-run. (Override the executable with $TAUCETI_BUBBLE.)"
+            "(needs kim-em/bubble#320). Install or update Bubble from kim-em/bubble, then re-run "
+            "(override the executable with $TAUCETI_BUBBLE)."
         )
     # Work-agent bubble rounds warm both Mathlib's cache and TauCeti's public Lake artifact cache before
     # launching the model. The latter is hosted on a project-specific R2 domain, so Bubble must support
@@ -576,13 +583,12 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     if uses_fork and not opts.dry_run and not bubble_supports_allow_domain():
         raise Die(
             "preflight: this bubble is too old for TauCeti's Lake artifact cache — it has no "
-            "`--allow-domain`. Refresh the cached build, e.g.\n"
-            "    uvx --refresh --from git+https://github.com/kim-em/bubble.git bubble --version\n"
-            "  or update your installed `bubble`, then re-run. (Override the executable with $TAUCETI_BUBBLE.)"
+            "`--allow-domain`. Install or update Bubble from kim-em/bubble, then re-run "
+            "(override the executable with $TAUCETI_BUBBLE)."
         )
-    # The CLI may advertise --allow-push while a daemon started before that support keeps rejecting fork
-    # pushes (403) — refresh the auth-proxy daemon when the installed bubble version changes so the running
-    # proxy honors the flag we hand it. Fork-pushing rounds only (a stale daemon must not block review).
+    # The CLI may advertise --allow-push while an older live daemon keeps rejecting fork pushes (403).
+    # Require a reachable endpoint that advertises the capability, and refresh it safely when needed.
+    # Fork-pushing rounds only (a stale daemon must not block review).
     if uses_fork and not opts.dry_run:
         ensure_fork_proxy_current()
 
