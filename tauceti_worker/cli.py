@@ -307,9 +307,7 @@ def resolve_source(args, only: list[str]) -> str | None:
         raise SystemExit(f"--source is neither a Git repository URL nor an existing Git repository directory: {source}")
     if not source.is_dir():
         raise SystemExit(f"--source local path must name a directory: {source}")
-    if subprocess.run(
-        ["git", "-C", str(source), "rev-parse", "--git-dir"], capture_output=True, text=True
-    ).returncode:
+    if subprocess.run(["git", "-C", str(source), "rev-parse", "--git-dir"], capture_output=True, text=True).returncode:
         raise SystemExit(f"--source local directory is not a Git repository: {source}")
     return str(source)
 

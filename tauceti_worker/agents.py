@@ -73,18 +73,16 @@ def _fetch_shallow(url: str, dir: Path) -> bool:
             and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0
         )
         clean = subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"]).returncode == 0
-        no_push = subprocess.run(
-            ["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]
-        ).returncode == 0
+        no_push = subprocess.run(["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]).returncode == 0
         return ok and clean and no_push
     import shutil
 
     shutil.rmtree(dir, ignore_errors=True)
     dir.parent.mkdir(parents=True, exist_ok=True)
     cloned = subprocess.run(["git", "clone", "-q", "--depth", "1", "--", url, str(dir)]).returncode == 0
-    return cloned and subprocess.run(
-        ["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]
-    ).returncode == 0
+    return (
+        cloned and subprocess.run(["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]).returncode == 0
+    )
 
 
 def fetch_ref(repo: str, dir: Path) -> bool:

@@ -54,7 +54,10 @@ subprocess.run(
 args = types.SimpleNamespace(source=str(source))
 old_area = os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
 try:
-    check("omitted source needs no roadmap restrictions", tc.resolve_source(types.SimpleNamespace(source=None), []) is None)
+    check(
+        "omitted source needs no roadmap restrictions",
+        tc.resolve_source(types.SimpleNamespace(source=None), []) is None,
+    )
     rejects("full cascade is rejected", args, [], "--only roadmap")
     rejects("non-roadmap goal is rejected", args, ["review"], "--only roadmap")
 
@@ -66,7 +69,9 @@ try:
 
     os.environ["TAUCETI_ROADMAP_ONLY"] = "Topology"
     resolved = tc.resolve_source(args, ["roadmap"])
-    check("pinned roadmap resolves source absolutely", resolved == str(source.resolve()) and Path(resolved).is_absolute())
+    check(
+        "pinned roadmap resolves source absolutely", resolved == str(source.resolve()) and Path(resolved).is_absolute()
+    )
     check(
         "Git repository URL is accepted",
         tc.resolve_source(types.SimpleNamespace(source="https://github.com/example/library.git"), ["roadmap"])
@@ -143,9 +148,7 @@ try:
         raise KeyboardInterrupt
 
     tc.loop.run_round_subprocess = capture_round
-    loop_args = types.SimpleNamespace(
-        ignore_quota=False, bubble=True, quota_cmd=None, source=str(source.resolve())
-    )
+    loop_args = types.SimpleNamespace(ignore_quota=False, bubble=True, quota_cmd=None, source=str(source.resolve()))
     rc = tc.loop.cmd_loop(loop_args, types.SimpleNamespace(wid="worker1"), only=["roadmap"], agent="deepseek")
     tc.loop.github_budget = old_budget
     tc.loop.run_round_subprocess = old_run

@@ -15,7 +15,6 @@ from urllib.parse import urlsplit
 from .constants import ROADMAP
 from .paths import HERE
 
-
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
 
 
