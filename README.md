@@ -340,7 +340,9 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 - Host authoring (the default): an `elan`/`lake` toolchain on the host.
 - The `--bubble` sandbox: a working Incus runtime and a stable Bubble install
   for the host-global auth daemon (for example,
-  `uv tool install git+https://github.com/kim-em/bubble.git`).
+  `uv tool install git+https://github.com/kim-em/bubble.git`). TauCetiWorker
+  requires Bubble 0.7.28 or newer so macOS SSH commands target Bubble's named
+  Colima Incus remote correctly.
 - The agents you want: `codex` and/or `claude` logged in, and for
   `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
   bubble image; you only need it on the host for host-mode rounds).

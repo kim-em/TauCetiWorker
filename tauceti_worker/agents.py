@@ -182,6 +182,7 @@ def _shq(s: str) -> str:
 # crosses the boundary. The in-container agent invocation is a frozen contract (see agent_inner_cmd).
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
+BUBBLE_MIN_VERSION = "0.7.28"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
@@ -257,6 +258,23 @@ def _bubble_version(cmd: list[str]) -> str:
         return ""
     match = re.search(r"\bversion\s+([^\s,]+)", (result.stdout or result.stderr or ""))
     return match.group(1) if result.returncode == 0 and match else ""
+
+
+def installed_bubble_version() -> str:
+    """Return the version of the exact stable Bubble command this worker would execute."""
+    return _bubble_version(bubble_cmd())
+
+
+def bubble_version_meets_minimum(version: str, minimum: str = BUBBLE_MIN_VERSION) -> bool:
+    """Compare stable three-component Bubble versions without adding a packaging dependency."""
+    import re
+
+    pattern = r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?"
+    found = re.fullmatch(pattern, version)
+    required = re.fullmatch(pattern, minimum)
+    if found is None or required is None:
+        return False
+    return tuple(map(int, found.groups()[:3])) >= tuple(map(int, required.groups()[:3]))
 
 
 def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_version: str | None = None) -> bool:

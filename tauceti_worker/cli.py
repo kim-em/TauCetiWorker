@@ -24,10 +24,14 @@ import time
 from pathlib import Path
 
 from .agents import (
+    BUBBLE_MIN_VERSION,
+    BUBBLE_REPO,
     bubble_cmd_is_disposable,
     bubble_supports_allow_domain,
     bubble_supports_allow_push,
+    bubble_version_meets_minimum,
     ensure_fork_proxy_current,
+    installed_bubble_version,
     isolate_home,
     run_in_bubble,
 )
@@ -612,6 +616,16 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "    uv tool install git+https://github.com/kim-em/bubble.git\n"
             "  or set $TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
         )
+    if uses_bubble and not opts.dry_run:
+        bubble_version = installed_bubble_version()
+        if not bubble_version_meets_minimum(bubble_version):
+            found = bubble_version or "unreadable"
+            raise Die(
+                f"preflight: --bubble needs Bubble {BUBBLE_MIN_VERSION} or newer; found {found}. "
+                "Older versions generate a broken Incus SSH target on macOS. Update the stable install with\n"
+                f"    uv tool install --force {BUBBLE_REPO}\n"
+                "  or point $TAUCETI_BUBBLE at an updated stable executable, then re-run."
+            )
     # The worker authors/fixes from the contributor's fork, handing bubble `--allow-push <fork>` for the
     # fork's git access (kim-em/bubble#320). An older cached bubble rejects that flag only AFTER the model
     # launches — a wasted round — so verify support up front (probes `bubble open --help` once).
