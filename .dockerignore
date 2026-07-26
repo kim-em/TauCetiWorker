@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.ruff_cache
+__pycache__
+*.pyc
+*.egg-info
+checkouts
+dist
+logs
+state
+tests
+uv.lock

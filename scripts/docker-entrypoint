@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Prefer the authenticated GitHub identity for commits. The image-level fallback still lets
+# setup and CI run before `gh auth login` has populated the persistent credential volume.
+if [[ "${TAUCETI_SKIP_GIT_IDENTITY:-0}" != 1 ]]; then
+  if gh auth status >/dev/null 2>&1; then
+    login="$(gh api user --jq .login 2>/dev/null || true)"
+    account_id="$(gh api user --jq .id 2>/dev/null || true)"
+    if [[ -n "$login" && "$account_id" =~ ^[0-9]+$ ]]; then
+      git config --system user.name "$login"
+      git config --system user.email "${account_id}+${login}@users.noreply.github.com"
+    fi
+  fi
+  git_name="$(git config --system user.name)"
+  git_email="$(git config --system user.email)"
+  if [[ "$git_name" == "TauCeti Worker" ]]; then
+    echo >&2 "tauceti-entrypoint: WARNING: GitHub identity unavailable; commits use the fallback identity"
+  fi
+  echo "tauceti-entrypoint: git author $git_name <$git_email>"
+fi
+
+exec "$@"

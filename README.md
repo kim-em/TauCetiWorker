@@ -39,6 +39,60 @@ shim that runs the `tauceti_worker` package), and every command above works the 
 current round and exits, and `tauceti doctor` checks your environment and tells
 you what's missing.
 
+### Docker deployment
+
+For an unattended Linux host, the included Compose deployment packages the worker,
+Lean toolchain, GitHub CLI, Codex, and Claude Code together. It needs Docker Compose,
+at least 8 GB of RAM for Lean builds, and roughly 25 GB of free disk once the image,
+toolchain, and Mathlib cache are populated.
+
+Build it, then authenticate each CLI once inside the credential volumes:
+
+```bash
+docker compose build
+docker compose run --rm auth
+
+# Inside the container:
+codex login --device-auth
+gh auth login --git-protocol https
+claude auth login
+exit
+
+docker compose run --rm tauceti ./tauceti doctor
+```
+
+Start the worker and the single-writer credential refresher for each agent:
+
+```bash
+docker compose up -d
+docker compose logs -f tauceti claude-refresh codex-refresh
+```
+
+The `claude`, `codex`, and `gh` volumes retain subscription credentials. Separate
+`claude-worker` and `codex-worker` volumes contain only access-token copies for the agent.
+The `uv-cache` volume retains build downloads; the pinned Lean toolchain stays in the image
+so it changes reliably with an image update. The `checkouts`, `state`, and `logs` volumes
+retain incremental Lean builds and worker state across image updates. `docker compose down`
+stops the deployment but keeps those volumes; `docker compose down -v` deletes them and
+requires fresh logins and fresh dependency downloads.
+
+Claude and Codex both rotate single-use refresh tokens. Each refresher is therefore the
+only writer to its provider's credential volume during normal operation. The worker never
+mounts those source volumes; it sees only read-only, refresh-token-free mirrors, then gives
+agents another access-only copy in their isolated home. By default the refreshers check once
+a minute, renew within 90 minutes of expiry, never rotate more than once per 10 minutes,
+and back off to 15 minutes after errors. Advanced deployments can override
+`TAUCETI_REFRESH_POLL_SECONDS`, `TAUCETI_REFRESH_SKEW_SECONDS`,
+`TAUCETI_REFRESH_MIN_INTERVAL_SECONDS`, and `TAUCETI_REFRESH_MAX_BACKOFF_SECONDS`
+on the refresher services.
+
+This is host mode inside a disposable Docker environment, not a Bubble round. The
+agent can access its access-token mirrors and GitHub credential, and has unrestricted
+network access, so use it only on a trusted, dedicated Docker host. Pulling a new worker
+revision and running `docker compose up -d --build` replaces the image while keeping
+its volumes. The deployment was adapted from
+[eohjelle/TauCetiWorker-docker](https://github.com/eohjelle/TauCetiWorker-docker).
+
 ### The dashboard
 
 Bare `tauceti` opens an interactive dashboard ([Textual](https://textual.textualize.io/)).
@@ -356,7 +410,10 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
   `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
   `tauceti` console script (`tauceti_worker.cli:cli_main`).
 - `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
-  these on `PATH` inside a round, so they stay shell. (The wheel bundles them into the package.)
+  these on `PATH` inside a round, so they stay shell. `oauth_refresh_loop.py` and
+  `docker-entrypoint` support the Docker deployment. (The wheel bundles this directory
+  into the package.)
+- `Dockerfile` and `compose.yaml`: the unattended, persistent Docker deployment.
 - `prompts/*.md`: the per-task agent prompts.
 - `tests/`: plain `python3 tests/<name>.py` scripts (`dashboard.py` runs under `uv run`), driven
   by `tests/run-all`; plus `lifecycle.sh`. Each loads the package and exercises one concern.

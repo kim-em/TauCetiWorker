@@ -1,0 +1,77 @@
+name: tauceti-worker
+
+services:
+  tauceti:
+    build:
+      context: .
+    image: tauceti-worker:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    command: ["./tauceti", "work", "--loop"]
+    environment:
+      TAUCETI_WORKER_ID: docker
+    volumes:
+      # Agent and GitHub subscription credentials, created by the one-time login step.
+      - claude-worker:/root/.claude:ro
+      - codex-worker:/root/.codex:ro
+      - gh:/root/.config/gh
+      # Preserve build downloads when the image or isolated worker HOME changes. The pinned
+      # Lean toolchain remains image-owned so an image update cannot be hidden by a stale volume.
+      - uv-cache:/root/.cache/uv
+      # Checkouts, scheduler state, and durable per-round logs.
+      - checkouts:/opt/tauceti/checkouts
+      - state:/opt/tauceti/state
+      - logs:/opt/tauceti/logs
+
+  # Explicit setup shell: unlike the worker, this service mounts credentials read-write.
+  # Run it only for the documented one-time logins, never as a long-running service.
+  auth:
+    image: tauceti-worker:local
+    profiles: [setup]
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+    volumes:
+      - claude:/root/.claude
+      - codex:/root/.codex
+      - gh:/root/.config/gh
+
+  # These are the only processes allowed to rotate each provider's shared refresh token.
+  # TauCeti's isolated worker home mirrors their access tokens, avoiding refresh-token races.
+  claude-refresh:
+    image: tauceti-worker:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command: ["/usr/local/bin/tauceti-oauth-refresh", "claude"]
+    environment:
+      TAUCETI_SKIP_GIT_IDENTITY: "1"
+      TAUCETI_REFRESH_MIRROR: /worker-credentials/.credentials.json
+    volumes:
+      - claude:/root/.claude
+      - claude-worker:/worker-credentials
+
+  codex-refresh:
+    image: tauceti-worker:local
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command: ["/usr/local/bin/tauceti-oauth-refresh", "codex"]
+    environment:
+      TAUCETI_SKIP_GIT_IDENTITY: "1"
+      TAUCETI_REFRESH_MIRROR: /worker-credentials/auth.json
+    volumes:
+      - codex:/root/.codex
+      - codex-worker:/worker-credentials
+
+volumes:
+  claude:
+  codex:
+  claude-worker:
+  codex-worker:
+  gh:
+  uv-cache:
+  checkouts:
+  state:
+  logs:

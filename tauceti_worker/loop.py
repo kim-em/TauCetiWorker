@@ -3,6 +3,7 @@ timeout, then settle (short pause if productive, escalating back-off otherwise).
 
 from __future__ import annotations
 
+import signal
 import subprocess
 import time
 
@@ -11,6 +12,10 @@ from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, 
 from .github import github_budget
 from .quota import Provider, Quota, _unavail_reason, quota_line
 from .round import run_round_subprocess
+
+
+class _LoopTerminated(KeyboardInterrupt):
+    """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
 
 
 def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
@@ -24,6 +29,14 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     quota_cmd = getattr(args, "quota_cmd", None)
     log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}{' [bubble]' if bubble else ''}")
     streak = 0
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def terminate(_signum, _frame) -> None:
+        # run_round_subprocess catches KeyboardInterrupt and tears down the round's process
+        # group before re-raising, so use that same proven cleanup path for Compose SIGTERM.
+        raise _LoopTerminated
+
+    signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
             # 1) Decide the model and whether to run this cycle.
@@ -110,9 +123,14 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 tag = "timed out" if rc in (124, 137) else ("no progress" if rc == EX_NOPROGRESS else f"rc={rc}")
                 log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
                 time.sleep(nap)
+    except _LoopTerminated:
+        log("loop terminated — stopping")
+        return 143
     except KeyboardInterrupt:
         log("loop interrupted — stopping")
         return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:

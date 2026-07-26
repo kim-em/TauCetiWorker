@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Rebuild against moving base images and agent/install endpoints even when this repo is quiet.
+    - cron: "17 4 * * 1"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -41,7 +44,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create tests/*.sh tests/run-all
+        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint tests/*.sh tests/run-all
 
   build:
     runs-on: ubuntu-latest
@@ -68,4 +71,89 @@ jobs:
           assert (base / "prompts").is_dir(), "prompts/ missing from the installed wheel"
           assert (base / "scripts").is_dir(), "scripts/ missing from the installed wheel"
           print("bundled prompts/ and scripts/ present")
+          PY
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the Compose model
+        run: docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the worker image from this revision
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: |
+            tauceti-worker:ci
+            tauceti-worker:local
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+      - name: Smoke-test the image and Compose service
+        run: |
+          docker compose run --rm --no-deps \
+            -e HOME=/tmp/isolated-home \
+            tauceti bash -euo pipefail -c '
+            mkdir -p "$HOME"
+            for tool in gh git uvx jq lake codex claude tauceti-oauth-refresh; do
+              command -v "$tool" >/dev/null
+            done
+            lake --version
+            ./tauceti --help >/dev/null
+            doctor_output="$(./tauceti doctor || true)"
+            printf "%s\n" "$doctor_output"
+            printf "%s\n" "$doctor_output" | grep -F "[ok     ] lake"
+            git init -q /tmp/git-smoke
+            git -C /tmp/git-smoke commit --allow-empty -m smoke >/dev/null
+            test "$(git -C /tmp/git-smoke log -1 --format=%ae)" = "tauceti-worker@users.noreply.github.com"
+            set +e
+            claude_output="$(timeout 15 claude -p "Reply with ok" --model opus --dangerously-skip-permissions 2>&1)"
+            set -e
+            ! printf "%s\n" "$claude_output" | grep -F "cannot be used with root/sudo privileges"
+          '
+      - name: Smoke-test both credential refresher services
+        run: |
+          for provider in claude codex; do
+            log="$(mktemp)"
+            docker run --rm --entrypoint /usr/local/bin/tauceti-oauth-refresh \
+              -e TAUCETI_REFRESH_ONCE=1 \
+              tauceti-worker:ci "$provider" >"$log" 2>&1
+            grep -F "$provider-refresh: waiting for" "$log"
+          done
+      - name: Probe the live OAuth contracts
+        if: github.event_name == 'schedule'
+        run: |
+          docker run --rm -i --entrypoint python3 tauceti-worker:ci <<'PY'
+          import requests
+
+          probes = [
+              (
+                  "claude",
+                  "https://platform.claude.com/v1/oauth/token",
+                  {
+                      "grant_type": "refresh_token",
+                      "refresh_token": "invalid-ci-probe",
+                      "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                      "scope": "user:profile user:inference user:sessions:claude_code user:mcp_servers",
+                  },
+              ),
+              (
+                  "codex",
+                  "https://auth.openai.com/oauth/token",
+                  {
+                      "grant_type": "refresh_token",
+                      "refresh_token": "invalid-ci-probe",
+                      "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                  },
+              ),
+          ]
+          for name, url, payload in probes:
+              response = requests.post(url, json=payload, timeout=30)
+              assert 400 <= response.status_code < 500, (name, response.status_code)
+              assert isinstance(response.json(), dict), name
+              print(f"{name}: reachable OAuth endpoint rejected the invalid probe as expected")
           PY
