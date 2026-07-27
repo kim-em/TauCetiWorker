@@ -46,18 +46,19 @@ Lean toolchain, GitHub CLI, Codex, and Claude Code together. It needs Docker Com
 at least 8 GB of RAM for Lean builds, and roughly 25 GB of free disk once the image,
 toolchain, and Mathlib cache are populated.
 
-Build it, then authenticate each CLI once inside the credential volumes:
+From the directory containing `compose.yaml`, build the image and run each one-time
+login command. Follow the prompts each command prints; Docker removes the temporary
+setup container afterward, while the credentials remain in named volumes:
 
 ```bash
 docker compose build
-docker compose run --rm auth
 
-# Inside the container:
-codex login --device-auth
-gh auth login --git-protocol https
-claude auth login
-exit
+# Authenticate GitHub, Codex, and Claude in turn:
+docker compose run --rm auth gh auth login --git-protocol https
+docker compose run --rm auth codex login --device-auth
+docker compose run --rm auth claude auth login
 
+# Confirm that the worker can see the installed tools and saved credentials:
 docker compose run --rm tauceti ./tauceti doctor
 ```
 

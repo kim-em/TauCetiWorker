@@ -24,14 +24,16 @@ services:
       - state:/opt/tauceti/state
       - logs:/opt/tauceti/logs
 
-  # Explicit setup shell: unlike the worker, this service mounts credentials read-write.
-  # Run it only for the documented one-time logins, never as a long-running service.
+  # Explicit setup runner: unlike the worker, this service mounts credentials read-write.
+  # Run it only for the documented one-time login commands, never as a long-running service.
   auth:
     image: tauceti-worker:local
     profiles: [setup]
     stdin_open: true
     tty: true
     command: ["bash"]
+    environment:
+      TAUCETI_SKIP_GIT_IDENTITY: "1"
     volumes:
       - claude:/root/.claude
       - codex:/root/.codex
