@@ -279,9 +279,10 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
 
 def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
     """Fold --only and --skip into one effective allow-list. With no --skip the --only list passes
-    through unchanged (empty ⇒ the whole cascade); --skip materializes the complement, in cascade
-    order, so everything downstream — the loop child's argv, want(), the displayed --only — needs to
-    know about `only` alone. Combining them subtracts: `--only review,fix --skip fix` ⇒ ['review']."""
+    through unchanged (empty ⇒ the whole cascade); --skip materializes the complement in stable
+    ALLOWED_TASKS order, so everything downstream — the loop child's argv, want(), the displayed
+    --only — needs to know about `only` alone. Combining them subtracts:
+    `--only review,fix --skip fix` ⇒ ['review']."""
     only = parse_only(only_vals, "--only")
     skip = set(parse_only(skip_vals, "--skip"))
     if not skip:

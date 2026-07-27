@@ -153,7 +153,8 @@ WORK_TASKS = list(ALLOWED_TASKS)
 AUTO_STAGES = ("rebase", "fix-ci", "fix", "review", "bump")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
-# Both derive from ALLOWED_TASKS so the table number, the row order, and the keybinding can never drift.
+# ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
+# runtime priority. Keeping those concepts separate avoids silently rebinding established digit keys.
 KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...
 
 KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1", ...

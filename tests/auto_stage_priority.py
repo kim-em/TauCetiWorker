@@ -3,6 +3,7 @@
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -24,6 +25,21 @@ checks = [
     check("fix beats unrelated review", tc._next_auto_stage(sv), "fix"),
     check("single shared auto order", tc.AUTO_STAGES, ("rebase", "fix-ci", "fix", "review", "bump")),
 ]
+
+# Drive the real cascade as well as its status predictor. A future edit must not let their shared
+# priority drift while leaving this display-only helper green.
+saved_survey = tc.work_units.survey
+saved_dispatch = tc.work_units.dispatch
+seen = []
+tc.work_units.survey = lambda *_a, **_k: sv
+tc.work_units.dispatch = lambda stage, *_a, **_k: seen.append(stage) or 0
+try:
+    worker = SimpleNamespace(cfg=None, gh=None, rs=None, counters=None)
+    tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("runtime cascade agrees with predictor", seen, ["fix"]))
 
 sv.red_ci.actionable.append(candidate)
 checks.append(check("red CI beats review findings", tc._next_auto_stage(sv), "fix-ci"))

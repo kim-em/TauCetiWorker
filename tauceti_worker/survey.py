@@ -260,7 +260,15 @@ def spread_candidates(candidates: list, rng=random) -> list:
     return out
 
 
-def fix_disposition(meta: Meta, head: str, build_success: bool, blocking: bool, per_head: int) -> tuple[str, str]:
+def fix_disposition(
+    meta: Meta,
+    head: str,
+    build_success: bool,
+    blocking: bool,
+    per_head: int,
+    *,
+    pending_contest: bool = False,
+) -> tuple[str, str]:
     """Classify a tended PR for the `fix` stage from its scoreboard meta. Returns (disposition, reason):
 
       'actionable' — a blocking rubric stands at the current head, under the per-head attempt budget
@@ -292,6 +300,11 @@ def fix_disposition(meta: Meta, head: str, build_success: bool, blocking: bool, 
         if (meta.data.get("states") or {}) or (meta.data.get("runs") or []):
             return ("waiting", "reviews all green — nothing to fix")
         return ("waiting", "review recorded at this head but no rubric verdicts yet — awaiting review")
+    if pending_contest:
+        # A fix round may legitimately answer a wrong finding by contesting it without pushing. Until
+        # review adjudicates that reply, the durable scoreboard remains blocking at the same head;
+        # scheduling another fixer would only burn the per-head budget on the identical finding.
+        return ("waiting", "author contest awaiting re-review")
     if per_head >= MAX_FIX_ATTEMPTS:
         return (
             "exhausted",
@@ -461,7 +474,20 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             meta = rs.gh_meta(p.number)
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
-            disp, why = fix_disposition(meta, p.head_oid, p.build_success, blocking, per_head)
+            pending_contest = False
+            if blocking and str(meta.data.get("head_sha") or "") == p.head_oid:
+                reply = rs.newest_contest_reply(p.number)
+                through = meta.data.get("replies_through")
+                through = through if isinstance(through, int) else 0
+                pending_contest = bool(reply and reply["id"] > through)
+            disp, why = fix_disposition(
+                meta,
+                p.head_oid,
+                p.build_success,
+                blocking,
+                per_head,
+                pending_contest=pending_contest,
+            )
             if disp == "skip":
                 continue
             if disp == "actionable":

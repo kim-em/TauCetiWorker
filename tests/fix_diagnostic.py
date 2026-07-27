@@ -63,6 +63,12 @@ check(
     disp(meta({"head_sha": HEAD}), build_success=False, blocking=True, per_head=0),
     "actionable",
 )
+check(
+    "blocking at head with a pending contest -> wait for adjudication",
+    tc.fix_disposition(meta({"head_sha": HEAD}), HEAD, True, True, 1, pending_contest=True),
+    "waiting",
+    "contest awaiting re-review",
+)
 
 # --- exhausted: blocking, but the per-head fixer budget is spent ---------------------------------
 check(
