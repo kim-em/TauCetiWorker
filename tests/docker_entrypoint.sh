@@ -26,6 +26,14 @@ output="$({
 test "$output" = $'<work>\n<--loop>'
 echo "[OK ] an empty option setting leaves the worker command unchanged"
 
+output="$({
+  cd "$temporary"
+  TAUCETI_SKIP_GIT_IDENTITY=1 TAUCETI_WORKER_ARGS='--only roadmap' \
+    "$ROOT/scripts/docker-entrypoint" ./tauceti doctor
+})"
+test "$output" = '<doctor>'
+echo "[OK ] worker options do not affect other container commands"
+
 marker="$temporary/should-not-exist"
 output="$({
   cd "$temporary"
@@ -37,12 +45,15 @@ test ! -e "$marker"
 test "$output" = $'<work>\n<--loop>\n<--roadmap-only>\n<$(touch '"$marker"$')>'
 echo "[OK ] worker options are parsed without shell evaluation"
 
-if (
+set +e
+error="$(
   cd "$temporary"
   TAUCETI_SKIP_GIT_IDENTITY=1 TAUCETI_WORKER_ARGS="'" \
-    "$ROOT/scripts/docker-entrypoint" ./tauceti work --loop >/dev/null 2>&1
-); then
-  echo "[FAIL] malformed worker options should fail instead of being partially applied" >&2
-  exit 1
-fi
-echo "[OK ] malformed quoting fails closed"
+    "$ROOT/scripts/docker-entrypoint" ./tauceti work --loop 2>&1
+)"
+status=$?
+set -e
+test "$status" -ne 0
+[[ "$error" == tauceti-entrypoint:*TAUCETI_WORKER_ARGS*invalid\ quoting* ]]
+[[ "$error" != *Traceback* ]]
+echo "[OK ] malformed quoting fails closed with a useful error"

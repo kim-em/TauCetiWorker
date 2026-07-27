@@ -121,6 +121,11 @@ jobs:
         run: |
           TAUCETI_WORKER_ARGS=--help docker compose run --rm --no-deps tauceti 2>&1 |
             grep -F "usage: tauceti work"
+          test ! -e .env
+          trap 'rm -f .env' EXIT
+          printf '%s\n' 'TAUCETI_WORKER_ARGS=--help' >.env
+          docker compose config --format json | python3 -c \
+            'import json, sys; assert json.load(sys.stdin)["services"]["tauceti"]["environment"]["TAUCETI_WORKER_ARGS"] == "--help"'
       # Exercise the actual tini -> uv -> Python process tree used by Compose. The
       # unit test invokes Python directly and cannot prove that SIGTERM crosses uv.
       - name: Graceful stop reaches the worker loop

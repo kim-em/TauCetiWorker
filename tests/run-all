@@ -6,7 +6,7 @@
 #   - most are stdlib-only         -> `uv run python <file>`
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
 #   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
-#   - lifecycle is bash (flock/signals); it resolves its own python3
+#   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
 #   - egress needs the bubble sandbox/proxy              -> skipped here
 # The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
 #

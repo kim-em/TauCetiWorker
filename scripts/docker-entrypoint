@@ -30,7 +30,11 @@ import os
 import shlex
 import sys
 
-argv = sys.argv[1:] + shlex.split(os.environ["TAUCETI_WORKER_ARGS"])
+try:
+    extra = shlex.split(os.environ["TAUCETI_WORKER_ARGS"])
+except ValueError as error:
+    sys.exit(f"tauceti-entrypoint: TAUCETI_WORKER_ARGS has invalid quoting: {error}")
+argv = sys.argv[1:] + extra
 os.execvp(argv[0], argv)
 ' "$@"
 fi
