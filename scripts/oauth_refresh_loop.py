@@ -208,6 +208,13 @@ def _last_success(marker: Path) -> float | None:
         return None
 
 
+def _effective_skew(skew_seconds: int, expiry: float, last_success: float | None) -> float:
+    """Never spend more than half a freshly issued token's lifetime refreshing early."""
+    if last_success is None or expiry <= last_success:
+        return float(skew_seconds)
+    return min(float(skew_seconds), max(1.0, (expiry - last_success) / 2))
+
+
 def refresh_if_due(
     provider: Provider,
     skew_seconds: int,
@@ -216,8 +223,9 @@ def refresh_if_due(
     minimum_interval_seconds: int = 600,
 ) -> str:
     provider.credentials.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = provider.credentials.with_name(f".{provider.credentials.name}.refresh.lock")
-    success_path = provider.credentials.with_name(f".{provider.credentials.name}.refresh.last-success")
+    credential_name = provider.credentials.name.lstrip(".")
+    lock_path = provider.credentials.with_name(f".{credential_name}.refresh.lock")
+    success_path = provider.credentials.with_name(f".{credential_name}.refresh.last-success")
     with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -231,17 +239,19 @@ def refresh_if_due(
         # read-only worker volume become usable without waiting for the token to approach expiry.
         _write_worker_mirror(provider, credentials)
 
+        now = time.time()
         expiry = _expires_at(provider, credentials)
-        if not force and expiry is not None and expiry > time.time() + skew_seconds:
+        last_success = _last_success(success_path)
+        effective_skew = _effective_skew(skew_seconds, expiry, last_success) if expiry is not None else skew_seconds
+        if not force and expiry is not None and expiry > now + effective_skew:
             return "current"
         if not force and expiry is None:
             raise ValueError(f"cannot determine {provider.name} access-token expiry; log in again")
-        last_success = _last_success(success_path)
-        if not force and last_success is not None and time.time() < last_success + minimum_interval_seconds:
+        if not force and last_success is not None and now < last_success + minimum_interval_seconds:
             return "cooldown"
 
         payload, old_refresh_token = _refresh_request(provider, credentials)
-        response = requests.post(provider.token_url, json=payload, timeout=30)
+        response = requests.post(provider.token_url, json=payload, timeout=15)
         if not response.ok:
             # Do not echo the body: an authentication service is allowed to include request
             # details, and refresh tokens must never reach container logs.

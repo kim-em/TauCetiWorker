@@ -104,6 +104,8 @@ jobs:
             done
             lake --version
             ./tauceti --help >/dev/null
+            claude auth login --help >/dev/null
+            codex login --help 2>&1 | grep -F -- --device-auth >/dev/null
             doctor_output="$(./tauceti doctor || true)"
             printf "%s\n" "$doctor_output"
             printf "%s\n" "$doctor_output" | grep -F "[ok     ] lake"
@@ -115,6 +117,22 @@ jobs:
             set -e
             ! printf "%s\n" "$claude_output" | grep -F "cannot be used with root/sudo privileges"
           '
+      # Exercise the actual tini -> uv -> Python process tree used by Compose. The
+      # unit test invokes Python directly and cannot prove that SIGTERM crosses uv.
+      - name: Graceful stop reaches the worker loop
+        run: |
+          docker compose up -d tauceti
+          for attempt in $(seq 1 30); do
+            docker compose logs --no-color tauceti | grep -F "loop start:" && break
+            test "$attempt" -lt 30
+            sleep 1
+          done
+          docker compose stop -t 60 tauceti
+          worker_log="$(docker compose logs --no-color tauceti)"
+          printf "%s\n" "$worker_log"
+          printf "%s\n" "$worker_log" | grep -F "loop terminated — stopping"
+          container_id="$(docker compose ps -aq tauceti)"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" = 143
       - name: Smoke-test both credential refresher services
         run: |
           for provider in claude codex; do

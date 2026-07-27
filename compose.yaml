@@ -45,7 +45,9 @@ services:
     image: tauceti-worker:local
     init: true
     restart: unless-stopped
-    stop_grace_period: 30s
+    # Exceed the refresher's 15-second HTTP timeout so Docker cannot kill it after
+    # the server rotates a token but before the replacement is persisted.
+    stop_grace_period: 60s
     command: ["/usr/local/bin/tauceti-oauth-refresh", "claude"]
     environment:
       TAUCETI_SKIP_GIT_IDENTITY: "1"
@@ -58,7 +60,7 @@ services:
     image: tauceti-worker:local
     init: true
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 60s
     command: ["/usr/local/bin/tauceti-oauth-refresh", "codex"]
     environment:
       TAUCETI_SKIP_GIT_IDENTITY: "1"

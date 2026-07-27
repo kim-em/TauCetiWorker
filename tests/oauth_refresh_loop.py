@@ -83,10 +83,16 @@ with tempfile.TemporaryDirectory() as temporary:
     check("Claude credential permissions are private", (claude_file.stat().st_mode & 0o777) == 0o600)
     mirrored = json.loads(claude_mirror.read_text())["claudeAiOauth"]
     check("Claude worker mirror excludes the refresh token", "refreshToken" not in mirrored)
-    with patch.object(refresher.requests, "post") as post:
+    # The configured 90-minute skew exceeds this token's one-hour lifetime. Once the
+    # refresher knows the issuance time, clamp the skew to half the observed lifetime
+    # so it does not rotate every ten-minute cooldown interval.
+    with (
+        patch.object(refresher.time, "time", return_value=time.time() + 700),
+        patch.object(refresher.requests, "post") as post,
+    ):
         check(
-            "short-lived credentials respect the refresh cooldown",
-            refresher.refresh_if_due(provider, 5400) == "cooldown",
+            "short-lived credentials do not repeatedly rotate after cooldown",
+            refresher.refresh_if_due(provider, 5400) == "current",
         )
         post.assert_not_called()
 
