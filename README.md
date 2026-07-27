@@ -41,58 +41,20 @@ you what's missing.
 
 ### Docker deployment
 
-For an unattended Linux host, the included Compose deployment packages the worker,
-Lean toolchain, GitHub CLI, Codex, and Claude Code together. It needs Docker Compose,
-at least 8 GB of RAM for Lean builds, and roughly 25 GB of free disk once the image,
-toolchain, and Mathlib cache are populated.
-
-From the directory containing `compose.yaml`, build the image and run each one-time
-login command. Follow the prompts each command prints; Docker removes the temporary
-setup container afterward, while the credentials remain in named volumes:
+From the repository root:
 
 ```bash
 docker compose build
-
-# Authenticate GitHub, Codex, and Claude in turn:
 docker compose run --rm auth gh auth login --git-protocol https
 docker compose run --rm auth codex login --device-auth
 docker compose run --rm auth claude auth login
-
-# Confirm that the worker can see the installed tools and saved credentials:
 docker compose run --rm tauceti ./tauceti doctor
-```
-
-Start the worker and the single-writer credential refresher for each agent:
-
-```bash
 docker compose up -d
 docker compose logs -f tauceti claude-refresh codex-refresh
 ```
 
-The `claude`, `codex`, and `gh` volumes retain subscription credentials. Separate
-`claude-worker` and `codex-worker` volumes contain only access-token copies for the agent.
-The `uv-cache` volume retains build downloads; the pinned Lean toolchain stays in the image
-so it changes reliably with an image update. The `checkouts`, `state`, and `logs` volumes
-retain incremental Lean builds and worker state across image updates. `docker compose down`
-stops the deployment but keeps those volumes; `docker compose down -v` deletes them and
-requires fresh logins and fresh dependency downloads.
-
-Claude and Codex both rotate single-use refresh tokens. Each refresher is therefore the
-only writer to its provider's credential volume during normal operation. The worker never
-mounts those source volumes; it sees only read-only, refresh-token-free mirrors, then gives
-agents another access-only copy in their isolated home. By default the refreshers check once
-a minute, renew within 90 minutes of expiry, never rotate more than once per 10 minutes,
-and back off to 15 minutes after errors. Advanced deployments can override
-`TAUCETI_REFRESH_POLL_SECONDS`, `TAUCETI_REFRESH_SKEW_SECONDS`,
-`TAUCETI_REFRESH_MIN_INTERVAL_SECONDS`, and `TAUCETI_REFRESH_MAX_BACKOFF_SECONDS`
-on the refresher services.
-
-This is host mode inside a disposable Docker environment, not a Bubble round. The
-agent can access its access-token mirrors and GitHub credential, and has unrestricted
-network access, so use it only on a trusted, dedicated Docker host. Pulling a new worker
-revision and running `docker compose up -d --build` replaces the image while keeping
-its volumes. The deployment was adapted from
-[eohjelle/TauCetiWorker-docker](https://github.com/eohjelle/TauCetiWorker-docker).
+See the [Docker deployment guide](docs/docker.md) for requirements, updates, storage,
+credential handling, and security details.
 
 ### The dashboard
 
