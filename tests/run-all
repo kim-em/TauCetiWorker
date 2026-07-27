@@ -21,6 +21,7 @@ FAIL_FAST=0
 RUN_STDLIB=(
   agent_cmds.py
   auto_stage_priority.py
+  authoring_profiles.py
   bubble_cache.py
   bubble_version.py
   build_status_rollup.py

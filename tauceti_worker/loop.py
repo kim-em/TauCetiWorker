@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 
+from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
@@ -171,6 +172,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 # after it has surveyed and picked a work unit, so a round that finds nothing to do never
                 # spends the request. The GitHub preflight above has already passed at this point.
                 tail.append("--claude-bootstrap")
+            if model:
+                profile = resolve_authoring_profile(
+                    model,
+                    cli_model=getattr(args, "author_model", None),
+                    cli_effort=getattr(args, "author_effort", None),
+                )
+                # Pin the exact parent-resolved profile into the isolated child. The
+                # child must not re-read a different HOME or upstream CLI default.
+                tail += ["--author-model", profile.model]
+                if profile.effort:
+                    tail += ["--author-effort", profile.effort]
             if bubble:
                 tail.append("--bubble")
             source = getattr(args, "source", None)

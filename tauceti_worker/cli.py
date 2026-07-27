@@ -33,6 +33,7 @@ from .agents import (
     ensure_fork_proxy_current,
     installed_bubble_version,
     isolate_home,
+    resolve_authoring_profile,
     run_in_bubble,
 )
 from .config import (
@@ -48,7 +49,7 @@ from .config import (
     set_log_file,
     warn_red,
 )
-from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, TAUCETI, WORK_TASKS
+from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, OPENROUTER_MODELS, TAUCETI, WORK_TASKS
 from .github import GitHub
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE
@@ -97,6 +98,8 @@ environment (flags win; see README.md for the full list):
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% <= elapsed%); see --pace
+  TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
+  TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
@@ -135,6 +138,18 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
         "or deepseek/minimax (pay-per-token OpenRouter, asked for by name) "
         "(default: $TAUCETI_AGENT or auto)",
+    )
+    p.add_argument(
+        "--author-model",
+        default=None,
+        metavar="MODEL",
+        help="exact authoring model for an explicit --agent; overrides the provider-specific environment default",
+    )
+    p.add_argument(
+        "--author-effort",
+        default=None,
+        metavar="EFFORT",
+        help="authoring reasoning effort for an explicit --agent; overrides the provider-specific environment default",
     )
     p.add_argument(
         "--bubble",
@@ -425,6 +440,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
+    author_model = getattr(args, "author_model", None)
+    author_effort = getattr(args, "author_effort", None)
+    if (author_model or author_effort) and agent == "auto":
+        raise Die("--author-model/--author-effort require an explicit --agent; auto may choose another provider")
+    if author_effort and agent in OPENROUTER_MODELS:
+        raise Die(f"--author-effort is not supported for the OpenRouter provider {agent!r}")
     # --roadmap-only overrides the env for this run (and is inherited by loop children, which read it
     # live via roadmap_only()). Empty string is a meaningful value: "all areas".
     if getattr(args, "roadmap_only", None) is not None:
@@ -514,6 +535,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         work_model, pending_init = resolve_work_model(
             cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd
         )
+        authoring_profile = None
+        if work_model != "auto":
+            authoring_profile = resolve_authoring_profile(
+                work_model,
+                cli_model=author_model,
+                cli_effort=author_effort,
+            )
         gh = GitHub()
         w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))
         opts = RoundOpts(
@@ -526,6 +554,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             # Either the pacer just selected Claude on an unopened window (one-shot), or the loop did
             # and passed the authorization down (--claude-bootstrap). Same launch-stage gate either way.
             claude_bootstrap=pending_init or getattr(args, "claude_bootstrap", False),
+            authoring_profile=authoring_profile,
         )
         if not dry:
             preflight(cfg, opts)

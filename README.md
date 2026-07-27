@@ -164,9 +164,9 @@ the worker doesn't avoid your own side's claims. This is on by default and is co
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex preferred, Opus fallback | subscription, paced |
-| `codex` | Codex only | subscription, paced |
-| `claude` | Opus only | subscription, paced |
+| `auto` (default) | Codex (`gpt-5.6-sol`, high) preferred; Claude (`claude-opus-4-6`, high) fallback | subscription, paced |
+| `codex` | `gpt-5.6-sol`, high effort | subscription, paced |
+| `claude` | `claude-opus-4-6`, high effort | subscription, paced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
@@ -174,6 +174,14 @@ Set a default with `TAUCETI_AGENT`. The OpenRouter agents are pay-per-token, so
 they never run on their own; you have to ask for them by name. Override their
 model ids with `DEEPSEEK_MODEL` / `MINIMAX_MODEL`, and point at a non-default `pi`
 runner with `PI_RUN`.
+
+Provider selection and authoring configuration are separate. For an explicit
+provider, `--author-model` and `--author-effort` override its profile for one run;
+provider-specific environment variables override the committed defaults shown
+above. Host and bubble execution receive the same resolved profile, and every
+authoring launch prints its effective provider, model, effort, and sandbox. A
+generic authoring override is rejected with `--agent auto`, because the model or
+effort may not apply to the provider quota selection chooses.
 
 ### Where it runs: the host, or `--bubble`
 
@@ -354,6 +362,8 @@ is in `tauceti work -h`.
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
 | `--only TASKS` | Restrict the round to a comma list of `rebase,review,fix-ci,fix,bump,roadmap` (default: the whole cascade). |
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax` — see the agent table above. |
+| `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
+| `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex or Claude provider. |
 | `--bubble` | Run the agent inside the bubble sandbox instead of directly on the host (the default). |
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
@@ -386,7 +396,10 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
-| `TAUCETI_CODEX_MODEL` | host's configured model (authoring); engine default `gpt-5.6-sol` (review) | The Codex model for authoring rounds; when set it also pins the Codex **review** model (`TAUCETI_CODEX_MODEL=gpt-5.6-terra tauceti work --only review`), like `DEEPSEEK_MODEL`/`MINIMAX_MODEL`. Left unset, reviews use the engine's default with its automatic `gpt-5.6-terra` fallback for accounts that can't run Sol. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` / `high` | Codex authoring profile. Host user configuration is deliberately ignored. |
+| `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-4-6` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin. Independent of authoring configuration; unset preserves the review engine's own default/fallback. |
+| `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`; it no longer changes review policy. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
 | `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
 | `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |

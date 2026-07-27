@@ -132,6 +132,14 @@ OPENROUTER_MODELS = {
 
 AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek", "minimax": "MiniMax"}
 
+# Reproducible authoring defaults. Provider selection remains quota-driven; once
+# selected, host and bubble launchers consume this exact model/effort profile.
+# Review models are configured separately by the review engine.
+AUTHORING_DEFAULTS = {
+    "codex": ("gpt-5.6-sol", "high"),
+    "claude": ("claude-opus-4-6", "high"),
+}
+
 PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
 
 # $TAUCETI_CLAUDE_CMD overrides the `claude` executable for host rounds (a sandbox wrapper, a

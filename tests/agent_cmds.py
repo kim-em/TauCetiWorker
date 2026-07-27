@@ -25,10 +25,30 @@ def check(name, argv, expect):
 
 
 a, env = tc.host_agent_argv(P, "codex")
-check("codex", a, ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", P])
+check(
+    "codex",
+    a,
+    [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+        "--sandbox",
+        "danger-full-access",
+        "--skip-git-repo-check",
+        P,
+    ],
+)
 
 a, env = tc.host_agent_argv(P, "claude")
-check("claude", a, ["claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
+check(
+    "claude",
+    a,
+    ["claude", "-p", P, "--model", "claude-opus-4-6", "--effort", "high", "--dangerously-skip-permissions"],
+)
 assert "ANTHROPIC_API_KEY" not in env, "claude env must drop ANTHROPIC_API_KEY (bills the Max plan)"
 print("[OK ] claude env drops ANTHROPIC_API_KEY")
 
@@ -60,8 +80,8 @@ finally:
     else:
         os.environ["TAUCETI_STREAM"] = saved_stream
 
-# Per-worker HOME isolation must not hide the host Codex model: Bubble seeds credentials but deliberately
-# excludes host config, so the worker has to pass the host's configured subscription-compatible model.
+# Host configuration must not change worker authoring. Both backends consume the
+# committed/provider-specific profile instead.
 saved_host_home = tc.agents._host_home
 saved_model = os.environ.pop("TAUCETI_CODEX_MODEL", None)
 try:
@@ -70,9 +90,9 @@ try:
         (host_home / ".codex").mkdir()
         (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-sol"\n')
         tc.agents._host_home = lambda: host_home
-        check("bubble Codex model comes from host home", tc.agents._codex_model(), "gpt-5.6-sol")
+        check("Codex default ignores host config", tc.agents._codex_model(), "gpt-5.6-sol")
         (host_home / ".codex" / "config.toml").write_text("not valid [")
-        check("bubble Codex model has a supported fallback", tc.agents._codex_model(), "gpt-5.6-terra")
+        check("invalid host config is irrelevant", tc.agents._codex_model(), "gpt-5.6-sol")
         os.environ["TAUCETI_CODEX_MODEL"] = "operator-model"
         check("bubble Codex model operator override", tc.agents._codex_model(), "operator-model")
 finally:
@@ -90,11 +110,26 @@ a, _ = tc.host_agent_argv(P, "claude")
 check(
     "claude override",
     a,
-    ["my-wrapper", "--flag", "claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"],
+    [
+        "my-wrapper",
+        "--flag",
+        "claude",
+        "-p",
+        P,
+        "--model",
+        "claude-opus-4-6",
+        "--effort",
+        "high",
+        "--dangerously-skip-permissions",
+    ],
 )
 tc.agents.CLAUDE_CMD = "   "
 a, _ = tc.host_agent_argv(P, "claude")
-check("claude override blank falls back", a, ["claude", "-p", P, "--model", "opus", "--dangerously-skip-permissions"])
+check(
+    "claude override blank falls back",
+    a,
+    ["claude", "-p", P, "--model", "claude-opus-4-6", "--effort", "high", "--dangerously-skip-permissions"],
+)
 tc.agents.CLAUDE_CMD = _saved
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

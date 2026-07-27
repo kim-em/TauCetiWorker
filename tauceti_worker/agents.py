@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,7 +19,16 @@ if TYPE_CHECKING:  # annotations only; importing at runtime would invert the lay
     from .work_units import RoundOpts, Worker
 
 from .config import Config, Die, log
-from .constants import CLAUDE_CMD, OPENROUTER_MODELS, PI_RUN, REVIEW, REVIEW_DAILY_CAP, ROADMAP, TAUCETI
+from .constants import (
+    AUTHORING_DEFAULTS,
+    CLAUDE_CMD,
+    OPENROUTER_MODELS,
+    PI_RUN,
+    REVIEW,
+    REVIEW_DAILY_CAP,
+    ROADMAP,
+    TAUCETI,
+)
 from .github import me
 from .paths import HERE
 from .quota import (
@@ -30,6 +41,71 @@ from .quota import (
 )
 
 # ============================================================================
+
+
+@dataclass(frozen=True)
+class AuthoringProfile:
+    """Exact provider configuration consumed by both execution backends."""
+
+    provider: str
+    model: str
+    effort: str | None
+    model_source: str
+    effort_source: str
+
+
+def resolve_authoring_profile(
+    provider: str, *, cli_model: str | None = None, cli_effort: str | None = None
+) -> AuthoringProfile:
+    """Resolve CLI > provider environment > committed default, without user CLI config.
+
+    `TAUCETI_CODEX_MODEL` remains a deprecated authoring-only fallback. Reviews
+    deliberately use `TAUCETI_REVIEW_CODEX_MODEL` instead.
+    """
+
+    cli_model = cli_model.strip() if cli_model else None
+    cli_effort = cli_effort.strip() if cli_effort else None
+    key = provider.upper()
+    model_env = f"TAUCETI_AUTHORING_{key}_MODEL"
+    effort_env = f"TAUCETI_AUTHORING_{key}_EFFORT"
+
+    if provider in AUTHORING_DEFAULTS:
+        default_model, default_effort = AUTHORING_DEFAULTS[provider]
+    elif provider in OPENROUTER_MODELS:
+        default_model, default_effort = OPENROUTER_MODELS[provider], None
+    else:
+        raise Die(f"no authoring profile for provider {provider!r}")
+
+    legacy = ((os.environ.get("TAUCETI_CODEX_MODEL") or "").strip() or None) if provider == "codex" else None
+    env_model = (os.environ.get(model_env) or "").strip() or None
+    if cli_model:
+        model, model_source = cli_model, "--author-model"
+    elif env_model:
+        model, model_source = env_model, f"${model_env}"
+    elif legacy:
+        model, model_source = legacy, "$TAUCETI_CODEX_MODEL (deprecated; authoring only)"
+    else:
+        model, model_source = default_model, "repository default"
+
+    env_effort = (os.environ.get(effort_env) or "").strip() or None
+    if cli_effort:
+        effort, effort_source = cli_effort, "--author-effort"
+    elif env_effort:
+        effort, effort_source = env_effort, f"${effort_env}"
+    else:
+        effort, effort_source = default_effort, "repository default"
+
+    if not model:
+        raise Die(f"authoring model for {provider} must not be empty")
+    if effort and not re.fullmatch(r"[A-Za-z0-9._-]+", effort):
+        raise Die(f"authoring effort for {provider} contains unsupported characters: {effort!r}")
+    return AuthoringProfile(provider, model, effort, model_source, effort_source)
+
+
+def _authoring_profile(value: AuthoringProfile | str) -> AuthoringProfile:
+    return value if isinstance(value, AuthoringProfile) else resolve_authoring_profile(value)
+
+
 # Agents — prompt filling, the host checkout, and the agent launch. The host argv lists are a frozen
 # contract — keep them byte-for-byte stable (the historical `( cd … ) 9>&-` and `env -u` shell
 # mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh / git-safe-push /
@@ -97,27 +173,35 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
+def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
-    if work_model == "codex":
-        argv = ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
-    elif work_model in OPENROUTER_MODELS:
-        argv = [PI_RUN, "openrouter", OPENROUTER_MODELS[work_model], "--prompt", prompt]
+    profile = _authoring_profile(profile)
+    if profile.provider == "codex":
+        argv = ["codex", "exec", "--ignore-user-config", "--model", profile.model]
+        if profile.effort:
+            argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
+        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+    elif profile.provider in OPENROUTER_MODELS:
+        argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
         env.pop("ANTHROPIC_API_KEY", None)
         base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
-        argv = [*base, "-p", prompt, "--model", "opus", "--dangerously-skip-permissions"]
+        argv = [*base, "-p", prompt, "--model", profile.model]
+        if profile.effort:
+            argv += ["--effort", profile.effort]
+        argv += ["--dangerously-skip-permissions"]
     return argv, env
 
 
-def run_agent_host(cwd: Path, prompt: str, work_model: str, logdir: Path) -> int:
-    argv, env = host_agent_argv(prompt, work_model)
+def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
+    profile = _authoring_profile(profile)
+    argv, env = host_agent_argv(prompt, profile)
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{work_model}")
+    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{profile.provider}")
 
 
 def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None) -> int:
@@ -475,47 +559,35 @@ def agent_cred_flags(work_model: str) -> list[str]:
 
 
 def _codex_model() -> str:
-    """The codex model to run in the bubble. $TAUCETI_CODEX_MODEL wins; else the host's configured
-    model from ~/.codex/config.toml (what host rounds use); else a safe default."""
-    m = os.environ.get("TAUCETI_CODEX_MODEL")
-    if m:
-        return m
-    try:
-        import tomllib
-
-        configured = tomllib.loads((_host_home() / ".codex" / "config.toml").read_text()).get("model")
-        if isinstance(configured, str) and configured.strip():
-            return configured.strip()
-    except (OSError, tomllib.TOMLDecodeError):
-        pass
-    return "gpt-5.6-terra"
+    """Compatibility helper for callers that only need the resolved Codex model."""
+    return resolve_authoring_profile("codex").model
 
 
-def agent_inner_cmd(work_model: str) -> str:
+def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     """The command bubble runs INSIDE the container (bash -lc); a frozen contract, kept byte-for-byte
     stable: the prompt is read from the read-only /opt/round mount; *_API_KEY emptied to force
     subscription auth."""
     import shlex
 
-    if work_model == "codex":
-        # Pin the model explicitly: the bubble seeds codex *credentials* but NOT host config
-        # (--no-codex-config, for isolation), so in-container codex would otherwise fall back to its
-        # built-in default (e.g. gpt-5.3-codex), which a ChatGPT-subscription account may not support.
-        # shlex.quote the model id: it comes from env / ~/.codex/config.toml, not a literal, and is
-        # spliced into a bash -lc string inside a credential-seeded, repo-write container.
+    profile = _authoring_profile(profile)
+    if profile.provider == "codex":
+        effort_config = f'model_reasoning_effort="{profile.effort}"'
+        effort = f" -c {shlex.quote(effort_config)}" if profile.effort else ""
         return (
-            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {shlex.quote(_codex_model())} "
+            "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --ignore-user-config "
+            f"--model {shlex.quote(profile.model)}{effort} "
             '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
         )
-    if work_model in OPENROUTER_MODELS:
+    if profile.provider in OPENROUTER_MODELS:
         return (
             'env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY="$(cat /opt/round/openrouter.key)" '
-            f"pi --provider openrouter --model {shlex.quote(OPENROUTER_MODELS[work_model])} --print "
+            f"pi --provider openrouter --model {shlex.quote(profile.model)} --print "
             '"$(cat /opt/round/prompt.txt)"'
         )
+    effort = f" --effort {shlex.quote(profile.effort)}" if profile.effort else ""
     return (
         'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
-        "--dangerously-skip-permissions --model opus"
+        f"--model {shlex.quote(profile.model)}{effort} --dangerously-skip-permissions"
     )
 
 
@@ -611,6 +683,7 @@ def run_in_bubble(
     import shlex
 
     cfg, wm = w.cfg, opts.work_model
+    profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm)
     cred_model = cred_model or wm
     # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
     # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
@@ -661,7 +734,7 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    command_inner = inner_cmd or agent_inner_cmd(wm)
+    command_inner = inner_cmd or agent_inner_cmd(profile)
     if inner_cmd is None:
         command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
     command = f"{tcenv} {command_inner}"
@@ -739,13 +812,8 @@ def run_in_bubble(
 
 
 def _codex_review_model_override(reviewers: str) -> str | None:
-    """An explicit codex review-model override from $TAUCETI_CODEX_MODEL, or None to let the engine use
-    its own default (currently gpt-5.6-sol, with an automatic gpt-5.6-terra fallback for accounts that
-    can't run it). Reuses the same env _codex_model() reads for authoring, so one TAUCETI_CODEX_MODEL
-    pins BOTH authoring and review (parity with DEEPSEEK_MODEL / MINIMAX_MODEL). Forwarded only when
-    codex is actually a reviewer; left unset by default so the engine's seamless fallback stays in play
-    (passing --codex-model opts the engine out of it, which is what an explicit pin should mean)."""
-    m = os.environ.get("TAUCETI_CODEX_MODEL")
+    """Independent review-model override, or None for the engine's own policy."""
+    m = os.environ.get("TAUCETI_REVIEW_CODEX_MODEL")
     return m if (m and "codex" in [r.strip() for r in reviewers.split(",")]) else None
 
 

@@ -15,12 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .agents import (
+    AuthoringProfile,
     _codex_review_model_override,
     fetch_git_source,
     fetch_ref,
     fill_prompt,
     host_agent_argv,
     prepare_checkout,
+    resolve_authoring_profile,
     review_in_bubble,
     run_agent_host,
     run_in_bubble,
@@ -69,10 +71,20 @@ class RoundOpts:
     # Claude was selected while one of its quota windows was reset-but-unopened. The round may spend ONE
     # small claude request to open it — at its LAUNCH STAGE (dispatch), never before there is work.
     claude_bootstrap: bool = False
+    authoring_profile: AuthoringProfile | None = None
 
     @property
     def agent_name(self) -> str:
         return AGENT_NAMES.get(self.work_model, self.work_model)
+
+    @property
+    def effective_authoring_profile(self) -> AuthoringProfile:
+        return self.authoring_profile or resolve_authoring_profile(self.work_model)
+
+
+def _effective_authoring_profile(opts) -> AuthoringProfile:
+    """Profile accessor tolerant of lightweight test/extension option objects."""
+    return getattr(opts, "authoring_profile", None) or resolve_authoring_profile(opts.work_model)
 
 
 @dataclass
@@ -289,7 +301,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = f"new PR (area: {c.reason or 'any'})"
     else:
         what = c.reason or (c.head[:12] if c.head else "")
-    log(f"→ {stage.upper()}: {what}   [agent={opts.work_model}, sandbox={where}]")
+    if stage == "review":
+        detail = f"provider={opts.work_model}, sandbox={where}"
+    else:
+        profile = _effective_authoring_profile(opts)
+        effort = profile.effort or "none"
+        detail = f"provider={profile.provider}, model={profile.model}, effort={effort}, sandbox={where}"
+    log(f"→ {stage.upper()}: {what}   [{detail}]")
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     rc = fn(w, sv, c, opts, bubble)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
@@ -504,7 +522,7 @@ def _do_fixlike(
         checked = rev.stdout.strip() or head
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
-        rc = run_agent_host(co, prompt, opts.work_model, w.cfg.logdir)
+        rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
     return rc
@@ -631,4 +649,4 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         REVIEW_DIR=str(refs / "review"),
         SOURCE_GUIDANCE=source_guidance,
     )
-    return run_agent_host(w.cfg.checkout, prompt, opts.work_model, w.cfg.logdir)
+    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
