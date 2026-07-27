@@ -892,7 +892,7 @@ class Quota:
                 return None
         return None
 
-    def codex(self) -> Provider:
+    def codex(self, *, refresh: bool = False) -> Provider:
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         auth = self._codex_creds()
         if not auth:
@@ -900,7 +900,8 @@ class Quota:
         # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
         # token itself when no id is available.
         fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
-        payload = self._cached_raw("codex", fp)
+        cached = self._cached_raw("codex", fp)
+        payload = None if refresh else cached
         if payload is None:
             tok = (auth.get("tokens") or {}).get("access_token")
             if not tok:
@@ -912,11 +913,15 @@ class Quota:
             try:
                 code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
             except GitHubError as e:
+                if refresh and cached is not None:
+                    return self._codex_from_payload(cached)
                 return Provider("codex", False, None, error=str(e))
             # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
             # access token simply reads as unavailable until the operator's external refresher rotates it
             # and mirror_creds picks it up next cycle.
             if code != 200 or not payload:
+                if refresh and cached is not None and code != 401:
+                    return self._codex_from_payload(cached)
                 err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
                 return Provider("codex", False, None, error=err, retry_after=retry_after)
             self._store_raw("codex", payload, fp)
@@ -978,7 +983,7 @@ class Quota:
             return block, sys.platform == "darwin"
         return None, False
 
-    def claude(self) -> Provider:
+    def claude(self, *, refresh: bool = False) -> Provider:
         """Read the Claude usage endpoint and report whether opus may run. PURE: it reads, it never
         spends. A dashboard refresh, `tauceti status`, and an `auto` selection that ends up picking
         codex must all be able to call this without making a Claude request.
@@ -1005,7 +1010,7 @@ class Quota:
         # re-fetch); an external same-account refresh also changes it, costing one harmless extra fetch.
         # The bootstrap RESERVATION deliberately does not use this — see _claude_account_key.
         fp = self._fingerprint(oauth.get("accessToken"))
-        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"))
+        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh)
         return prov
 
     def authorize_claude_launch(self) -> Provider:
@@ -1042,11 +1047,14 @@ class Quota:
             log(f"claude quota: bootstrap request failed ({detail}) — claude stays unavailable")
         return self.claude()  # the fresh telemetry decides, including whether there is headroom to spend
 
-    def _claude_pass(self, fp: str | None, tok: str | None) -> tuple[Provider, list[Reading] | None]:
+    def _claude_pass(
+        self, fp: str | None, tok: str | None, *, refresh: bool = False
+    ) -> tuple[Provider, list[Reading] | None]:
         """One read of the usage endpoint (cache-aware) turned into a Provider. Returns readings=None
         when no payload was obtained at all, so the caller can tell "the endpoint would not answer"
         from "the endpoint answered something we could not use"."""
-        payload = self._cached_claude(fp)
+        cached = self._cached_claude(fp)
+        payload = None if refresh else cached
         if payload is None:
             if not tok:
                 return Provider("claude", False, None, error="no claude accessToken"), None
@@ -1054,6 +1062,12 @@ class Quota:
             try:
                 code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
             except GitHubError as e:
+                if refresh and cached is not None:
+                    readings = _claude_readings(cached)
+                    notes, bootstrap_recorded = self._idle_notes(readings)
+                    return self._claude_provider(
+                        readings, notes, bootstrap_recorded=bootstrap_recorded
+                    ), readings
                 return Provider("claude", False, None, error=str(e)), None
             # The worker never refreshes: the operator owns the single-use refresh token (rotating it here
             # would invalidate their copy). An expired access token reads as unavailable until the operator's
@@ -1062,6 +1076,12 @@ class Quota:
             # status code — an auth failure, a rate-limited endpoint and a server error are different
             # problems with different fixes, and none of them is "usage unknown".
             if code != 200 or not payload:
+                if refresh and cached is not None and code != 401:
+                    readings = _claude_readings(cached)
+                    notes, bootstrap_recorded = self._idle_notes(readings)
+                    return self._claude_provider(
+                        readings, notes, bootstrap_recorded=bootstrap_recorded
+                    ), readings
                 err = f"claude usage HTTP {code}"
                 if code == 401:
                     err += " (token expired; refresh left to the operator)"
@@ -1383,7 +1403,7 @@ class Quota:
         return min(blocked) if blocked else None
 
     # --- selection ---------------------------------------------------------
-    def choose(self, forced: str | None) -> tuple[str | None, dict]:
+    def choose(self, forced: str | None, *, refresh: bool = False) -> tuple[str | None, dict]:
         """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
 
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
@@ -1391,9 +1411,9 @@ class Quota:
         """
         snap = {}
         if forced in (None, "auto", "codex"):
-            snap["codex"] = self.codex()
+            snap["codex"] = self.codex(refresh=refresh)
         if forced in (None, "auto", "claude"):
-            snap["claude"] = self.claude()
+            snap["claude"] = self.claude(refresh=refresh)
         codex_ok = snap.get("codex") and snap["codex"].available
         opus_ok = snap.get("claude") and snap["claude"].available
         if forced == "codex":

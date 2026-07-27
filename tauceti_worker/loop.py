@@ -99,7 +99,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 # round to post an all-error scoreboard.
                 if agent == "auto":
                     raise SystemExit("--ignore-quota --loop needs an explicit --agent (codex/claude)")
-                _chosen, snap = choose_model(cfg, agent, quota_cmd)
+                _chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=True)
                 prov = snap.get(agent)
                 verdict = _ignore_quota_verdict(_chosen, prov)
                 # An unopened window is the one hard block --ignore-quota may still clear, because the
@@ -122,13 +122,20 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
                 model = agent
             else:
-                model, snap = choose_model(cfg, agent, quota_cmd)
+                model, snap = choose_model(cfg, agent, quota_cmd, refresh=True)
                 if model is None and claude_pending_init(snap):
                     model, pending_init = "claude", True
                 if model is None:
                     # Honor a provider's Retry-After (e.g. a 429 asking for 580s) over the fixed poll, so
                     # we don't re-trip a rate limit by polling sooner than the server asked.
                     nap = max(POLL, max((p.retry_after or 0 for p in snap.values()), default=0))
+                    if not any(p.retry_after for p in snap.values()):
+                        eligible = [p.next_eligible for p in snap.values() if p.next_eligible]
+                        if eligible:
+                            # A forced refresh is valuable before a launch, not every five minutes
+                            # throughout a known multi-hour wait. Recheck at least hourly so sibling
+                            # workers or operator activity are still observed reasonably promptly.
+                            nap = max(nap, min(int(min(eligible) - time.time()) + 5, 3600))
                     log(f"quota: {_wait_quota_line(snap)} — sleeping {nap}s")
                     time.sleep(nap)
                     continue
@@ -209,7 +216,7 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
     return "over-pace" if soft else "wait"
 
 
-def choose_model(cfg: Config, agent: str, quota_cmd: str | None) -> tuple[str | None, dict]:
+def choose_model(cfg: Config, agent: str, quota_cmd: str | None, *, refresh: bool = False) -> tuple[str | None, dict]:
     """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
     command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
     `<quota_cmd> <agent>`; its first stdout token is the model to run (codex/claude/deepseek/minimax)
@@ -224,7 +231,7 @@ def choose_model(cfg: Config, agent: str, quota_cmd: str | None) -> tuple[str | 
         out = (r.stdout or "").split()
         model = out[0] if (r.returncode == 0 and out) else None
         return (model or None), {"quota-cmd": Provider("quota-cmd", bool(model), model)}
-    return Quota(cfg).choose(None if agent == "auto" else agent)
+    return Quota(cfg).choose(None if agent == "auto" else agent, refresh=refresh)
 
 
 def claude_pending_init(snap: dict) -> bool:
