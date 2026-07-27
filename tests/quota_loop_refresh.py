@@ -7,7 +7,7 @@ Claude was exhausted. This pins the integration point without network access.
 """
 
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,8 +41,8 @@ print(f"[{'OK ' if ok else 'XX '}] loop refresh vs ordinary cached read: got={ca
 
 # Pin the semantic behind the plumbing: a forced read must contact the endpoint even with a valid
 # cache, refresh that cache on success, and retain the valid cached verdict across a transient error.
-reset_session = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
-reset_weekly = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+reset_session = (datetime.now(UTC) + timedelta(hours=4)).isoformat()
+reset_weekly = (datetime.now(UTC) + timedelta(days=6)).isoformat()
 payload = {
     "five_hour": {"utilization": 1, "resets_at": reset_session},
     "seven_day": {"utilization": 1, "resets_at": reset_weekly},

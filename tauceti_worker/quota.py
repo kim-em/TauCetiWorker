@@ -1065,9 +1065,7 @@ class Quota:
                 if refresh and cached is not None:
                     readings = _claude_readings(cached)
                     notes, bootstrap_recorded = self._idle_notes(readings)
-                    return self._claude_provider(
-                        readings, notes, bootstrap_recorded=bootstrap_recorded
-                    ), readings
+                    return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded), readings
                 return Provider("claude", False, None, error=str(e)), None
             # The worker never refreshes: the operator owns the single-use refresh token (rotating it here
             # would invalidate their copy). An expired access token reads as unavailable until the operator's
@@ -1079,9 +1077,7 @@ class Quota:
                 if refresh and cached is not None and code != 401:
                     readings = _claude_readings(cached)
                     notes, bootstrap_recorded = self._idle_notes(readings)
-                    return self._claude_provider(
-                        readings, notes, bootstrap_recorded=bootstrap_recorded
-                    ), readings
+                    return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded), readings
                 err = f"claude usage HTTP {code}"
                 if code == 401:
                     err += " (token expired; refresh left to the operator)"
