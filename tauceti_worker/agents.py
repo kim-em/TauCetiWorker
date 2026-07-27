@@ -689,11 +689,7 @@ def run_in_bubble(
     cfg, wm = w.cfg, opts.work_model
     # Review/probe commands bring their own model policy. Do not let an unrelated authoring override
     # (including a malformed effort value) prevent those isolated commands from running.
-    profile = (
-        getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm)
-        if inner_cmd is None
-        else None
-    )
+    profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm) if inner_cmd is None else None
     cred_model = cred_model or wm
     # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
     # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
