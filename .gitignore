@@ -12,5 +12,8 @@ __pycache__/
 /dist/
 *.egg-info/
 
+# macOS metadata
+.DS_Store
+
 # uv lockfile — generated for the single-file script, not source.
 /uv.lock
