@@ -146,6 +146,12 @@ ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "roadmap"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
+# Priority for an unrestricted round. Maintenance on the worker's own PRs comes
+# before fleet-wide review work, so an awaiting-author head cannot be starved by
+# a steady supply of unrelated reviewable PRs. Roadmap is the final fallback and
+# is handled separately after these PR-backed stages.
+AUTO_STAGES = ("rebase", "fix-ci", "fix", "review", "bump")
+
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # Both derive from ALLOWED_TASKS so the table number, the row order, and the keybinding can never drift.
 KIND_KEYS = {str(i): name for i, name in enumerate(ALLOWED_TASKS, 1)}  # "1" -> "rebase", ...

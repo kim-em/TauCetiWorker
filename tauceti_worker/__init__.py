@@ -5,7 +5,7 @@ the driver loop); `tauceti status` prints the read-only survey.
 
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and treats that
 account's own PRs as the ones it tends. Each round does exactly ONE unit of work, chosen in
-priority order: rebase -> review -> fix-ci -> fix -> bump -> roadmap.
+priority order: rebase -> fix-ci -> fix -> review -> bump -> roadmap.
 
 This package was split from a single-file script for navigability. The split is behaviour-
 preserving. For both the test harness (which reaches `tauceti_worker.<NAME>`) and the historical

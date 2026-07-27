@@ -29,6 +29,7 @@ from .agents import (
 from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
     AGENT_NAMES,
+    AUTO_STAGES,
     CONTEST_CLAIM_TTL,
     MAX_OPEN_PRS,
     OPENROUTER_MODELS,
@@ -142,14 +143,14 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # (review collides on the in-progress marker; fix/fix-ci/rebase each cost a branch-claim round-trip to
     # discover the clash). This only reorders WITHIN a stage — the cascade's stage priority below is
     # unchanged — and the real de-contention (marker / branch claim) remains the authority and backstop.
-    for stage in ("rebase", "review", "fix-ci", "fix", "bump"):
+    for stage in AUTO_STAGES:
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
     # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
     # fix-ci before fix: a red PR can't be reviewed or review-fixed until it builds. bump adapts a
     # bump-mathlib PR (opened by the review bot) that mathlib moved out from under.
-    for stage in ("rebase", "review", "fix-ci", "fix", "bump"):
+    for stage in AUTO_STAGES:
         if not want(opts.only, stage):
             continue
         for c in sv.kind(stage).actionable:

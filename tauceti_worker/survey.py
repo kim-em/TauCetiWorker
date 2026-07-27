@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .config import Config, log, roadmap_only, roadmap_skip
 from .constants import (
+    AUTO_STAGES,
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
     MAX_BUMP_ATTEMPTS,
@@ -513,16 +514,9 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
-    if sv.rebaseable.actionable:
-        return "rebase"
-    if sv.reviewable.actionable:
-        return "review"
-    if sv.red_ci.actionable:
-        return "fix-ci"
-    if sv.needs_fix.actionable:
-        return "fix"
-    if sv.bump.actionable:
-        return "bump"
+    for stage in AUTO_STAGES:
+        if sv.kind(stage).actionable:
+            return stage
     if not sv.roadmap_backpressure:
         return "roadmap"
     return None
