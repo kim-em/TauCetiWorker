@@ -50,7 +50,6 @@ docker compose build
 docker compose run --rm auth gh auth login --git-protocol https
 docker compose run --rm auth codex login --device-auth
 docker compose run --rm auth claude auth login
-docker compose run --rm tauceti ./tauceti doctor
 docker compose up -d
 docker compose logs -f tauceti claude-refresh codex-refresh
 ```

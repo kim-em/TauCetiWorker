@@ -21,7 +21,6 @@ docker compose build
 docker compose run --rm auth gh auth login --git-protocol https
 docker compose run --rm auth codex login --device-auth
 docker compose run --rm auth claude auth login
-docker compose run --rm tauceti ./tauceti doctor
 ```
 
 Start the worker and follow its logs:
@@ -30,6 +29,18 @@ Start the worker and follow its logs:
 docker compose up -d
 docker compose logs -f tauceti claude-refresh codex-refresh
 ```
+
+Starting the deployment also starts the credential refreshers. They copy access-only
+credentials into the volumes mounted by the worker, so they must run before checking
+the worker environment. Once they have started, an optional check is:
+
+```bash
+docker compose run --rm tauceti ./tauceti doctor
+```
+
+Codex and Claude credentials should report `[ok]`. Missing `bubble`, `incus`, and `pi`
+are expected for the standard host-mode deployment; they are only needed for Bubble
+sandboxing or the DeepSeek and MiniMax agents.
 
 ## Operations
 
