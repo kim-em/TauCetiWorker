@@ -70,6 +70,23 @@ def fake_survey(next_stage="review"):
     _f = tc.roadmap_only()  # mirror survey()'s sanitization: None → "auto"
     sv.roadmap_only = "auto" if _f is None else (_f or "any")
     sv.roadmap_skip = tc.roadmap_skip()
+    sv._mine_open_prs = [
+        tc.PRInfo(
+            number=200 + n,
+            head_oid="x",
+            head_ref="roadmap/x",
+            head_owner="o",
+            head_repo="r",
+            is_draft=False,
+            mergeable="MERGEABLE",
+            author="me",
+            build_success=True,
+            build_failed=False,
+            labels=("roadmap/algebra" if n < tc.MAX_OPEN_PRS else "roadmap/topology",),
+        )
+        for n in range(tc.MAX_OPEN_PRS + 1)
+    ]
+    sv.rescope_roadmap()
     sv.next_auto_stage = next_stage
     return sv
 
@@ -126,6 +143,8 @@ async def test_dashboard():
         await pilot.pause(0.1)
         check("only picker set env area to topology", os.environ.get("TAUCETI_ROADMAP_ONLY") == "topology")
         check("roadmap row area updated immediately (no stale redraw)", app.sv.roadmap_only == "topology")
+        check("roadmap row count rescoped immediately", app.sv.n_mine_open == 1)
+        check("roadmap row backpressure rescoped immediately", app.sv.roadmap_backpressure is False)
 
         # a digit jumps the cursor to that kind and launches a one-round follow-up (then exits)
         await pilot.press("2")

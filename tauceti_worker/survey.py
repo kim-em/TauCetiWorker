@@ -65,9 +65,22 @@ class Counters:
 
 BUILD_FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"}
 
-TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 \{[^}]*\}-->")
+TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 (\{[^}]*\})-->")
 
 TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
+
+
+def target_marker_focuses(body: str) -> tuple[str, ...]:
+    """Concrete roadmap focuses in target markers; all/auto are scopes, not roadmap area names."""
+    focuses: set[str] = set()
+    for match in TARGET_MARKER_RE.finditer(body):
+        try:
+            focus = json.loads(match.group(1)).get("focus")
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if isinstance(focus, str) and focus not in ("", "any", "auto"):
+            focuses.add(focus)
+    return tuple(sorted(focuses))
 
 
 @dataclass(frozen=True)
@@ -84,6 +97,7 @@ class PRInfo:
     build_failed: bool
     author_is_bot: bool = False  # a GitHub App / bot author (e.g. the review bot's bump PRs)
     title: str = ""
+    target_focuses: tuple[str, ...] = ()  # synchronous fallback while the derived roadmap label is pending
     labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
 
     @staticmethod
@@ -103,6 +117,7 @@ class PRInfo:
         return PRInfo(
             number=d["number"],
             title=d.get("title", ""),
+            target_focuses=target_marker_focuses(d.get("body", "")),
             head_oid=d.get("headRefOid", ""),
             head_ref=d.get("headRefName", ""),
             head_owner=head_owner,
@@ -160,6 +175,9 @@ class Survey:
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
+    # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
+    # run is the number of our open, non-draft roadmap PRs that belong to that run's selected areas,
+    # not the number of every PR we have open across the project.
     n_mine_open: int = 0
     roadmap_backpressure: bool = False
     next_auto_stage: str | None = None
@@ -184,6 +202,12 @@ class Survey:
     # the scoreboard not yet posted. (pr, reason) for a one-line status note.
     fix_waiting: list[tuple[int, str]] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        # Retained only so the TUI's live roadmap dials can rescope without another GitHub fetch.
+        # This is intentionally not a dataclass field: `status --json` uses asdict() and should not
+        # duplicate the worker's PRs in its public payload.
+        self._mine_open_prs: list[PRInfo] = []
+
     def kind(self, name: str) -> WorkKind:
         return {
             "rebase": self.rebaseable,
@@ -192,6 +216,12 @@ class Survey:
             "fix-ci": self.red_ci,
             "bump": self.bump,
         }[name]
+
+    def rescope_roadmap(self) -> None:
+        """Recompute authoring pressure after roadmap-only/skip changes, including live TUI dials."""
+        self.n_mine_open = roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
+        self.roadmap_backpressure = self.n_mine_open >= MAX_OPEN_PRS
+        self.next_auto_stage = _next_auto_stage(self)
 
     def status_label_line(self) -> str:
         """One-line breakdown of open non-draft PRs by status label: 'N label (M mine), N label (M),
@@ -244,6 +274,40 @@ def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tu
     ]
     unlabeled = sum(1 for p in nondraft if not any(label in p.labels for label in STATUS_LABELS))
     return buckets, unlabeled
+
+
+def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
+    """Count open roadmap PRs in the current authoring scope.
+
+    ``only`` is the survey's normalized value: a concrete area, ``auto`` (a random eligible area
+    will be selected later), or ``any`` (all eligible areas). For a concrete area, only its exact
+    ``roadmap/<area>`` focus counts and --roadmap-only wins over an overlapping skip. Derived area
+    labels are authoritative when present; a concrete synchronous target-marker focus
+    is the fallback during label lag. ``roadmap/none`` is not roadmap work, while an Unknown label
+    or an unresolved ``roadmap/`` branch counts in every scope so the safety limit cannot fail open.
+    A PR is counted once.
+    """
+
+    def focuses(p: PRInfo) -> set[str] | None:
+        labels = {label for label in p.labels if label.startswith("roadmap/")}
+        areas = labels - {"roadmap/", "roadmap/none", "roadmap/Unknown"}
+        if areas:
+            return {label.removeprefix("roadmap/") for label in areas}
+        if "roadmap/Unknown" in labels:
+            return None
+        if "roadmap/none" in labels:
+            return set()
+        if p.target_focuses:
+            return set(p.target_focuses)
+        if not labels and p.head_ref.startswith("roadmap/"):
+            return None  # roadmap work whose area is unknown: count conservatively in every scope
+        return set()
+
+    if only not in ("", "any", "auto"):
+        return sum((areas := focuses(p)) is None or only in areas for p in prs)
+
+    skipped = set(skip)
+    return sum((areas := focuses(p)) is None or bool(areas - skipped) for p in prs)
 
 
 def spread_candidates(candidates: list, rng=random) -> list:
@@ -334,6 +398,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             [
                 "number",
                 "title",
+                "body",
                 "headRefOid",
                 "headRefName",
                 "headRepositoryOwner",
@@ -358,13 +423,14 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
     # bot automation — a bot-authored PR whose head branch lives in the base repo (the review bot's
     # bump PRs). Requiring the head in-repo keeps the worker off a fork or an external/unrelated bot's
     # branch (which it either can't push to, or shouldn't touch); a human contributor's PR is neither
-    # ours nor a first-party bot's, so it is left alone. Roadmap backpressure still counts only `mine`:
-    # it bounds how many PRs WE author, which a bot's PRs don't.
+    # ours nor a first-party bot's, so it is left alone. Roadmap backpressure counts only the part of
+    # `mine` identified with this run's selected area(s), conservatively including unresolved roadmap
+    # PRs: it bounds what WE author in that scope, and a bot's PR never consumes our capacity.
     tended = [p for p in nondraft if p.author == me_login or (p.author_is_bot and p.head_owner == TAUCETI_OWNER)]
     sv.n_open_nondraft = len(nondraft)
     sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
-    sv.n_mine_open = len(mine)
-    sv.roadmap_backpressure = len(mine) >= MAX_OPEN_PRS
+    sv._mine_open_prs = mine
+    sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
     sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login)

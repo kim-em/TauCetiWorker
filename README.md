@@ -141,6 +141,12 @@ To stay out of areas other contributors are working on, exclude them with
 `x` key): skipped areas drop out of the random pick and the all-areas case.
 `--roadmap-only` wins if it names a skipped area.
 
+The open-PR backpressure limit follows that same roadmap scope. A pinned area counts only your open
+PRs identified for that area; an all/auto run counts roadmap PRs in all non-skipped areas. Drafts,
+non-roadmap PRs, and PRs for roadmaps outside the selected scope do not consume its authoring limit.
+An open roadmap PR whose area is temporarily unknown counts conservatively in every scope until its
+area label is resolved.
+
 To adapt compatible material from an existing local Git repository directory or Git repository URL,
 leave the roadmap phase enabled, pin one area, then pass it with `--source`:
 

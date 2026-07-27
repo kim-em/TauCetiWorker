@@ -171,7 +171,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
                 return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
     if want(opts.only, "roadmap"):
         if sv.roadmap_backpressure:
-            raise NoProgress(f"roadmap: {sv.n_mine_open} open PRs (>= {MAX_OPEN_PRS}) — backpressure, not authoring")
+            raise NoProgress(
+                f"roadmap: {sv.n_mine_open} open PRs in selected scope "
+                f"(>= {MAX_OPEN_PRS}) — backpressure, not authoring"
+            )
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
         if rc is not None:
             return rc

@@ -52,7 +52,7 @@ def _roadmap_note(sv: Survey, esc=lambda s: s) -> tuple[str, str]:
     skip_note = f"  (skip: {esc(', '.join(sv.roadmap_skip))})" if sv.roadmap_skip else ""
     only = esc(sv.roadmap_only)
     if sv.roadmap_backpressure:
-        return "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open  (only: {only}){skip_note}"
+        return "⛔", f"backpressure: {sv.n_mine_open}/{MAX_OPEN_PRS} open in scope  (only: {only}){skip_note}"
     return "∞", f"only: {only}{skip_note}"
 
 
@@ -559,6 +559,7 @@ def _dashboard_app(cfg, loader=None):
             self._only_set_by_user = True
             if self.sv is not None:  # keep the roadmap row in step with the status bar immediately
                 self.sv.roadmap_only = roadmap_only() or "any"
+                self.sv.rescope_roadmap()
             self._save_prefs()
             self._render()
 
@@ -587,6 +588,7 @@ def _dashboard_app(cfg, loader=None):
             self._skip_set_by_user = True
             if self.sv is not None:  # keep the roadmap row in step with the status bar immediately
                 self.sv.roadmap_skip = roadmap_skip()
+                self.sv.rescope_roadmap()
             self._save_prefs()
             self._render()
 
