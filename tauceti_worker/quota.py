@@ -1024,7 +1024,11 @@ class Quota:
         if prov.available or not prov.bootstrap_eligible:
             return prov  # nothing to do, or something other than an initializable idle window blocks
         windows = list(prov.pending_bootstrap)
-        held, why = self._reserve_bootstrap(windows)
+        # Freeze the identity across reserve/request/settle. A request can cross a wall-clock period
+        # boundary (or credential lookup can transiently fail); recomputing would orphan the original
+        # in-progress claim and record its outcome against a different episode.
+        episode_keys = [self._episode_key(w) for w in windows]
+        held, why = self._reserve_bootstrap(episode_keys)
         if not held:
             return self._reannotate(prov, windows, why)
         log(
@@ -1032,7 +1036,7 @@ class Quota:
             f"bootstrap request to open it"
         )
         ok, detail = self._claude_bootstrap_request()
-        self._settle_bootstrap(windows, ok, detail)
+        self._settle_bootstrap(episode_keys, ok, detail)
         self._forget_raw("claude")  # whatever we cached predates the request meant to change it
         if not ok:
             log(f"claude quota: bootstrap request failed ({detail}) — claude stays unavailable")
@@ -1080,7 +1084,8 @@ class Quota:
                 self._store_raw("claude", payload, fp, valid_until)
         else:
             readings = _claude_readings(payload)
-        return self._claude_provider(readings, self._idle_notes(readings)), readings
+        notes, bootstrap_recorded = self._idle_notes(readings)
+        return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded), readings
 
     def _cached_claude(self, fp: str | None) -> dict | None:
         """A cached usage payload, or None when it must not be served. Validity is BOTH conditions:
@@ -1095,7 +1100,13 @@ class Quota:
             return None
         return payload
 
-    def _claude_provider(self, readings: list[Reading], notes: dict[str, str] | None = None) -> Provider:
+    def _claude_provider(
+        self,
+        readings: list[Reading],
+        notes: dict[str, str] | None = None,
+        *,
+        bootstrap_recorded: bool = False,
+    ) -> Provider:
         """Both windows always gate: a window we cannot read blocks exactly as hard as one that is
         exhausted. `notes` supplies the bootstrap phase for idle windows.
 
@@ -1114,7 +1125,10 @@ class Quota:
         avail = bool(wins) and all(w.status == STATUS_UNDER_PACE for w in wins)
         idle = [w.name for w in wins if w.status == STATE_IDLE]
         others_ok = all(w.status == STATUS_UNDER_PACE for w in wins if w.status != STATE_IDLE)
-        eligible = bool(idle) and others_ok and _idle_init_block() is None
+        # A live ledger record means this episode already has a request in flight or completed. Keep
+        # the parent loop asleep as well as refusing the launch-stage reservation: otherwise it would
+        # repeatedly pay for a deep GitHub survey only to discover the same reservation again.
+        eligible = bool(idle) and others_ok and not bootstrap_recorded and _idle_init_block() is None
         return Provider(
             "claude",
             avail,
@@ -1143,12 +1157,13 @@ class Quota:
         return Provider("claude", False, None, wins, prov.error, prov.next_eligible, prov.retry_after, False, [])
 
     # --- the bounded post-reset bootstrap -----------------------------------
-    def _idle_notes(self, readings: list[Reading]) -> dict[str, str]:
+    def _idle_notes(self, readings: list[Reading]) -> tuple[dict[str, str], bool]:
         """What to say about each idle window, given what the shared ledger remembers about this idle
         episode. These are the states an operator needs to tell apart: nothing tried yet (and whether
         their own pace curve is what forbids trying), a request that went through but whose window
         still isn't reporting, and a request that failed outright."""
         notes = {}
+        recorded = False
         ledger = self._read_bootstrap_ledger()
         for r in readings:
             if r.state != STATE_IDLE:
@@ -1156,13 +1171,15 @@ class Quota:
             rec = ledger.get(self._episode_key(r.window))
             if not isinstance(rec, dict):
                 notes[r.window] = _idle_phrase(r)
-            elif rec.get("state") == "in-progress":
+                continue
+            recorded = True
+            if rec.get("state") == "in-progress":
                 notes[r.window] = "bootstrap in progress (another worker holds the reservation)"
             elif rec.get("ok"):
                 notes[r.window] = "bootstrap attempted; awaiting fresh usage"
             else:
                 notes[r.window] = f"bootstrap failed: {rec.get('detail') or 'unknown error'}"
-        return notes
+        return notes, recorded
 
     # The reservation lives beside the CREDENTIALS, not under state/<worker-id>/: every worker measuring
     # the same Claude account must contend for the same record, including workers with isolated $HOMEs
@@ -1226,9 +1243,11 @@ class Quota:
             ledger.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(lockpath, os.O_CREAT | os.O_WRONLY, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
-            yield ledger
         except OSError:
             yield None
+            return
+        try:
+            yield ledger
         finally:
             if fd is not None:
                 try:
@@ -1259,7 +1278,7 @@ class Quota:
                 live[key] = rec
         return live
 
-    def _reserve_bootstrap(self, windows: list[str]) -> tuple[bool, str]:
+    def _reserve_bootstrap(self, episode_keys: list[str]) -> tuple[bool, str]:
         """Claim the right to make ONE bootstrap request for these windows, BEFORE making it.
 
         The reservation is written and fsynced under an exclusive lock, so a crash between the claim and
@@ -1270,8 +1289,8 @@ class Quota:
             if ledger is None:
                 return False, "bootstrap reservation unavailable (cannot lock the shared ledger)"
             live = self._read_bootstrap_ledger()
-            for w in windows:
-                rec = live.get(self._episode_key(w))
+            for key in episode_keys:
+                rec = live.get(key)
                 if isinstance(rec, dict):
                     if rec.get("state") == "in-progress":
                         return False, "bootstrap in progress (another worker holds the reservation)"
@@ -1279,22 +1298,22 @@ class Quota:
                         return False, "bootstrap attempted; awaiting fresh usage"
                     return False, f"bootstrap failed: {rec.get('detail') or 'unknown error'}"
             claimed = dict(live)
-            for w in windows:
-                claimed[self._episode_key(w)] = {"state": "in-progress", "at": int(time.time())}
+            for key in episode_keys:
+                claimed[key] = {"state": "in-progress", "at": int(time.time())}
             try:
                 _write_json_atomic(ledger, claimed)  # temp file + fsync + atomic rename
             except OSError as e:
                 return False, f"bootstrap reservation unavailable (cannot record it: {e})"
         return True, ""
 
-    def _settle_bootstrap(self, windows: list[str], ok: bool, detail: str) -> None:
+    def _settle_bootstrap(self, episode_keys: list[str], ok: bool, detail: str) -> None:
         """Replace the in-progress reservation with its outcome."""
         with self._bootstrap_lock() as ledger:
             if ledger is None:
                 return  # the reservation expires on its own; we never re-request while it is live
             records = self._read_bootstrap_ledger()
-            for w in windows:
-                records[self._episode_key(w)] = {
+            for key in episode_keys:
+                records[key] = {
                     "state": "done",
                     "at": int(time.time()),
                     "ok": bool(ok),

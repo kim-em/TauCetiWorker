@@ -223,6 +223,7 @@ check("the failure is reported verbatim", reason(p), "session bootstrap failed: 
 p = q.authorize_claude_launch()
 check("...and is not retried for the same episode", boot.calls, 1)
 check("...with the diagnosis preserved", reason(p), "session bootstrap failed: claude exited 1: Rate limit exceeded")
+check("...and the parent loop no longer schedules doomed surveys", p.bootstrap_eligible, False)
 
 # --- PACE POLICY ----------------------------------------------------------------------------------
 # A curve that holds the budget at 0 through 90% of a window forbids opening one: the request would
