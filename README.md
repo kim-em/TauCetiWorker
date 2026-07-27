@@ -54,6 +54,12 @@ docker compose up -d
 docker compose logs -f tauceti claude-refresh codex-refresh
 ```
 
+Pass normal worker arguments to restrict its phases or roadmap area, for example:
+
+```bash
+TAUCETI_WORKER_ARGS="--only fix,fix-ci,roadmap --roadmap-only CombinatorialHeegaardFloer" docker compose up -d
+```
+
 See the [Docker deployment guide](docs/docker.md) for requirements, updates, storage,
 credential handling, and security details.
 
