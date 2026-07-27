@@ -43,6 +43,8 @@ you what's missing.
 
 From the repository root:
 
+> If `docker compose` is unavailable, use `docker-compose` in the commands below.
+
 ```bash
 docker compose build
 docker compose run --rm auth gh auth login --git-protocol https

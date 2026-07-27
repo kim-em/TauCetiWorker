@@ -5,7 +5,7 @@ Code for an unattended Linux host.
 
 ## Requirements
 
-- Docker with Compose v2
+- Docker with Compose v2, either as `docker compose` or the standalone `docker-compose`
 - At least 8 GB of RAM for Lean builds
 - Roughly 25 GB of free disk for the image, toolchain, and Mathlib cache
 - GitHub access plus Codex and Claude subscription credentials
@@ -14,7 +14,7 @@ Code for an unattended Linux host.
 
 Run these commands from the repository root. Follow the prompts from each login
 command; the temporary setup containers are removed, while credentials remain in
-named volumes.
+named volumes. If `docker compose` is unavailable, replace it with `docker-compose`.
 
 ```bash
 docker compose build
