@@ -26,6 +26,7 @@ keys = [
     "TAUCETI_AUTHORING_CLAUDE_MODEL",
     "TAUCETI_AUTHORING_CLAUDE_EFFORT",
     "TAUCETI_CODEX_MODEL",
+    "TAUCETI_AUTHORING_DEEPSEEK_EFFORT",
 ]
 saved_env = {k: os.environ.get(k) for k in keys}
 for key in keys:
@@ -34,8 +35,8 @@ for key in keys:
 try:
     codex = tc.resolve_authoring_profile("codex")
     claude = tc.resolve_authoring_profile("claude")
-    check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-sol", "high"))
-    check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-4-6", "high"))
+    check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-terra", "high"))
+    check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
 
     os.environ["TAUCETI_AUTHORING_CODEX_MODEL"] = "env-model"
     os.environ["TAUCETI_AUTHORING_CODEX_EFFORT"] = "medium"
@@ -62,6 +63,14 @@ try:
     except tc.Die:
         unsafe_rejected = True
     check("effort is safe to forward as a Codex config value", unsafe_rejected, True)
+
+    os.environ["TAUCETI_AUTHORING_DEEPSEEK_EFFORT"] = "high"
+    try:
+        tc.resolve_authoring_profile("deepseek")
+        openrouter_effort_rejected = False
+    except tc.Die:
+        openrouter_effort_rejected = True
+    check("OpenRouter effort env fails clearly instead of poisoning loop children", openrouter_effort_rejected, True)
 
     try:
         tc.cmd_work(

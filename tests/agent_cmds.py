@@ -31,9 +31,8 @@ check(
     [
         "codex",
         "exec",
-        "--ignore-user-config",
         "--model",
-        "gpt-5.6-sol",
+        "gpt-5.6-terra",
         "-c",
         'model_reasoning_effort="high"',
         "--sandbox",
@@ -47,7 +46,7 @@ a, env = tc.host_agent_argv(P, "claude")
 check(
     "claude",
     a,
-    ["claude", "-p", P, "--model", "claude-opus-4-6", "--effort", "high", "--dangerously-skip-permissions"],
+    ["claude", "-p", P, "--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"],
 )
 assert "ANTHROPIC_API_KEY" not in env, "claude env must drop ANTHROPIC_API_KEY (bills the Max plan)"
 print("[OK ] claude env drops ANTHROPIC_API_KEY")
@@ -90,9 +89,9 @@ try:
         (host_home / ".codex").mkdir()
         (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-sol"\n')
         tc.agents._host_home = lambda: host_home
-        check("Codex default ignores host config", tc.agents._codex_model(), "gpt-5.6-sol")
+        check("Codex default ignores host model selection", tc.agents._codex_model(), "gpt-5.6-terra")
         (host_home / ".codex" / "config.toml").write_text("not valid [")
-        check("invalid host config is irrelevant", tc.agents._codex_model(), "gpt-5.6-sol")
+        check("invalid host model config is irrelevant", tc.agents._codex_model(), "gpt-5.6-terra")
         os.environ["TAUCETI_CODEX_MODEL"] = "operator-model"
         check("bubble Codex model operator override", tc.agents._codex_model(), "operator-model")
 finally:
@@ -117,7 +116,7 @@ check(
         "-p",
         P,
         "--model",
-        "claude-opus-4-6",
+        "claude-opus-5",
         "--effort",
         "high",
         "--dangerously-skip-permissions",
@@ -128,7 +127,7 @@ a, _ = tc.host_agent_argv(P, "claude")
 check(
     "claude override blank falls back",
     a,
-    ["claude", "-p", P, "--model", "claude-opus-4-6", "--effort", "high", "--dangerously-skip-permissions"],
+    ["claude", "-p", P, "--model", "claude-opus-5", "--effort", "high", "--dangerously-skip-permissions"],
 )
 tc.agents.CLAUDE_CMD = _saved
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

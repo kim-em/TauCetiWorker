@@ -88,6 +88,8 @@ def resolve_authoring_profile(
         model, model_source = default_model, "repository default"
 
     env_effort = (os.environ.get(effort_env) or "").strip() or None
+    if provider in OPENROUTER_MODELS and (cli_effort or env_effort):
+        raise Die(f"authoring effort is not supported for OpenRouter agent {provider}")
     if cli_effort:
         effort, effort_source = cli_effort, "--author-effort"
     elif env_effort:
@@ -179,7 +181,9 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
-        argv = ["codex", "exec", "--ignore-user-config", "--model", profile.model]
+        # Explicit model/effort flags are authoritative while preserving unrelated operator config
+        # such as enterprise model providers, MCP servers, and notification hooks.
+        argv = ["codex", "exec", "--model", profile.model]
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
         argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
@@ -574,7 +578,7 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
         effort_config = f'model_reasoning_effort="{profile.effort}"'
         effort = f" -c {shlex.quote(effort_config)}" if profile.effort else ""
         return (
-            "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --ignore-user-config "
+            "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec "
             f"--model {shlex.quote(profile.model)}{effort} "
             '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
         )
@@ -683,7 +687,13 @@ def run_in_bubble(
     import shlex
 
     cfg, wm = w.cfg, opts.work_model
-    profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm)
+    # Review/probe commands bring their own model policy. Do not let an unrelated authoring override
+    # (including a malformed effort value) prevent those isolated commands from running.
+    profile = (
+        getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm)
+        if inner_cmd is None
+        else None
+    )
     cred_model = cred_model or wm
     # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
     # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
@@ -734,7 +744,7 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
-    command_inner = inner_cmd or agent_inner_cmd(profile)
+    command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
         command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
     command = f"{tcenv} {command_inner}"

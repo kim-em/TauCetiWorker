@@ -164,9 +164,9 @@ the worker doesn't avoid your own side's claims. This is on by default and is co
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex (`gpt-5.6-sol`, high) preferred; Claude (`claude-opus-4-6`, high) fallback | subscription, paced |
-| `codex` | `gpt-5.6-sol`, high effort | subscription, paced |
-| `claude` | `claude-opus-4-6`, high effort | subscription, paced |
+| `auto` (default) | Codex (`gpt-5.6-terra`, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
+| `codex` | `gpt-5.6-terra`, high effort | subscription, paced |
+| `claude` | `claude-opus-5`, high effort | subscription, paced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
@@ -396,8 +396,8 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
-| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` / `high` | Codex authoring profile. Host user configuration is deliberately ignored. |
-| `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-4-6` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-terra` / `high` | Codex authoring profile. Explicit model/effort override those fields while unrelated host configuration remains available. |
+| `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin. Independent of authoring configuration; unset preserves the review engine's own default/fallback. |
 | `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`; it no longer changes review policy. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
