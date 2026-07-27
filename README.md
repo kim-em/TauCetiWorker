@@ -177,8 +177,8 @@ the worker doesn't avoid your own side's claims. This is on by default and is co
 
 | `--agent` | Model | Billing |
 | --- | --- | --- |
-| `auto` (default) | Codex (`gpt-5.6-terra`, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
-| `codex` | `gpt-5.6-terra`, high effort | subscription, paced |
+| `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
+| `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
 | `claude` | `claude-opus-5`, high effort | subscription, paced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
@@ -195,6 +195,15 @@ above. Host and bubble execution receive the same resolved profile, and every
 authoring launch prints its effective provider, model, effort, and sandbox. A
 generic authoring override is rejected with `--agent auto`, because the model or
 effort may not apply to the provider quota selection chooses.
+
+The committed Codex authoring profile defaults to `gpt-5.6-sol`. Before the real
+authoring task, the worker makes a tiny read-only Sol access probe and caches the
+result for one hour for that worker and ChatGPT account. Only two structured
+400/403/404 model-access rejections select `gpt-5.6-terra`; rate limits, server
+errors, context errors, malformed output, and ordinary failures pause the round
+without downgrading. The real authoring prompt is always executed exactly once.
+An explicit `--author-model`, `TAUCETI_AUTHORING_CODEX_MODEL`, or legacy
+`TAUCETI_CODEX_MODEL` is a pin and bypasses the probe and fallback.
 
 ### Where it runs: the host, or `--bubble`
 
@@ -409,7 +418,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
-| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-terra` / `high` | Codex authoring profile. Explicit model/effort override those fields while unrelated host configuration remains available. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. Explicit model/effort override those fields while unrelated host configuration remains available; an explicit model disables automatic fallback. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin. Independent of authoring configuration; unset preserves the review engine's own default/fallback. |
 | `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`; it no longer changes review policy. |
@@ -455,8 +464,8 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 - `tauceti`: a small PEP 723 `uv` shim ([PEP 723](https://peps.python.org/pep-0723/)) so
   `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
   `tauceti` console script (`tauceti_worker.cli:cli_main`).
-- `scripts/`: `claim.sh`, `git-safe-push`, `gh-safe-pr-create`. The agents run
-  these on `PATH` inside a round, so they stay shell. `oauth_refresh_loop.py` and
+- `scripts/`: `claim.sh`, `git-safe-push`, and `gh-safe-pr-create`. These are
+  placed on the agents' `PATH` inside a round. `oauth_refresh_loop.py` and
   `docker-entrypoint` support the Docker deployment. (The wheel bundles this directory
   into the package.)
 - `Dockerfile` and `compose.yaml`: the unattended, persistent Docker deployment.

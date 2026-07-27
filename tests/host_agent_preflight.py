@@ -41,6 +41,7 @@ for model in ("codex", "claude", "deepseek", "minimax"):
     launcher_bin = tc.host_agent_argv("", model)[0][0]
     check(f"fix {model} -> host_agent_argv argv[0]", wu._host_agent_binary("fix", model), launcher_bin)
 check("fix deepseek -> PI_RUN", wu._host_agent_binary("fix", "deepseek"), tc.PI_RUN)
+check("default fix codex preflights underlying CLI", wu._host_agent_binary("fix", "codex"), "codex")
 
 # A custom claude wrapper: the preflight must target the wrapper, not bare `claude`, or it would
 # false-block a working launcher (or miss a broken one).
@@ -106,6 +107,16 @@ try:
     check("missing codex -> stage NOT run (no counter bump)", runs["n"], 0)
     check("missing codex -> warned red once", len(warns), 1)
     check("NoProgress names the binary + PATH", ("codex" in msg and "PATH" in msg), True)
+
+    # The default authoring profile's fallback machinery must not mask the underlying Codex preflight.
+    reset()
+    raised = False
+    try:
+        wu.dispatch("fix", None, None, CAND, opts())
+    except tc.NoProgress:
+        raised = True
+    check("default fix with missing codex -> NoProgress before probe", raised, True)
+    check("default fix with missing codex -> stage NOT run", runs["n"], 0)
 
     # 2) host + binary PRESENT -> proceeds to the stage, no warning.
     wu.shutil.which = lambda name: f"/usr/bin/{name}"

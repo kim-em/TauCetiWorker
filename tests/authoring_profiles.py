@@ -35,8 +35,17 @@ for key in keys:
 try:
     codex = tc.resolve_authoring_profile("codex")
     claude = tc.resolve_authoring_profile("claude")
-    check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-terra", "high"))
+    check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-sol", "high"))
+    check("committed Codex fallback", codex.fallback_model, "gpt-5.6-terra")
     check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
+    default_host, _ = tc.host_agent_argv("PROMPT", codex)
+    default_bubble = tc.agent_inner_cmd(codex)
+    check("default Codex host launch is direct", default_host[:3], ["codex", "exec", "--model"])
+    check("default Codex host launch prefers Sol", "gpt-5.6-sol" in default_host, True)
+    check("default Codex host launch carries one model", "gpt-5.6-terra" in default_host, False)
+    check("default Codex bubble launch is direct", "codex exec" in default_bubble, True)
+    check("default Codex bubble launch prefers Sol", "--model gpt-5.6-sol" in default_bubble, True)
+    check("default Codex bubble launch carries one model", "gpt-5.6-terra" in default_bubble, False)
 
     os.environ["TAUCETI_AUTHORING_CODEX_MODEL"] = "env-model"
     os.environ["TAUCETI_AUTHORING_CODEX_EFFORT"] = "medium"
@@ -50,12 +59,16 @@ try:
 
     cli_profile = tc.resolve_authoring_profile("codex", cli_model="cli-model", cli_effort="xhigh")
     check("CLI overrides environment", (cli_profile.model, cli_profile.effort), ("cli-model", "xhigh"))
+    check("explicit model disables automatic fallback", cli_profile.fallback_model, None)
 
     os.environ.pop("TAUCETI_AUTHORING_CODEX_MODEL")
     os.environ["TAUCETI_CODEX_MODEL"] = "legacy-author"
     legacy = tc.resolve_authoring_profile("codex")
     check("legacy variable remains authoring fallback", legacy.model, "legacy-author")
     check("legacy variable does not pin review", tc._codex_review_model_override("codex"), None)
+    check("legacy authoring model disables automatic fallback", legacy.fallback_model, None)
+    os.environ.pop("TAUCETI_CODEX_MODEL")
+    os.environ.pop("TAUCETI_AUTHORING_CODEX_EFFORT")
 
     try:
         tc.resolve_authoring_profile("codex", cli_effort='high"\nmodel="surprise')
@@ -90,8 +103,10 @@ try:
     bubble = tc.agent_inner_cmd(cli_profile)
     check("host carries exact model", host[host.index("--model") + 1], "cli-model")
     check("host carries exact effort", 'model_reasoning_effort="xhigh"' in host, True)
+    check("explicit host model remains direct", host[0], "codex")
     check("bubble carries exact model", "--model cli-model" in bubble, True)
     check("bubble carries exact effort", "model_reasoning_effort" in bubble and "xhigh" in bubble, True)
+    check("explicit bubble model remains direct", "codex-author" in bubble, False)
 
     # Loop parent pins the exact resolved profile into its isolated _round child.
     captured = []
@@ -126,6 +141,35 @@ try:
         captured[captured.index("--author-model") : captured.index("--author-model") + 4],
         ["--author-model", "claude-custom", "--author-effort", "max"],
     )
+
+    # The default Codex profile remains fallback-eligible after the loop parent pins Sol into its child.
+    captured.clear()
+    tc.loop.choose_model = lambda *_a, **_k: ("codex", {})
+    tc.loop.github_budget = lambda: {}
+    tc.loop.run_round_subprocess = capture
+    try:
+        args = SimpleNamespace(
+            ignore_quota=False,
+            bubble=False,
+            quota_cmd=None,
+            source=None,
+            author_model=None,
+            author_effort=None,
+        )
+        tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="codex")
+    finally:
+        tc.loop.choose_model = saved_choose
+        tc.loop.github_budget = saved_budget
+        tc.loop.run_round_subprocess = saved_round
+    check(
+        "loop child retains default Codex fallback provenance",
+        captured[captured.index("--resolved-author-fallback-model") - 2 :],
+        ["--author-effort", "high", "--resolved-author-fallback-model", "gpt-5.6-terra"],
+    )
+    child_profile = tc.resolve_authoring_profile(
+        "codex", cli_model="gpt-5.6-sol", resolved_fallback_model="gpt-5.6-terra"
+    )
+    check("loop child restores fallback eligibility", child_profile.fallback_model, "gpt-5.6-terra")
 finally:
     for key, value in saved_env.items():
         if value is None:

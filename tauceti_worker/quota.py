@@ -892,6 +892,12 @@ class Quota:
                 return None
         return None
 
+    def codex_account_fingerprint(self) -> str | None:
+        """Stable, non-secret cache identity for the Codex account currently used by this worker."""
+        auth = self._codex_creds() or {}
+        tok = auth.get("tokens") or {}
+        return self._fingerprint(self._codex_account_id(auth) or tok.get("access_token"))
+
     def codex(self, *, refresh: bool = False) -> Provider:
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         auth = self._codex_creds()

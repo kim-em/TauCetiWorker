@@ -152,6 +152,11 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="authoring reasoning effort for an explicit --agent; overrides the provider-specific environment default",
     )
     p.add_argument(
+        "--resolved-author-fallback-model",
+        default=None,
+        help=argparse.SUPPRESS,  # internal loop-parent -> isolated _round provenance handoff
+    )
+    p.add_argument(
         "--bubble",
         action="store_true",
         help="run the agent inside the bubble sandbox — its own container, TauCeti-scoped "
@@ -442,6 +447,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         )
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
+    resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)
     if (author_model or author_effort) and agent == "auto":
         raise Die("--author-model/--author-effort require an explicit --agent; auto may choose another provider")
     if author_effort and agent in OPENROUTER_MODELS:
@@ -541,6 +547,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
                 work_model,
                 cli_model=author_model,
                 cli_effort=author_effort,
+                resolved_fallback_model=resolved_author_fallback_model,
             )
         gh = GitHub()
         w = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), ctx, Claims(cfg, ctx))

@@ -32,7 +32,7 @@ check(
         "codex",
         "exec",
         "--model",
-        "gpt-5.6-terra",
+        "gpt-5.6-sol",
         "-c",
         'model_reasoning_effort="high"',
         "--sandbox",
@@ -41,6 +41,8 @@ check(
         P,
     ],
 )
+assert "OPENAI_API_KEY" not in env, "codex env must drop OPENAI_API_KEY (bills the ChatGPT plan)"
+print("[OK ] codex env drops OPENAI_API_KEY")
 
 a, env = tc.host_agent_argv(P, "claude")
 check(
@@ -87,11 +89,11 @@ try:
     with tempfile.TemporaryDirectory() as td:
         host_home = Path(td)
         (host_home / ".codex").mkdir()
-        (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+        (host_home / ".codex" / "config.toml").write_text('model = "gpt-5.6-luna"\n')
         tc.agents._host_home = lambda: host_home
-        check("Codex default ignores host model selection", tc.agents._codex_model(), "gpt-5.6-terra")
+        check("Codex default ignores host model selection", tc.agents._codex_model(), "gpt-5.6-sol")
         (host_home / ".codex" / "config.toml").write_text("not valid [")
-        check("invalid host model config is irrelevant", tc.agents._codex_model(), "gpt-5.6-terra")
+        check("invalid host model config is irrelevant", tc.agents._codex_model(), "gpt-5.6-sol")
         os.environ["TAUCETI_CODEX_MODEL"] = "operator-model"
         check("bubble Codex model operator override", tc.agents._codex_model(), "operator-model")
 finally:

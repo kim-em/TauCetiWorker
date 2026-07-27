@@ -23,6 +23,7 @@ from .agents import (
     host_agent_argv,
     prepare_checkout,
     resolve_authoring_profile,
+    resolve_codex_model_access,
     review_in_bubble,
     run_agent_host,
     run_in_bubble,
@@ -262,14 +263,18 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    profile = _effective_authoring_profile(opts) if stage != "review" else None
+    needs_codex_probe = bool(profile and profile.provider == "codex" and profile.fallback_model)
     # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
     # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
     # review engine rejects `--reviewer codex` and do_review counts it as a PER-PR review error — so a
     # machine-wide outage marches PRs one-by-one to the "needs a human" escalation cap. Catch it HERE,
     # before launch, as a loud self-healing pause (NoProgress ⇒ backoff, no counter bump): every PR
     # would hit the identical failure, so it must not be charged to any single PR's error budget.
-    if not bubble:
-        binname = _host_agent_binary(stage, opts.work_model)
+    # A default Codex authoring round also makes its read-only entitlement probe on the host before
+    # entering Bubble, against the same mirrored subscription credential. Explicit Codex pins bypass it.
+    if not bubble or needs_codex_probe:
+        binname = "codex" if needs_codex_probe else _host_agent_binary(stage, opts.work_model)
         if binname and shutil.which(binname) is None:
             warn_red(
                 f"agent '{opts.work_model}' needs the `{binname}` CLI on PATH, but it is not "
@@ -278,6 +283,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 f"the worker's PATH and the loop resumes on its own."
             )
             raise NoProgress(f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host")
+    if needs_codex_probe:
+        # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
+        # checkout-independent and the selected profile is then consumed exactly once by either backend.
+        opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
     # LAUNCH STAGE for a Claude round selected on an unopened window. Everything the bootstrap decision
     # requires is true exactly here and not earlier: a concrete work unit is in hand, the survey (and so
     # the GitHub preflight) succeeded, Claude is the model actually about to run, and the agent binary

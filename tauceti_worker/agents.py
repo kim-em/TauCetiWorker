@@ -4,6 +4,7 @@ argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolati
 from __future__ import annotations
 
 import functools
+import json
 import os
 import re
 import shutil
@@ -11,17 +12,19 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
-from .config import Config, Die, log
+from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
     CLAUDE_CMD,
+    CODEX_AUTHORING_FALLBACK_MODEL,
+    CODEX_MODEL_ACCESS_TTL,
     OPENROUTER_MODELS,
     PI_RUN,
     REVIEW,
@@ -32,6 +35,7 @@ from .constants import (
 from .github import me
 from .paths import HERE
 from .quota import (
+    Quota,
     _claude_keychain_creds_interactive,
     _read_json_file,
     _safe_exists,
@@ -52,10 +56,15 @@ class AuthoringProfile:
     effort: str | None
     model_source: str
     effort_source: str
+    fallback_model: str | None = None
 
 
 def resolve_authoring_profile(
-    provider: str, *, cli_model: str | None = None, cli_effort: str | None = None
+    provider: str,
+    *,
+    cli_model: str | None = None,
+    cli_effort: str | None = None,
+    resolved_fallback_model: str | None = None,
 ) -> AuthoringProfile:
     """Resolve CLI > provider environment > committed default, without user CLI config.
 
@@ -65,6 +74,7 @@ def resolve_authoring_profile(
 
     cli_model = cli_model.strip() if cli_model else None
     cli_effort = cli_effort.strip() if cli_effort else None
+    resolved_fallback_model = resolved_fallback_model.strip() if resolved_fallback_model else None
     key = provider.upper()
     model_env = f"TAUCETI_AUTHORING_{key}_MODEL"
     effort_env = f"TAUCETI_AUTHORING_{key}_EFFORT"
@@ -101,17 +111,207 @@ def resolve_authoring_profile(
         raise Die(f"authoring model for {provider} must not be empty")
     if effort and not re.fullmatch(r"[A-Za-z0-9._-]+", effort):
         raise Die(f"authoring effort for {provider} contains unsupported characters: {effort!r}")
-    return AuthoringProfile(provider, model, effort, model_source, effort_source)
+    fallback_model = None
+    if provider == "codex":
+        if resolved_fallback_model:
+            # Internal loop-child handoff: the parent already resolved whether its model was a default
+            # (eligible for fallback) or an operator pin. Without this provenance, pinning the resolved
+            # Sol model into the child would accidentally turn the default into an explicit override.
+            fallback_model = resolved_fallback_model
+        elif model_source == "repository default" and model == AUTHORING_DEFAULTS["codex"][0]:
+            fallback_model = CODEX_AUTHORING_FALLBACK_MODEL
+    return AuthoringProfile(provider, model, effort, model_source, effort_source, fallback_model)
 
 
 def _authoring_profile(value: AuthoringProfile | str) -> AuthoringProfile:
     return value if isinstance(value, AuthoringProfile) else resolve_authoring_profile(value)
 
 
+_CODEX_MODEL_ERROR_STATUSES = {400, 403, 404}
+_CODEX_MODEL_ERROR_MESSAGE = re.compile(
+    r"not supported when using codex"
+    r"|does not exist or you do not have access"
+    r"|(?:no|do not have) access to (?:this )?model"
+    r"|model[_ ]not[_ ]found|model metadata for .*? not found"
+    r"|unsupported model|invalid model|unknown model"
+    r"|model .*?not entitled|not entitled to (?:this |use )?model",
+    re.I,
+)
+_CODEX_MODEL_ACCESS_PROMPT = "Reply with exactly OK. Do not use tools."
+
+
+def _codex_error_details(transcript: str) -> tuple[int | None, str | None]:
+    """Parse Codex JSONL's terminal HTTP status/message; never classify raw transcript text."""
+    failed_payload = error_payload = None
+    for line in transcript.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "turn.failed":
+            error = event.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                failed_payload = error["message"]
+        elif kind and ("error" in kind or "failed" in kind):
+            if error_payload is None and isinstance(event.get("message"), str):
+                error_payload = event["message"]
+
+    for payload in (failed_payload, error_payload):
+        if not isinstance(payload, str):
+            continue
+        try:
+            decoded = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(decoded, dict):
+            continue
+        error = decoded.get("error")
+        error = error if isinstance(error, dict) else {}
+        status = decoded.get("status", error.get("status"))
+        if isinstance(status, bool):
+            status = None
+        elif isinstance(status, str) and status.lstrip("-").isdigit():
+            status = int(status)
+        if not isinstance(status, int):
+            status = None
+        message = error.get("message") or decoded.get("message")
+        return status, message if isinstance(message, str) else None
+    return None, None
+
+
+def _codex_model_unavailable(returncode: int, transcript: str) -> bool:
+    """Only a structured client rejection naming model access confirms an entitlement miss."""
+    if returncode == 0:
+        return False
+    status, message = _codex_error_details(transcript)
+    return bool(
+        status in _CODEX_MODEL_ERROR_STATUSES
+        and isinstance(message, str)
+        and _CODEX_MODEL_ERROR_MESSAGE.search(message)
+    )
+
+
+def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[str]:
+    """Make one read-only, ephemeral request that cannot mutate the authoring checkout."""
+    cfg.state.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.pop("OPENAI_API_KEY", None)  # authoring is subscription-paced; probe that same account
+    env.pop("ANTHROPIC_API_KEY", None)
+    command = [
+        "codex",
+        "exec",
+        "--json",
+        "--model",
+        model,
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        _CODEX_MODEL_ACCESS_PROMPT,
+    ]
+    try:
+        return subprocess.run(
+            command,
+            cwd=cfg.state,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+    except OSError as error:
+        raise NoProgress(f"codex model-access probe could not launch: {error}") from error
+    except subprocess.TimeoutExpired as error:
+        raise NoProgress("codex model-access probe timed out after 120s; not launching authoring") from error
+
+
+def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -> NoProgress:
+    status, message = _codex_error_details(result.stdout or "")
+    detail = message or (result.stderr or "").strip()[-1000:] or f"exit {result.returncode}"
+    status_text = f"HTTP {status}: " if status is not None else ""
+    return NoProgress(
+        f"codex model-access probe for {model} failed without confirming subscription unavailability "
+        f"({status_text}{detail}); not launching authoring"
+    )
+
+
+def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
+    """Resolve a default Sol profile to Sol or Terra before the real task runs.
+
+    Explicit model pins have no fallback and bypass this probe. A confirmed result is cached per worker
+    and account; failures that might be transient are never cached and never cause a downgrade.
+    """
+    fallback = profile.fallback_model
+    if profile.provider != "codex" or not fallback:
+        return profile
+
+    fp = Quota(cfg).codex_account_fingerprint()
+    cache_path = cfg.quota_cache / "codex-model-access.json"
+    cached = _read_json_file(cache_path) or {}
+    fetched_at = cached.get("fetched_at")
+    age_ok = (
+        isinstance(fetched_at, (int, float))
+        and not isinstance(fetched_at, bool)
+        and time.time() - fetched_at <= CODEX_MODEL_ACCESS_TTL
+    )
+    if (
+        fp is not None
+        and cached.get("fp") == fp
+        and cached.get("primary_model") == profile.model
+        and cached.get("fallback_model") == fallback
+        and age_ok
+        and isinstance(cached.get("available"), bool)
+    ):
+        available = cached["available"]
+    else:
+        first = _codex_model_probe(cfg, profile.model)
+        if first.returncode == 0:
+            available = True
+        elif _codex_model_unavailable(first.returncode, first.stdout or ""):
+            # Reconfirm entitlement before persisting a downgrade. Both probes are trivial, read-only,
+            # and checkout-independent; the real authoring prompt is still executed exactly once.
+            second = _codex_model_probe(cfg, profile.model)
+            if second.returncode == 0:
+                available = True
+            elif _codex_model_unavailable(second.returncode, second.stdout or ""):
+                available = False
+            else:
+                raise _codex_probe_failure(profile.model, second)
+        else:
+            raise _codex_probe_failure(profile.model, first)
+
+        if fp is not None:
+            cfg.quota_cache.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(
+                cache_path,
+                {
+                    "fetched_at": int(time.time()),
+                    "fp": fp,
+                    "primary_model": profile.model,
+                    "fallback_model": fallback,
+                    "available": available,
+                },
+            )
+
+    if available:
+        return replace(profile, fallback_model=None)
+    log(f"codex: {profile.model} is unavailable to this subscription; using {fallback}")
+    return replace(profile, model=fallback, model_source="subscription fallback", fallback_model=None)
+
+
 # Agents — prompt filling, the host checkout, and the agent launch. The host argv lists are a frozen
 # contract — keep them byte-for-byte stable (the historical `( cd … ) 9>&-` and `env -u` shell
 # mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh / git-safe-push /
-# gh-safe-pr-create are put on the agent's PATH so it can push.
+# gh-safe-pr-create are put on the agent's PATH.
 # ============================================================================
 
 
@@ -183,6 +383,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
         # such as enterprise model providers, MCP servers, and notification hooks.
+        env.pop("OPENAI_API_KEY", None)  # Codex rounds are paced against ChatGPT subscription usage
         argv = ["codex", "exec", "--model", profile.model]
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
@@ -578,8 +779,7 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
         effort_config = f'model_reasoning_effort="{profile.effort}"'
         effort = f" -c {shlex.quote(effort_config)}" if profile.effort else ""
         return (
-            "env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec "
-            f"--model {shlex.quote(profile.model)}{effort} "
+            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {shlex.quote(profile.model)}{effort} "
             '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
         )
     if profile.provider in OPENROUTER_MODELS:

@@ -137,10 +137,15 @@ AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek"
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
 # Review models are configured separately by the review engine.
+CODEX_AUTHORING_FALLBACK_MODEL = "gpt-5.6-terra"
+# A model entitlement normally changes only when an account's subscription changes. Keep the
+# side-effect-free access probe out of every round while still noticing an upgrade promptly.
+CODEX_MODEL_ACCESS_TTL = 3600
 AUTHORING_DEFAULTS = {
-    # Terra is available to every Codex subscription tier; Sol remains an explicit opt-up for
-    # eligible paid accounts. Pin Claude to the current exact Opus generation, not its moving alias.
-    "codex": ("gpt-5.6-terra", "high"),
+    # Prefer flagship Sol for authoring. A cached preflight probe selects Terra only when Codex confirms
+    # that this repository default is unavailable to the current subscription.
+    # Pin Claude to the current exact Opus generation, not its moving alias.
+    "codex": ("gpt-5.6-sol", "high"),
     "claude": ("claude-opus-5", "high"),
 }
 

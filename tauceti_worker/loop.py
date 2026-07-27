@@ -179,10 +179,13 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     cli_effort=getattr(args, "author_effort", None),
                 )
                 # Pin the exact parent-resolved profile into the isolated child. The
-                # child must not re-read a different HOME or upstream CLI default.
+                # child must not re-read a different HOME or upstream CLI default. Preserve fallback
+                # provenance separately: --author-model alone looks like an operator pin to the child.
                 tail += ["--author-model", profile.model]
                 if profile.effort:
                     tail += ["--author-effort", profile.effort]
+                if profile.fallback_model:
+                    tail += ["--resolved-author-fallback-model", profile.fallback_model]
             if bubble:
                 tail.append("--bubble")
             source = getattr(args, "source", None)
