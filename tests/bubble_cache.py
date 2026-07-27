@@ -36,9 +36,17 @@ build_i = bootstrap.index("lake build")
 agent_i = bootstrap.index("exec " + inner)
 check("cache/build/agent order", mathlib_i < tauceti_i < build_i < agent_i)
 check("TauCeti cache uses the canonical repository", f"--repo {tc.TAUCETI}" in bootstrap)
-check("agent inherits Lake restore settings", "LAKE_RESTORE_ARTIFACTS=true" in bootstrap)
-check("public config selects the named service", 'cache.defaultService = "tauceti-public"' in tc.TAUCETI_CACHE_CONFIG)
-check("public config uses only the allowed host", tc.TAUCETI_CACHE_CONFIG.count(tc.TAUCETI_CACHE_DOMAIN) == 2)
+check("Bubble, not the bootstrap, supplies Lake config", "LAKE_CONFIG" not in bootstrap)
+check("Bubble, not the bootstrap, supplies Lake restore settings", "LAKE_RESTORE_ARTIFACTS" not in bootstrap)
+
+saved_help = tc.agents._bubble_open_help
+try:
+    tc.agents._bubble_open_help = lambda: "  --lake-cache-service NAME ARTIFACT_URL REVISION_URL"
+    check("exact Bubble cache flag is detected", tc.bubble_supports_lake_cache_service())
+    tc.agents._bubble_open_help = lambda: "  --lake-cache-service-url URL"
+    check("similarly prefixed Bubble flag is not accepted", not tc.bubble_supports_lake_cache_service())
+finally:
+    tc.agents._bubble_open_help = saved_help
 
 
 # Execute the bootstrap against a fake `lake`, so the tests pin the failure semantics rather than just
@@ -122,8 +130,8 @@ finally:
     shutil.rmtree(cache_home, ignore_errors=True)
 
 
-# Exercise run_in_bubble through its no-side-effect echo path to pin which rounds get the egress flag
-# and bootstrap. The normal credential mirror/model launch happens after this early return.
+# Exercise run_in_bubble through its no-side-effect echo path to pin which rounds get the cache
+# capability and bootstrap. The normal credential mirror/model launch happens after this early return.
 tmp = Path(tempfile.mkdtemp())
 cfg = SimpleNamespace(
     state=tmp / "state",
@@ -144,25 +152,60 @@ try:
         rc = tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts)
     work_argv = out.getvalue()
     check("work echo succeeds", rc == 0)
-    check("work round allows only the TauCeti cache host", f"--allow-domain {tc.TAUCETI_CACHE_DOMAIN}" in work_argv)
-    check("work round runs both cache commands", "lake exe cache get" in work_argv and "lake cache get" in work_argv)
-    check(
-        "staged Lake config matches the public config",
-        (cfg.state / "bubble-round" / "lake-cache.toml").read_text() == tc.TAUCETI_CACHE_CONFIG,
+    cache_grant = (
+        f"--lake-cache-service {tc.TAUCETI_CACHE_SERVICE} "
+        f"{tc.TAUCETI_CACHE_ARTIFACT_URL} {tc.TAUCETI_CACHE_REVISION_URL}"
     )
+    check("work round grants the TauCeti download cache", cache_grant in work_argv)
+    check("work round does not expose the upstream domain directly", "--allow-domain" not in work_argv)
+    check("work round runs both cache commands", "lake exe cache get" in work_argv and "lake cache get" in work_argv)
+    check("work round stages no competing Lake config", not (cfg.state / "bubble-round" / "lake-cache.toml").exists())
 
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         rc = tc.run_in_bubble(w, tc.TAUCETI, "", opts, inner_cmd="true", cred_model="claude")
     review_argv = out.getvalue()
     check("review/probe echo succeeds", rc == 0)
-    check("review/probe does not add cache egress", "--allow-domain" not in review_argv)
+    check("review/probe does not add a cache capability", "--lake-cache-service" not in review_argv)
     check("review/probe command is not wrapped in a build", "lake exe cache get" not in review_argv)
 finally:
     os.environ.pop("TAUCETI_AGENT_ECHO", None)
     tc.agents.ensure_bubble_home = saved_home
     tc.agents._bubble_pop = saved_pop
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+# A real work round must fail in preflight, before a model is launched, when the installed Bubble lacks
+# the host-global Lake cache capability. Review-only rounds intentionally do not need it.
+saved_have = tc.cli._have
+saved_disposable = tc.cli.bubble_cmd_is_disposable
+saved_version = tc.cli.installed_bubble_version
+saved_push = tc.cli.bubble_supports_allow_push
+saved_cache = tc.cli.bubble_supports_lake_cache_service
+saved_proxy = tc.cli.ensure_fork_proxy_current
+try:
+    tc.cli._have = lambda _tool: True
+    tc.cli.bubble_cmd_is_disposable = lambda: False
+    tc.cli.installed_bubble_version = lambda: tc.BUBBLE_MIN_VERSION
+    tc.cli.bubble_supports_allow_push = lambda: True
+    tc.cli.bubble_supports_lake_cache_service = lambda: False
+    tc.cli.ensure_fork_proxy_current = lambda: (_ for _ in ()).throw(
+        AssertionError("cache capability failure must precede auth-proxy refresh")
+    )
+    work_opts = tc.RoundOpts(only=["fix"], agent="claude", work_model="claude", sandbox_host=False, dry_run=False)
+    try:
+        tc.cli.preflight(SimpleNamespace(), work_opts)
+        cache_blocked = False
+    except tc.Die as exc:
+        cache_blocked = "--lake-cache-service" in str(exc)
+    check("preflight rejects work rounds without the cache capability", cache_blocked)
+finally:
+    tc.cli._have = saved_have
+    tc.cli.bubble_cmd_is_disposable = saved_disposable
+    tc.cli.installed_bubble_version = saved_version
+    tc.cli.bubble_supports_allow_push = saved_push
+    tc.cli.bubble_supports_lake_cache_service = saved_cache
+    tc.cli.ensure_fork_proxy_current = saved_proxy
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

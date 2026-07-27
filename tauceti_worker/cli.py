@@ -21,12 +21,17 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from .agents import (
+    BUBBLE_MIN_VERSION,
+    BUBBLE_REPO,
     bubble_cmd_is_disposable,
-    bubble_supports_allow_domain,
     bubble_supports_allow_push,
+    bubble_supports_lake_cache_service,
+    bubble_version_meets_minimum,
     ensure_fork_proxy_current,
+    installed_bubble_version,
     isolate_home,
     run_in_bubble,
 )
@@ -36,7 +41,9 @@ from .config import (
     NoProgress,
     acquire_slot,
     auto_assign_wid,
+    is_git_url,
     log,
+    roadmap_only,
     sanitize_wid,
     set_log_file,
     warn_red,
@@ -91,7 +98,7 @@ environment (flags win; see README.md for the full list):
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% <= elapsed%); see --pace
   TAUCETI_STREAM=1       same as --stream
-  CLAUDE_CONFIG_DIR      Claude config/credential dir the pacer and bubble seeding use
+  CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
 """
 
@@ -159,6 +166,15 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_ONLY "
         "unset) to pick a fresh random area each round. Overrides "
         "$TAUCETI_ROADMAP_ONLY for this run",
+    )
+    p.add_argument(
+        "--source",
+        default=None,
+        metavar="PATH_OR_URL",
+        help="supplementary source material from a local Git repository directory or Git repository URL "
+        "(checked-out/default HEAD) for a new roadmap PR. Requires the roadmap phase to be enabled and "
+        "one specific --roadmap-only area; the source is mounted read-only in bubble mode and treated "
+        "as non-definitive reference material",
     )
     p.add_argument(
         "--roadmap-skip",
@@ -281,6 +297,35 @@ def resolve_agent(args) -> str:
     return getattr(args, "agent", None) or os.environ.get("TAUCETI_AGENT") or "auto"
 
 
+def resolve_source(args, only: list[str]) -> str | None:
+    """Validate and resolve --source after CLI roadmap overrides have reached the environment.
+
+    A source is meaningful only when this invocation may author a roadmap PR and the target is pinned
+    to one concrete roadmap area. Other phases may remain enabled: they simply ignore the source.
+    Resolving it here also gives loop children a stable absolute path even if their cwd differs.
+    """
+    raw = getattr(args, "source", None)
+    if raw is None:
+        return None
+    if only and "roadmap" not in only:
+        raise SystemExit("--source requires the 'roadmap' phase to be enabled")
+    area = roadmap_only()
+    if area is None or area.strip().lower() in ("", "any", "auto"):
+        raise SystemExit("--source requires a single roadmap area (use --roadmap-only AREA)")
+    if not raw.strip():
+        raise SystemExit("--source value must not be empty")
+    if is_git_url(raw):
+        return raw
+    source = Path(raw).expanduser().resolve()
+    if not source.exists():
+        raise SystemExit(f"--source is neither a Git repository URL nor an existing Git repository directory: {source}")
+    if not source.is_dir():
+        raise SystemExit(f"--source local path must name a directory: {source}")
+    if subprocess.run(["git", "-C", str(source), "rev-parse", "--git-dir"], capture_output=True, text=True).returncode:
+        raise SystemExit(f"--source local directory is not a Git repository: {source}")
+    return str(source)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tauceti",
@@ -383,6 +428,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # live via roadmap_only()). Empty string is a meaningful value: "all areas".
     if getattr(args, "roadmap_only", None) is not None:
         os.environ["TAUCETI_ROADMAP_ONLY"] = args.roadmap_only
+    source = resolve_source(args, only)
+    if source is not None:
+        args.source = source
     # --roadmap-skip likewise overrides the env and is inherited by loop children (read live via
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
@@ -476,6 +524,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             # Either the pacer just selected Claude on an unopened window (one-shot), or the loop did
             # and passed the authorization down (--claude-bootstrap). Same launch-stage gate either way.
             claude_bootstrap=pending_init or getattr(args, "claude_bootstrap", False),
+            source=source,
         )
         if not dry:
             preflight(cfg, opts)
@@ -582,6 +631,17 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "    uv tool install git+https://github.com/kim-em/bubble.git\n"
             "  or set $TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
         )
+    if uses_bubble and not opts.dry_run:
+        bubble_version = installed_bubble_version()
+        if not bubble_version_meets_minimum(bubble_version):
+            found = bubble_version or "unreadable"
+            raise Die(
+                f"preflight: --bubble needs Bubble {BUBBLE_MIN_VERSION} or newer; found {found}. "
+                "Older versions do not fail closed when a requested Lake cache service cannot be "
+                "configured. Update the stable install with\n"
+                f"    uv tool install --force {BUBBLE_REPO}\n"
+                "  or point $TAUCETI_BUBBLE at an updated stable executable, then re-run."
+            )
     # The worker authors/fixes from the contributor's fork, handing bubble `--allow-push <fork>` for the
     # fork's git access (kim-em/bubble#320). An older cached bubble rejects that flag only AFTER the model
     # launches — a wasted round — so verify support up front (probes `bubble open --help` once).
@@ -592,12 +652,12 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
             "(override the executable with $TAUCETI_BUBBLE)."
         )
     # Work-agent bubble rounds warm both Mathlib's cache and TauCeti's public Lake artifact cache before
-    # launching the model. The latter is hosted on a project-specific R2 domain, so Bubble must support
-    # extending one bubble's network allowlist without broadening its global policy.
-    if uses_fork and not opts.dry_run and not bubble_supports_allow_domain():
+    # launching the model. Require Bubble's host-global download proxy rather than exposing the cache's
+    # public R2 domain directly to the container.
+    if uses_fork and not opts.dry_run and not bubble_supports_lake_cache_service():
         raise Die(
             "preflight: this bubble is too old for TauCeti's Lake artifact cache — it has no "
-            "`--allow-domain`. Install or update Bubble from kim-em/bubble, then re-run "
+            "`--lake-cache-service`. Install or update Bubble from kim-em/bubble, then re-run "
             "(override the executable with $TAUCETI_BUBBLE)."
         )
     # The CLI may advertise --allow-push while an older live daemon keeps rejecting fork pushes (403).

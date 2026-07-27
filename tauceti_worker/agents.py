@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import functools
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -65,22 +67,34 @@ def prepare_checkout(cfg: Config) -> bool:
     return True
 
 
-def fetch_ref(repo: str, dir: Path) -> bool:
-    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+def _fetch_shallow(url: str, dir: Path) -> bool:
+    """Clone or refresh a worker-owned shallow checkout and make its origin fetch-only."""
     if (dir / ".git").is_dir():
         ok = (
             subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"]).returncode == 0
             and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0
         )
-        subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"])
-        return ok
+        clean = subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"]).returncode == 0
+        no_push = subprocess.run(["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]).returncode == 0
+        return ok and clean and no_push
     import shutil
 
     shutil.rmtree(dir, ignore_errors=True)
     dir.parent.mkdir(parents=True, exist_ok=True)
+    cloned = subprocess.run(["git", "clone", "-q", "--depth", "1", "--", url, str(dir)]).returncode == 0
     return (
-        subprocess.run(["git", "clone", "-q", "--depth", "1", f"https://github.com/{repo}", str(dir)]).returncode == 0
+        cloned and subprocess.run(["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]).returncode == 0
     )
+
+
+def fetch_ref(repo: str, dir: Path) -> bool:
+    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+    return _fetch_shallow(f"https://github.com/{repo}", dir)
+
+
+def fetch_git_source(url: str, dir: Path) -> bool:
+    """Clone or refresh a worker-owned shallow snapshot of a source Git repository."""
+    return _fetch_shallow(url, dir)
 
 
 def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
@@ -170,18 +184,14 @@ def _shq(s: str) -> str:
 # crosses the boundary. The in-container agent invocation is a frozen contract (see agent_inner_cmd).
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
+BUBBLE_MIN_VERSION = "0.7.29"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
 TAUCETI_CACHE_DOMAIN = "pub-1825e93d97ca45b2a98d9ad45a5972f8.r2.dev"
-TAUCETI_CACHE_CONFIG = f"""cache.defaultService = "tauceti-public"
-
-[[cache.service]]
-name = "tauceti-public"
-kind = "s3"
-artifactEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/artifacts"
-revisionEndpoint = "https://{TAUCETI_CACHE_DOMAIN}/revisions"
-"""
+TAUCETI_CACHE_SERVICE = "tauceti-public"
+TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
+TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
 
 
 def bubble_cmd() -> list[str]:
@@ -212,10 +222,11 @@ def bubble_supports_allow_push() -> bool:
     return "--allow-push" in _bubble_open_help()
 
 
-def bubble_supports_allow_domain() -> bool:
-    """Does the resolved bubble support the per-bubble `--allow-domain` extension? TauCeti's Lake
-    artifact cache lives on its own public R2 host, outside Bubble's built-in Lean allowlist."""
-    return "--allow-domain" in _bubble_open_help()
+def bubble_supports_lake_cache_service() -> bool:
+    """Does the resolved Bubble support its host-global, download-only Lake cache proxy?"""
+    import re
+
+    return re.search(r"(?<![\w-])--lake-cache-service(?=[\s=,]|$)", _bubble_open_help()) is not None
 
 
 def _host_home() -> Path:
@@ -245,6 +256,23 @@ def _bubble_version(cmd: list[str]) -> str:
         return ""
     match = re.search(r"\bversion\s+([^\s,]+)", (result.stdout or result.stderr or ""))
     return match.group(1) if result.returncode == 0 and match else ""
+
+
+def installed_bubble_version() -> str:
+    """Return the version of the exact stable Bubble command this worker would execute."""
+    return _bubble_version(bubble_cmd())
+
+
+def bubble_version_meets_minimum(version: str, minimum: str = BUBBLE_MIN_VERSION) -> bool:
+    """Compare stable three-component Bubble versions without adding a packaging dependency."""
+    import re
+
+    pattern = r"(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?"
+    found = re.fullmatch(pattern, version)
+    required = re.fullmatch(pattern, minimum)
+    if found is None or required is None:
+        return False
+    return tuple(map(int, found.groups()[:3])) >= tuple(map(int, required.groups()[:3]))
 
 
 def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_version: str | None = None) -> bool:
@@ -432,13 +460,18 @@ def ensure_bubble_home(cfg: Config) -> dict:
     return env
 
 
+def _uses_claude_credentials(work_model: str) -> bool:
+    """Keep Bubble's Claude credential flag and macOS private-seed decision on one predicate."""
+    return work_model != "codex" and work_model not in OPENROUTER_MODELS
+
+
 def agent_cred_flags(work_model: str) -> list[str]:
     """Bubble flags seeding ONLY the work model's credential; all config and other models' creds stay out."""
     if work_model == "codex":
         return ["--codex-credentials", "--no-codex-config", "--no-claude-credentials", "--no-claude-config"]
-    if work_model in OPENROUTER_MODELS:
-        return ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
-    return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+    if _uses_claude_credentials(work_model):
+        return ["--claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+    return ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
 
 
 def _codex_model() -> str:
@@ -491,17 +524,15 @@ def bubble_work_cmd(inner: str) -> str:
 
     Bubble's noninteractive `--command` mode deliberately does not run a hook-generated build, so do
     both cache fetches explicitly: Mathlib's `lake exe cache`, then Lake's built-in cache for TauCeti's
-    own outputs. Keep a Lake-cache miss and the preliminary build non-fatal: fix/fix-ci/bump/rebase
-    rounds often start from a red tree, and repairing it is the agent's job. A Mathlib-cache failure is
-    fatal because compiling Mathlib would consume the round. The exports remain in the environment
-    inherited by the agent, so later `lake build`s restore from the same per-round cache too.
+    own outputs. Bubble's login shell supplies `MATHLIB_CACHE_GET_URL` and the generated user-level Lake
+    cache config for the host-global proxy. Keep a Lake-cache miss and the preliminary build non-fatal:
+    fix/fix-ci/bump/rebase rounds often start from a red tree, and repairing it is the agent's job. A
+    Mathlib-cache failure is fatal because compiling Mathlib would consume the round.
     """
     return (
         "set -e; "
-        "export LAKE_CONFIG=/opt/round/lake-cache.toml LAKE_ARTIFACT_CACHE=true "
-        "LAKE_RESTORE_ARTIFACTS=true; "
         "lake exe cache get || lake exe cache get; "
-        f"if ! lake cache get --service tauceti-public --repo {TAUCETI}; then "
+        f"if ! lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}; then "
         "echo 'warning: TauCeti Lake cache miss; building missing outputs' >&2; "
         "fi; "
         "if ! timeout 1800 lake build; then "
@@ -515,30 +546,52 @@ def _bubble_pop(cfg: Config, env: dict) -> None:
     subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
 
 
-def _ensure_claude_creds_for_bubble(cfg: Config) -> None:
-    """bubble seeds the in-container claude from <CLAUDE_CONFIG_DIR>/.credentials.json (it can't read the
-    macOS Keychain). On Linux that file is the store, so leave it to bubble. On macOS, where Claude Code
-    keeps creds in the Keychain, write the credential INTO the configured dir from the Keychain, every
-    round: the Keychain is authoritative and may hold a token rotated by a host claude since we last
-    wrote, and re-mirroring it keeps both the access AND refresh token current (a stale refresh token in
-    an unexpired-looking mirror would fail mid-round). The read is interactive (unlock if locked). The
-    pacer reads the Keychain directly (keychain-first), so it never refreshes this mirror. If the Keychain
-    can't be read but a credentials file already exists, fall back to it; otherwise Die."""
+def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
+    """Return a private Claude config dir for one macOS Bubble launch, or ``None`` off macOS.
+
+    Bubble seeds the in-container Claude from ``<CLAUDE_CONFIG_DIR>/.credentials.json`` but cannot read
+    the macOS Keychain. The Keychain is authoritative and may hold tokens rotated since the prior round,
+    so read it interactively and write the current blob into a mode-0700 temporary directory owned by the
+    worker. ``run_in_bubble`` exposes that directory only through the Bubble subprocess environment and
+    removes it after the container exits. In particular, never create or overwrite the operator's
+    configured credential file: a persistent Keychain snapshot can later shadow the live Keychain in a
+    host review process. If the Keychain is unavailable, copy an existing configured credential file into
+    the private directory as the same fallback the old in-place handoff provided.
+
+    The caller owns and must remove the returned directory."""
     if sys.platform != "darwin":
-        return  # Linux/Windows: the file is the store; bubble seeds it (or reports none)
-    f = claude_dir(cfg.home) / ".credentials.json"
+        return None  # Linux/Windows: the configured file is the store; Bubble reads it directly
+    cfg.state.mkdir(parents=True, exist_ok=True)
+    # A SIGKILL bypasses both finally and RoundContext's signal/atexit cleanup. Bound the lifetime and
+    # number of those orphaned snapshots by removing them before the next staging attempt.
+    for stale in cfg.state.glob("bubble-claude-seed-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+
+    source = claude_dir(cfg.home) / ".credentials.json"
     blob = _claude_keychain_creds_interactive()
-    if blob and blob.get("claudeAiOauth"):
-        f.parent.mkdir(parents=True, exist_ok=True)
-        _write_json_atomic(f, blob)  # 0600, temp + atomic rename (no partial-read or perms window)
-        return
-    if (_read_json_file(f) or {}).get("claudeAiOauth"):
-        return  # Keychain unreadable but a credentials file exists; let bubble use it
-    raise Die(
-        "no Claude credentials to seed the bubble: none in "
-        f'{f} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
-        "the Keychain and retry, or drop --bubble (the host claude reads the Keychain itself)."
-    )
+    if not (blob or {}).get("claudeAiOauth"):
+        blob = _read_json_file(source)
+        if (blob or {}).get("claudeAiOauth"):
+            expires = blob["claudeAiOauth"].get("expiresAt")
+            expired = (
+                isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires <= time.time() * 1000
+            )
+            suffix = " (access token is already expired)" if expired else ""
+            log(f"claude creds: Keychain unavailable; seeding Bubble from file snapshot {source}{suffix}")
+    if not (blob or {}).get("claudeAiOauth"):
+        raise Die(
+            "no Claude credentials to seed the bubble: none in "
+            f'{source} and could not read the "Claude Code-credentials" login Keychain item. Unlock '
+            "the Keychain and retry, or drop --bubble (the host claude reads the Keychain itself)."
+        )
+
+    seed_dir = Path(tempfile.mkdtemp(prefix="bubble-claude-seed-", dir=cfg.state))
+    try:
+        _write_json_atomic(seed_dir / ".credentials.json", blob)
+    except BaseException:
+        shutil.rmtree(seed_dir, ignore_errors=True)
+        raise
+    return seed_dir
 
 
 def run_in_bubble(
@@ -561,17 +614,15 @@ def run_in_bubble(
     cred_model = cred_model or wm
     # OpenRouter agents run in the bubble: the image ships `pi` and allows openrouter.ai egress
     # (kim-em/bubble#299), and the key is staged 0600 at /opt/round/openrouter.key below.
-    # bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317), reading it
-    # from this subprocess's inherited env, so the in-bubble claude and the pacer agree on the account
-    # with no extra plumbing here.
+    # Bubble honors $CLAUDE_CONFIG_DIR for its own credential seeding (kim-em/bubble#317). On macOS we
+    # replace it in this subprocess env with a private, transient Keychain handoff below; the process-wide
+    # value and any operator-owned credential file remain untouched.
     env = ensure_bubble_home(cfg)
     rounddir = cfg.state / "bubble-round"
-    import shutil
 
     shutil.rmtree(rounddir, ignore_errors=True)
     rounddir.mkdir(parents=True, exist_ok=True)
     (rounddir / "prompt.txt").write_text(prompt)
-    (rounddir / "lake-cache.toml").write_text(TAUCETI_CACHE_CONFIG)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
     for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
@@ -615,9 +666,19 @@ def run_in_bubble(
         command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
     command = f"{tcenv} {command_inner}"
 
-    # Only work-agent rounds compile TauCeti. Review/probe commands remain usable with older Bubble
-    # releases and do not need access to the artifact-cache host.
-    cache_flags = ["--allow-domain", TAUCETI_CACHE_DOMAIN] if inner_cmd is None else []
+    # Only work-agent rounds compile TauCeti. Bubble turns the two immutable public endpoints into
+    # capability-scoped routes through its host-global download cache; the upstream host is not exposed
+    # to the container. Review/probe commands neither compile nor need an artifact-cache capability.
+    cache_flags = (
+        [
+            "--lake-cache-service",
+            TAUCETI_CACHE_SERVICE,
+            TAUCETI_CACHE_ARTIFACT_URL,
+            TAUCETI_CACHE_REVISION_URL,
+        ]
+        if inner_cmd is None
+        else []
+    )
 
     argv = [
         *bubble_cmd(),
@@ -651,11 +712,17 @@ def run_in_bubble(
     # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that
     # never call the pacer). No-op when not isolated or on macOS.
     mirror_creds(cfg)
-    # On macOS, Claude Code keeps creds in the Keychain, not a file; make sure the configured
-    # CLAUDE_CONFIG_DIR holds a current credentials file so bubble can seed it (done after the echo path
-    # so a dry-run never prompts the Keychain).
-    if cred_model == "claude":
-        _ensure_claude_creds_for_bubble(cfg)
+    # On macOS, Claude Code keeps creds in the Keychain, not a file. Stage a current snapshot privately
+    # and override only Bubble's subprocess env (done after the echo path so a dry-run never prompts the
+    # Keychain). Register cleanup before launch for signals; the normal finally removes it promptly too.
+    claude_seed: Path | None = None
+    if _uses_claude_credentials(cred_model):
+        claude_seed = _stage_claude_creds_for_bubble(cfg)
+        if claude_seed is not None:
+            env = {**env, "CLAUDE_CONFIG_DIR": str(claude_seed)}
+            # Register the seed first: RoundContext cleans up LIFO, so the pop registered next runs
+            # before the container's credential source disappears.
+            w.rc.add_cleanup(lambda p=claude_seed: shutil.rmtree(p, ignore_errors=True))
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
@@ -663,7 +730,11 @@ def run_in_bubble(
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode
     finally:
-        _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+        try:
+            _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+        finally:
+            if claude_seed is not None:
+                shutil.rmtree(claude_seed, ignore_errors=True)
     return rc
 
 

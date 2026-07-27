@@ -42,15 +42,8 @@ def _wait_quota_line(snap: dict) -> str:
     windows = prov.windows or []
     idle = [w for w in windows if w.status == "idle"]
     paced = [w for w in windows if w.status in ("at-budget", "over-pace")]
-    other_hard = [
-        w for w in windows if w.status not in ("under-pace", "at-budget", "over-pace", "idle")
-    ]
-    if (
-        not idle
-        or not paced
-        or other_hard
-        or any(w.detail != "window reset; awaiting initialization" for w in idle)
-    ):
+    other_hard = [w for w in windows if w.status not in ("under-pace", "at-budget", "over-pace", "idle")]
+    if not idle or not paced or other_hard or any(w.detail != "window reset; awaiting initialization" for w in idle):
         return line
 
     why = "; ".join(
@@ -160,6 +153,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 tail.append("--claude-bootstrap")
             if bubble:
                 tail.append("--bubble")
+            source = getattr(args, "source", None)
+            if source is not None:
+                tail += ["--source", source]
             rc = run_round_subprocess(tail)
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.

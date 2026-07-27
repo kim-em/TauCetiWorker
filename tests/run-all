@@ -21,6 +21,7 @@ FAIL_FAST=0
 RUN_STDLIB=(
   agent_cmds.py
   bubble_cache.py
+  bubble_version.py
   build_status_rollup.py
   claude_config_dir.py
   claude_keychain.py
@@ -50,6 +51,7 @@ RUN_STDLIB=(
   round_group_sweep.py
   safe_exists.py
   scoreboard_trust.py
+  source_argument.py
   spread_candidates.py
   status_labels.py
 )

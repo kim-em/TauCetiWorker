@@ -10,9 +10,21 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .constants import ROADMAP
 from .paths import HERE
+
+_SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
+
+
+def is_git_url(value: str) -> bool:
+    """Whether value has a URL shape accepted by `git clone` (including scp-style SSH URLs)."""
+    try:
+        scheme = urlsplit(value).scheme.lower()
+    except ValueError:
+        return False
+    return scheme in {"http", "https", "ssh", "git", "file"} or bool(_SCP_GIT_URL_RE.fullmatch(value))
 
 
 def roadmap_only() -> str | None:

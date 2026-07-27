@@ -116,6 +116,20 @@ To stay out of areas other contributors are working on, exclude them with
 `x` key): skipped areas drop out of the random pick and the all-areas case.
 `--roadmap-only` wins if it names a skipped area.
 
+To adapt compatible material from an existing local Git repository directory or Git repository URL,
+leave the roadmap phase enabled, pin one area, then pass it with `--source`:
+
+```bash
+tauceti work --only roadmap --roadmap-only Topology --source ../existing-library
+tauceti work --only roadmap --roadmap-only Topology --source https://github.com/example/library.git
+```
+
+Sources are shallow-cloned at their checked-out/default `HEAD` into worker-owned state and
+refreshed on later rounds. The snapshot is mounted read-only at `/opt/source` in bubble mode.
+It is supplementary:
+the agent is told to prioritize the roadmap as written, then review-quality library
+code, and only then migration of source material compatible with those requirements.
+
 Within an area, roadmap workers also respect finer-grained **claims** registered by other
 contributors on the [intentions board](https://github.com/leanprover-community/intentions):
 an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that someone has
@@ -173,9 +187,10 @@ exits non-zero). Pass `--stream` to watch it live on the terminal instead.
 credential files the official CLIs already maintain (`~/.claude/.credentials.json`,
 `~/.codex/auth.json`) and queries each provider's usage endpoint. It honors
 `$CLAUDE_CONFIG_DIR` for the Claude credentials, so personal/work account switching
-is paced correctly; bubble honors the same var, so it seeds the matching credentials
-into the sandbox too. On macOS, where Claude Code keeps its creds in the login Keychain
-rather than a file, the pacer reads them from the Keychain instead, read-only: it
+is paced correctly. Bubble uses that credential source directly when Claude stores
+credentials in a file; on macOS it receives the Keychain credential through the
+private handoff described below. On macOS, where Claude Code keeps its creds in the
+login Keychain rather than a file, the pacer reads them from the Keychain instead, read-only: it
 never refreshes the Keychain (that would log out your interactive `claude`), so on
 token expiry it just reports Claude unavailable for the cycle, and your next `claude`
 run (interactive, or one `--ignore-quota --agent claude` round) refreshes the
@@ -256,9 +271,10 @@ the container:
 - Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
   `lake exe cache get`, fetches TauCeti's own main-built outputs with `lake cache get`,
   and runs an advisory `lake build` (a red tree still reaches the repair agent). Bubble
-  allows TauCeti's public R2 cache host as the work round's only extra egress domain and
-  fetches both caches into a per-round writable view that is discarded when the container
-  is popped, so an untrusted round can neither poison nor be poisoned by a later one.
+  routes both download-only caches through its host-global proxy, so TauCeti's public R2
+  host is never reachable from inside the container. Its exact revision/content-addressed
+  GET routes are shared across rounds; containers cannot select another origin or upload,
+  while their writable Lake views are still discarded when the container is popped.
 
 The sandbox itself lives at [kim-em/bubble](https://github.com/kim-em/bubble).
 The OpenRouter agents (`--agent deepseek|minimax`) run in the bubble too: the
@@ -290,14 +306,25 @@ up.
 
 On macOS, Claude Code keeps its creds in the login Keychain rather than a file.
 Bubble rounds still work: bubble seeds the in-container `claude` from a
-`.credentials.json`, so when one isn't present `tauceti` writes the credential into
-your `$CLAUDE_CONFIG_DIR` (or `~/.claude`) from the Keychain, refreshing it when it's
-missing or expired (read-only on the Keychain, which is never written; the first
-round unlocks it interactively if it's locked). The pacer reads the Keychain
-directly, so it never refreshes that file and never rotates the shared login token.
+`.credentials.json`, so `tauceti` copies the current credential from the Keychain
+into a private, transient config directory used only by the Bubble subprocess
+(read-only on the Keychain, which is never written; the first round unlocks it
+interactively if it's locked). The directory is removed after the bubble exits, or
+before the next round if the worker was hard-killed; your `$CLAUDE_CONFIG_DIR` (or
+`~/.claude`) is never created or overwritten. The pacer
+reads the Keychain directly and never rotates the shared login token.
 Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
 can't give a host worker its own Claude account there; host-mode multi-worker
 isolation on macOS applies to Codex only.
+
+Worker versions before this private handoff may already have left a Keychain
+snapshot at `.claude/.credentials.json` under your configured Claude directory.
+This version does not delete an existing file because it may be operator-owned. If
+host subscription reviews fail with a 401 while an interactive `claude` still works,
+move that old file aside once so the review can fall back to the live Keychain. A
+headless worker whose Keychain cannot be unlocked still needs a file fallback; point
+`CLAUDE_CONFIG_DIR` at a dedicated directory containing a current
+`.credentials.json` instead of moving away its only credential source.
 
 ## `tauceti work` reference
 
@@ -313,6 +340,7 @@ is in `tauceti work -h`.
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. It is copied into worker state and mounted read-only in bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
@@ -338,7 +366,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential dir the pacer and bubble seeding use (account switching, where the creds live in a file). |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
 | `TAUCETI_CODEX_MODEL` | host's configured model (authoring); engine default `gpt-5.6-sol` (review) | The Codex model for authoring rounds; when set it also pins the Codex **review** model (`TAUCETI_CODEX_MODEL=gpt-5.6-terra tauceti work --only review`), like `DEEPSEEK_MODEL`/`MINIMAX_MODEL`. Left unset, reviews use the engine's default with its automatic `gpt-5.6-terra` fallback for accounts that can't run Sol. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
@@ -363,7 +391,12 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 - Host authoring (the default): an `elan`/`lake` toolchain on the host.
 - The `--bubble` sandbox: a working Incus runtime and a stable Bubble install
   for the host-global auth daemon (for example,
-  `uv tool install git+https://github.com/kim-em/bubble.git`).
+  `uv tool install git+https://github.com/kim-em/bubble.git`). TauCetiWorker
+  requires Bubble 0.7.29 or newer. Bubble 0.7.28 introduced the named Colima
+  Incus SSH target fix and `--lake-cache-service`; 0.7.29 makes an unavailable
+  requested Lake service fail closed. Together with Bubble's automatic Mathlib
+  proxy, this keeps both download streams in the host-global cache without
+  exposing the TauCeti cache host inside the sandbox.
 - The agents you want: `codex` and/or `claude` logged in, and for
   `--agent deepseek|minimax`, an exported `OPENROUTER_API_KEY` (`pi` ships in the
   bubble image; you only need it on the host for host-mode rounds).
