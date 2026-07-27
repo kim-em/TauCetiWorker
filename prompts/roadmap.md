@@ -33,9 +33,9 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 
 ## Verify before pushing (all three MUST pass)
 ```
-lake exe cache get
-lake build
-lake exe axioms
+"${TAUCETI_LAKE:-lake}" exe cache get
+"${TAUCETI_LAKE:-lake}" build
+"${TAUCETI_LAKE:-lake}" exe axioms
 ```
 If `lake build` is red, FIX IT or pick a smaller target. Never push red.
 

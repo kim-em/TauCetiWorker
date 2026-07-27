@@ -26,11 +26,16 @@ from pathlib import Path
 from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
+    _host_shell,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
     bubble_supports_lake_cache_service,
     bubble_version_meets_minimum,
+    configure_host_lake_cache,
     ensure_fork_proxy_current,
+    host_agent_env,
+    host_lake_env,
+    host_login_shell_which,
     installed_bubble_version,
     isolate_home,
     run_in_bubble,
@@ -572,7 +577,11 @@ def cmd_doctor(args) -> int:
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
-    rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
+    lake_path = host_login_shell_which("lake", env={**host_agent_env(), **host_lake_env(cfg)})
+    lake_note = f"host authoring probes `{_host_shell()} -lc`"
+    if lake_path:
+        lake_note += f" → {lake_path}"
+    rows.append(("lake (agent shell)", lake_path is not None, lake_note))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("codex creds", _safe_exists(cfg.home / ".codex" / "auth.json"), "~/.codex/auth.json"))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
@@ -589,7 +598,7 @@ def cmd_doctor(args) -> int:
         mark = "ok " if ok else "MISSING"
         if not ok and name in ("gh", "git", "uv/uvx", "gh auth"):
             bad += 1
-        print(f"  [{mark:7}] {name:14} {note}")
+        print(f"  [{mark:7}] {name:20} {note}")
     return 1 if bad else 0
 
 
@@ -603,11 +612,17 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any((not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s != "review")
-    if needs_host_build and not _have("lake") and not opts.dry_run:
-        raise Die(
-            "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
-            "(or pass --bubble to build inside the sandbox instead)"
-        )
+    if needs_host_build and not opts.dry_run:
+        configure_host_lake_cache(cfg)
+        lake_path = host_login_shell_which("lake", env=host_agent_env())
+        if lake_path is None:
+            raise Die(
+                "preflight: host authoring (the default) needs `lake` in the agent command login shell "
+                f"(`{_host_shell()} -lc`), but the worker's Lake shim cannot resolve a real Lake there. "
+                "Configure Elan for that shell (or pass --bubble to build inside the sandbox instead). "
+                "`tauceti doctor` shows this probe."
+            )
+        os.environ["TAUCETI_REAL_LAKE"] = lake_path
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";
     # catch it here with a pointer to the two ways out.
@@ -685,7 +700,7 @@ def cli_main() -> int:
 def _ensure_scripts_executable() -> None:
     """A wheel install drops the execute bit on the bundled scripts/ wrappers; restore it so the agents
     can run git-safe-push / gh-safe-pr-create / claim.sh on PATH. Cheap and idempotent."""
-    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create"):
+    for f in ("claim.sh", "git-safe-push", "gh-safe-pr-create", "lake", "trusted-run"):
         p = HERE / "scripts" / f
         try:
             if p.exists() and not os.access(p, os.X_OK):

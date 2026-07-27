@@ -51,6 +51,7 @@ TAUCETI = tc.TAUCETI
 # transient hiccup while the authoritative status is green). Binds $b to the list of build state
 # strings; callers append the predicate.
 BUILD_STATES = '([.statusCheckRollup[]? | select(.context=="build") | .state]) as $b '
+BUMP_GUARD_STATES = '([.statusCheckRollup[]? | select(.context=="bump-guard") | .state]) as $g '
 
 
 def jq(data, expr, args=None):
@@ -119,12 +120,13 @@ def run_checks(data, label):
         [p.number for p in prs if is_tended(p) and p.build_failed and not p.head_ref.startswith("bump-mathlib/")],
     )
 
-    # bump: a bump-mathlib PR (bot-authored) whose authoritative build is red.
+    # bump: a bump-mathlib PR whose authoritative build is red and trusted bump validator is green.
     check(
         "bump (bump-mathlib)",
         '.[] | select(.headRefName|startswith("bump-mathlib/")) '
-        "| select(%s | any($b[]; . | IN(%s)))" % (BUILD_STATES, fail_set),
-        [p.number for p in prs if p.head_ref.startswith("bump-mathlib/") and p.build_failed],
+        "| select(%s | any($b[]; . | IN(%s))) "
+        '| select(%s | ($g|length)>0 and (all($g[]; .=="SUCCESS")))' % (BUILD_STATES, fail_set, BUMP_GUARD_STATES),
+        [p.number for p in prs if p.head_ref.startswith("bump-mathlib/") and p.build_failed and p.bump_guard_success],
     )
 
     return fails

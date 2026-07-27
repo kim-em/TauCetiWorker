@@ -17,18 +17,22 @@ from pathlib import Path
 from .agents import (
     _codex_review_model_override,
     fetch_git_source,
+    fetch_host_lake_caches,
     fetch_ref,
     fill_prompt,
     host_agent_argv,
     prepare_checkout,
+    prepare_host_authoring,
     review_in_bubble,
     run_agent_host,
     run_in_bubble,
     run_to_logfile,
+    stage_trusted_base_config,
 )
 from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
     AGENT_NAMES,
+    BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
     MAX_OPEN_PRS,
     OPENROUTER_MODELS,
@@ -68,6 +72,7 @@ class RoundOpts:
     # small claude request to open it — at its LAUNCH STAGE (dispatch), never before there is work.
     claude_bootstrap: bool = False
     source: str | None = None  # local directory or Git URL used read-only by a single-area roadmap PR
+    host_prepared: bool = False  # dispatch warmed this round's immutable origin/main + caches
 
     @property
     def agent_name(self) -> str:
@@ -262,6 +267,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 f"the worker's PATH and the loop resumes on its own."
             )
             raise NoProgress(f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host")
+        # Warm trusted current-main artifacts before entering a semantic authoring stage. This is a
+        # machine-wide checkout/cache prerequisite, so a failure must stop here — before do_fix* charges
+        # this PR's attempt counters or any model is launched. Host review never compiles.
+        if stage != "review" and not opts.host_prepared:
+            prepare_host_authoring(w.cfg)
+            opts.host_prepared = True
     # LAUNCH STAGE for a Claude round selected on an unopened window. Everything the bootstrap decision
     # requires is true exactly here and not earlier: a concrete work unit is in hand, the survey (and so
     # the GitHub preflight) succeeded, Claude is the model actually about to run, and the agent binary
@@ -464,45 +475,86 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
 
 
 def _do_fixlike(
-    w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool, *, prompt_file: str, label: str
+    w: Worker,
+    sv: Survey,
+    c: Candidate,
+    opts: RoundOpts,
+    bubble: bool,
+    *,
+    prompt_file: str,
+    label: str,
+    attempt_keys: tuple[str, ...] = (),
 ) -> int | None:
     """Shared shape for fix / fix-ci / rebase: take the branch claim, then run the agent against the PR
     branch — in bubble (it checks out the PR inside the container) or on the host checkout."""
     pr, head = c.pr, c.head
+    charged = False
+
+    def charge_attempt() -> None:
+        nonlocal charged
+        if not charged:
+            for key in attempt_keys:
+                w.counters.incr(key)
+            charged = True
+
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
         raise Die(f"{label}: PR #{pr} vanished from the survey")
+    is_bump_branch = p.head_ref.startswith(BUMP_HEAD_PREFIX)
+    if is_bump_branch and not getattr(p, "bump_guard_success", False):
+        raise NoProgress(
+            f"{label} #{pr}: trusted bump-guard is not green, so CI has not authorized these pins for execution"
+        )
     # Deleted/unavailable head: with the head repo gone, there is nowhere to push the fix and bubble
     # can't check the PR out. Skip to the next candidate rather than build a `https://github.com//`
     # remote or an `allow_push="/"` (a fork head deletes to empty fields in PRInfo.from_json).
     if not (p.head_owner and p.head_repo and p.head_ref):
+        charge_attempt()
         log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
         return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
     prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name)
     if bubble:
+        charge_attempt()
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
         rc = run_in_bubble(
             w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
         )  # bubble checks out the PR inside
     else:
-        if not prepare_checkout(w.cfg):
-            log(f"checkout failed for #{pr} — skipping this attempt")
-            return 1
+        if not getattr(opts, "host_prepared", False):
+            prepare_host_authoring(w.cfg)
+            opts.host_prepared = True
         co = w.cfg.checkout
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
         chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
         if chk.returncode:
+            charge_attempt()
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head
+        if is_bump_branch and checked != head:
+            raise NoProgress(
+                f"{label} #{pr}: bump head moved from {head[:12]} to {checked[:12]} after its trusted "
+                "bump-guard result; refusing to execute unvalidated pins until the next survey"
+            )
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
+        # CI builds the PR's TauCeti/ sources over current main's trusted lakefile/scripts/pins. Recreate
+        # that view without changing this writable PR branch or HEAD, so merge/rebase and
+        # git-safe-push still operate normally. Any stage acting on a validated bump branch keeps its
+        # PR manifest/toolchain just as CI does.
+        if not stage_trusted_base_config(w.cfg, preserve_pr_pins=is_bump_branch):
+            raise Die(f"preflight: could not create current-main's trusted build view for {label} #{pr}")
+        # CI validates a bump and overlays its pins before fetching caches. Do the same pre-model:
+        # the current-main warmup cannot supply the bumped Mathlib/toolchain artifacts.
+        if is_bump_branch:
+            fetch_host_lake_caches(w.cfg)
+        charge_attempt()
         rc = run_agent_host(co, prompt, opts.work_model, w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
@@ -511,29 +563,59 @@ def _do_fixlike(
 
 def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    w.counters.incr(f"fix-{pr}-{head[:12]}")  # count up front (an un-checkout-able PR mustn't loop)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix")
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="fix.md",
+        label="fix",
+        attempt_keys=(f"fix-{pr}-{head[:12]}",),
+    )
 
 
 def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    w.counters.incr(f"ci-{pr}-{head[:12]}")
-    w.counters.incr(f"ci-pr-{pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci")
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="fix-ci.md",
+        label="fix-ci",
+        attempt_keys=(f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}"),
+    )
 
 
 def do_rebase(w, sv, c, opts, bubble) -> int | None:
-    w.counters.incr(f"rebase-pr-{c.pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase")
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="rebase.md",
+        label="rebase",
+        attempt_keys=(f"rebase-pr-{c.pr}",),
+    )
 
 
 def do_bump(w, sv, c, opts, bubble) -> int | None:
     """Adapt a red bump-mathlib PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
-    w.counters.incr(f"bump-{pr}-{head[:12]}")  # count up front so an un-checkout-able PR can't loop
-    w.counters.incr(f"bump-pr-{pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump")
+    return _do_fixlike(
+        w,
+        sv,
+        c,
+        opts,
+        bubble,
+        prompt_file="bump.md",
+        label="bump",
+        attempt_keys=(f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}"),
+    )
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
@@ -616,7 +698,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             mounts=mounts,
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
-    if not prepare_checkout(w.cfg):
+    if not getattr(opts, "host_prepared", False) and not prepare_checkout(w.cfg):
         raise Die("checkout failed")
     prompt = fill_prompt(
         HERE / "prompts" / "roadmap.md",

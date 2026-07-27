@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Refresh the PR source snapshot, then run a current-main script from the trusted build view.
+set -euo pipefail
+
+self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+: "${TAUCETI_TRUSTED_BUILD:?tauceti: TAUCETI_TRUSTED_BUILD is not set}"
+
+TAUCETI_LAKE_SYNC_ONLY=1 "$self_dir/lake"
+cd -- "$TAUCETI_TRUSTED_BUILD"
+export PATH="$self_dir:$PATH"
+exec "$@"

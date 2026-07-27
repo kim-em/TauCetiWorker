@@ -18,9 +18,9 @@ You are resolving merge conflicts on pull request #__PR__ of TauCetiProject/TauC
 
 ## Verify before pushing (all three MUST pass, after the merge/rebase)
 ```
-lake exe cache get
-lake build
-lake exe axioms
+"${TAUCETI_LAKE:-lake}" exe cache get
+"${TAUCETI_LAKE:-lake}" build
+"${TAUCETI_LAKE:-lake}" exe axioms
 ```
 Iterate until green. Never push red — a botched conflict resolution that builds red is worse than the conflict.
 

@@ -26,12 +26,16 @@ RUN_STDLIB=(
   claude_config_dir.py
   claude_keychain.py
   contest_claim.py
+  fix_ci_prompt.py
   fix_diagnostic.py
   fork_authoring.py
   github_ratelimit.py
   host_agent_preflight.py
+  host_cache.py
+  host_trusted_base.py
   ignore_quota_hardblock.py
   inflight_review.py
+  isolate_home_elan.py
   isolate_home_gh_token.py
   isolate_home_paths.py
   ledger_blocking.py

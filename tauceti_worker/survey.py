@@ -82,6 +82,7 @@ class PRInfo:
     author: str
     build_success: bool
     build_failed: bool
+    bump_guard_success: bool = False
     author_is_bot: bool = False  # a GitHub App / bot author (e.g. the review bot's bump PRs)
     title: str = ""
     labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
@@ -100,6 +101,7 @@ class PRInfo:
         # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
         # neither success nor failed — and simply waits for the trusted build to post.
         build_states = [c.get("state") for c in rollup if c.get("context") == "build"]
+        bump_guard_states = [c.get("state") for c in rollup if c.get("context") == "bump-guard"]
         return PRInfo(
             number=d["number"],
             title=d.get("title", ""),
@@ -113,6 +115,7 @@ class PRInfo:
             author_is_bot=bool((d.get("author") or {}).get("is_bot")),
             build_success=bool(build_states) and all(s == "SUCCESS" for s in build_states),
             build_failed=any(s in BUILD_FAIL for s in build_states),
+            bump_guard_success=bool(bump_guard_states) and all(s == "SUCCESS" for s in bump_guard_states),
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
         )
 
@@ -508,11 +511,12 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         else:
             sv.red_ci.actionable.append(c)
 
-    # 5) bump: a bump-mathlib PR (opened by the review bot) whose build is RED — mathlib moved
-    #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
-    #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
-    #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
-    #    fix still owns its review findings).
+    # 5) bump: a bump-mathlib PR whose build is RED and whose required bump-guard status is green —
+    #    mathlib moved out from under the last-known-good bump and TauCeti/ needs adapting. CI overlays
+    #    PR pins only after its trusted validator posts that status; an invalid/pending bump must never
+    #    be executed on the host. We adapt validated bumps; we never author one (the bot owns opening
+    #    them, CI owns merging green ones). This is the bump-specific CI-fixer: fix-ci defers every
+    #    bump branch here (rebase still owns conflicts and fix still owns review findings).
     for p in nondraft:
         if not (p.head_ref.startswith(BUMP_HEAD_PREFIX) and p.build_failed):
             continue
@@ -520,7 +524,7 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
-        if per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS:
+        if not p.bump_guard_success or per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS:
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)

@@ -6,9 +6,9 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 
 ## Reproduce and adapt
 ```
-lake exe cache get
-lake build
-lake exe axioms
+"${TAUCETI_LAKE:-lake}" exe cache get
+"${TAUCETI_LAKE:-lake}" build
+"${TAUCETI_LAKE:-lake}" exe axioms
 ```
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
 - For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
@@ -21,9 +21,9 @@ lake exe axioms
 
 ## Verify before pushing (all three MUST pass)
 ```
-lake exe cache get
-lake build
-lake exe axioms
+"${TAUCETI_LAKE:-lake}" exe cache get
+"${TAUCETI_LAKE:-lake}" build
+"${TAUCETI_LAKE:-lake}" exe axioms
 ```
 Iterate until green. Never push red.
 

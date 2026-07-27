@@ -4,17 +4,21 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
-- Reproduce locally — this is the source of truth, not the log alone. The single `build` check bundles
-  the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
-  ```
-  lake exe cache get
-  lake build
-  lake exe axioms
-  lake exe module-system
-  bash scripts/lint-env.sh
-  ```
-  If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main (CI
-  overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
+- Start with those logs before running an expensive local build. Identify the failing step, module, and
+  declaration from CI, then reproduce only the smallest relevant command:
+  - For an elaboration/build failure, run
+    `"${TAUCETI_LAKE:-lake}" build TauCeti.<Module>` (or
+    `"${TAUCETI_LAKE:-lake}" env lean TauCeti/Path/To/Module.lean`).
+  - For an audit or lint failure, run only the failing check:
+    `"${TAUCETI_LAKE:-lake}" exe axioms`, `"${TAUCETI_LAKE:-lake}" exe module-system`, or
+    `"${TAUCETI_TRUSTED_RUN:-env}" bash scripts/lint-env.sh`.
+- Iterate with that targeted module/check command while fixing it. Do not repeatedly run the complete CI
+  suite during diagnosis; it is the final gate below.
+- If `lint-env` flags a declaration that is NOT in your diff, do not assume the branch is merely stale.
+  A new global `simp` lemma, instance, import, or attribute in your diff can change the environment seen
+  by an existing declaration. Investigate that possibility first. CI evaluates the PR's `TauCeti/`
+  source over current main's trusted configuration; merge `main` only when the evidence shows the branch
+  itself is behind.
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
@@ -26,16 +30,18 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Everything under `namespace TauCeti`.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
-## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
+## Final gate before pushing (run the complete CI suite only here)
+Only after the targeted failure is fixed, run all of these together as the final gate:
 ```
-lake exe cache get
-lake build
-lake exe axioms
-lake exe module-system
-bash scripts/lint-env.sh
+"${TAUCETI_LAKE:-lake}" exe cache get
+"${TAUCETI_LAKE:-lake}" build --iofail
+"${TAUCETI_LAKE:-lake}" exe axioms
+"${TAUCETI_LAKE:-lake}" exe module-system
+"${TAUCETI_TRUSTED_RUN:-env}" bash scripts/lint-env.sh
 ```
-Iterate until every one is green. A green `lake build` alone is NOT enough — the `build` check also
-fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing docstring). Never push red.
+If this gate exposes another failure, return to the smallest targeted command, fix it, then rerun the
+complete gate. A green `lake build` alone is NOT enough — the `build` check also fails on an axiom-audit,
+module-system, or lint-env violation (e.g. a missing docstring). Never push red.
 
 **Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

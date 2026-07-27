@@ -44,9 +44,145 @@ def fill_prompt(path: Path, **subs) -> str:
     return out
 
 
+TRUSTED_BUILD_ENV = "TAUCETI_TRUSTED_BUILD"
+TRUSTED_SOURCE_ENV = "TAUCETI_PR_SOURCE"
+TRUSTED_ROOT_SOURCE_ENV = "TAUCETI_PR_ROOT_SOURCE"
+TRUSTED_PINS_ENV = "TAUCETI_TRUSTED_PINS"
+
+
+def _remove_worktree_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _trusted_build_dir(cfg: Config) -> Path:
+    return cfg.state / "trusted-build"
+
+
+def _clear_trusted_build(cfg: Config) -> bool:
+    """Remove the prior round's detached build view and stop routing Lake through it."""
+    for name in (TRUSTED_BUILD_ENV, TRUSTED_SOURCE_ENV, TRUSTED_ROOT_SOURCE_ENV, TRUSTED_PINS_ENV):
+        os.environ.pop(name, None)
+    build = _trusted_build_dir(cfg)
+    co = cfg.checkout
+    if not (co / ".git").exists():
+        try:
+            _remove_worktree_path(build)
+        except OSError:
+            return False
+        return True
+
+    # A clean prior round leaves a registered linked worktree. If a process died halfway through
+    # setup, either its directory or registration may be missing. Remove both forms, then prune stale
+    # metadata before adding the next trusted view.
+    removed = subprocess.run(
+        ["git", "-C", str(co), "worktree", "remove", "--force", str(build)],
+        capture_output=True,
+    )
+    if removed.returncode and build.exists():
+        try:
+            _remove_worktree_path(build)
+        except OSError:
+            return False
+    return subprocess.run(["git", "-C", str(co), "worktree", "prune"], capture_output=True).returncode == 0
+
+
+def _source_tree_has_symlink(source: Path) -> bool:
+    """Match CI's source-overlay guard without following a nested link outside the checkout."""
+    for root, dirs, files in os.walk(source, followlinks=False):
+        base = Path(root)
+        if any((base / name).is_symlink() for name in (*dirs, *files)):
+            return True
+    return False
+
+
+def _copy_trusted_sources(co: Path, build: Path, *, preserve_pr_pins: bool) -> bool:
+    """Snapshot the writable PR sources into a real directory that trusted scripts can traverse.
+
+    The host Lake shim repeats this copy before every Lake command so edits made by the agent remain
+    live. Preserved mtimes keep Lake's incremental traces warm, while a real directory (rather than a
+    directory symlink) makes current-main tooling such as ``find TauCeti ...`` behave exactly as in CI.
+    """
+    source = co / "TauCeti"
+    root_source = co / "TauCeti.lean"
+    if not source.is_dir() or source.is_symlink() or _source_tree_has_symlink(source):
+        return False
+    if root_source.exists() and (root_source.is_symlink() or not root_source.is_file()):
+        return False
+
+    try:
+        _remove_worktree_path(build / "TauCeti")
+        shutil.copytree(source, build / "TauCeti", copy_function=shutil.copy2)
+        if root_source.exists():
+            _remove_worktree_path(build / "TauCeti.lean")
+            shutil.copy2(root_source, build / "TauCeti.lean")
+
+        if preserve_pr_pins:
+            for name in ("lake-manifest.json", "lean-toolchain"):
+                src = co / name
+                if src.is_symlink() or not src.is_file():
+                    return False
+                shutil.copy2(src, build / name)
+    except OSError:
+        return False
+    return True
+
+
+def stage_trusted_base_config(cfg: Config, *, preserve_pr_pins: bool = False) -> bool:
+    """Create CI's trusted-main build view beside the untouched writable PR checkout.
+
+    CI checks out current main and overlays only the PR's ``TauCeti/`` sources. Host authoring needs
+    that exact build view *and* an ordinary writable PR worktree whose merge/rebase/status/index
+    semantics remain intact. A detached ``origin/main`` worktree supplies the trusted lakefile,
+    scripts, manifest, and toolchain. Its source tree is refreshed from the live PR checkout before
+    every Lake command, and its ``.lake`` points at the warm writable checkout cache. The agent-only
+    ``lake`` shim performs that refresh and enters this view before invoking the real Lake executable.
+
+    A validated bump PR is CI's one exception: copy its manifest/toolchain into the detached view
+    after checkout, while the human-owned lakefile and scripts remain current-main versions.
+    """
+    co = cfg.checkout
+    build = _trusted_build_dir(cfg)
+    if not _clear_trusted_build(cfg):
+        return False
+    try:
+        build.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    added = subprocess.run(
+        ["git", "-C", str(co), "worktree", "add", "--detach", str(build), "origin/main"],
+        capture_output=True,
+    )
+    if added.returncode:
+        return False
+
+    try:
+        lake = co / ".lake"
+        lake.mkdir(parents=True, exist_ok=True)
+        _remove_worktree_path(build / ".lake")
+        (build / ".lake").symlink_to(lake, target_is_directory=True)
+    except OSError:
+        return False
+    if not _copy_trusted_sources(co, build, preserve_pr_pins=preserve_pr_pins):
+        return False
+
+    os.environ[TRUSTED_BUILD_ENV] = str(build.absolute())
+    os.environ[TRUSTED_SOURCE_ENV] = str((co / "TauCeti").absolute())
+    root_source = co / "TauCeti.lean"
+    if root_source.exists():
+        os.environ[TRUSTED_ROOT_SOURCE_ENV] = str(root_source.absolute())
+    if preserve_pr_pins:
+        os.environ[TRUSTED_PINS_ENV] = "1"
+    return True
+
+
 def prepare_checkout(cfg: Config) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
     co = cfg.checkout
+    if not _clear_trusted_build(cfg):
+        return False
     if not (co / ".git").is_dir():
         co.parent.mkdir(parents=True, exist_ok=True)
         log(f"cloning {TAUCETI} → {co} (first run)")
@@ -97,10 +233,22 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+def host_agent_env() -> dict[str, str]:
+    """The common environment host work agents and their login-shell preflight receive."""
+    return {
+        **os.environ,
+        "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}",
+        # Login-shell startup files are allowed to rewrite PATH. Prompts use this absolute shim so
+        # trusted build routing does not depend on the scripts/ prefix surviving that rewrite.
+        "TAUCETI_LAKE": str(HERE / "scripts" / "lake"),
+        "TAUCETI_TRUSTED_RUN": str(HERE / "scripts" / "trusted-run"),
+    }
+
+
 def host_agent_argv(prompt: str, work_model: str) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
     resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
-    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    env = host_agent_env()
     if work_model == "codex":
         argv = ["codex", "exec", "--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
     elif work_model in OPENROUTER_MODELS:
@@ -237,6 +385,144 @@ def _host_home() -> Path:
         return Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (ImportError, KeyError, OSError):
         return Path(os.path.expanduser("~"))
+
+
+def _host_shell() -> str:
+    """The login shell agent command tools use, independent of the parent process's ``$SHELL``."""
+    try:
+        import pwd
+
+        shell = pwd.getpwuid(os.getuid()).pw_shell
+        if shell:
+            return shell
+    except (ImportError, KeyError, OSError):
+        pass
+    return os.environ.get("SHELL") or "/bin/sh"
+
+
+def host_lake_env(cfg: Config) -> dict[str, str]:
+    """The host Lake cache environment shared by trusted setup and the work agent."""
+    return {
+        "LAKE_CONFIG": str((cfg.state / "lake-cache.toml").absolute()),
+        "LAKE_CACHE_DIR": str((cfg.checkout / ".lake" / "cache").absolute()),
+        "LAKE_ARTIFACT_CACHE": "true",
+        "LAKE_RESTORE_ARTIFACTS": "true",
+    }
+
+
+def configure_host_lake_cache(cfg: Config) -> dict[str, str]:
+    """Materialize TauCeti's anonymous public cache config and export the agent's Lake environment."""
+    env = host_lake_env(cfg)
+    config = (
+        f'cache.defaultService = "{TAUCETI_CACHE_SERVICE}"\n'
+        "[[cache.service]]\n"
+        f'name = "{TAUCETI_CACHE_SERVICE}"\n'
+        'kind = "s3"\n'
+        f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
+        f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+    )
+    try:
+        cfg.state.mkdir(parents=True, exist_ok=True)
+        Path(env["LAKE_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        config_path = Path(env["LAKE_CONFIG"])
+        if not config_path.exists() or config_path.read_text() != config:
+            config_path.write_text(config)
+    except OSError as e:
+        raise Die(f"preflight: could not configure the host Lake artifact cache: {e}") from e
+    # Host agents are launched later through host_agent_argv(), which deliberately snapshots os.environ.
+    # Export once in this one-round worker process so every supported model inherits the exact same knobs.
+    os.environ.update(env)
+    return env
+
+
+def host_login_shell_which(tool: str, env: dict | None = None) -> str | None:
+    """Resolve a tool through the same login-shell shape used by agent command execution."""
+    import shlex
+
+    probe_env = dict(env or os.environ)
+    if tool == "lake":
+        # This is an output of the probe, never an input. A loop child or manually inherited value may
+        # name a removed/older executable; resolve afresh from this login shell's post-startup PATH.
+        probe_env.pop("TAUCETI_REAL_LAKE", None)
+    quoted_tool = shlex.quote(tool)
+    if tool == "lake":
+        # Agent prompts invoke the absolute shim because login startup files may rewrite PATH. In the
+        # same login shell, prove both that ordinary Lake is resolvable and that the shim can resolve
+        # the real executable from the post-startup PATH it will actually inherit.
+        wrapper = str(HERE / "scripts" / "lake")
+        command = f"command -v {quoted_tool} >/dev/null || exit 1; TAUCETI_LAKE_RESOLVE_ONLY=1 {shlex.quote(wrapper)}"
+    else:
+        command = f"command -v {quoted_tool}"
+    try:
+        p = subprocess.run(
+            [_host_shell(), "-lc", command],
+            env=probe_env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [line.strip() for line in (p.stdout or "").splitlines() if line.strip()]
+    return lines[-1] if p.returncode == 0 and lines else None
+
+
+def _run_host_login_command(argv: list[str], *, cwd: Path, env: dict) -> subprocess.CompletedProcess:
+    """Run trusted host setup via the agent's login shell, capturing a useful failure diagnostic."""
+    import shlex
+
+    try:
+        return subprocess.run(
+            [_host_shell(), "-lc", "exec " + shlex.join(argv)],
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(argv, 1, "", str(e))
+
+
+def fetch_host_lake_caches(cfg: Config) -> None:
+    """Fetch Mathlib plus TauCeti's public artifacts for the currently active trusted build view."""
+    env = host_agent_env()
+    lake = env["TAUCETI_LAKE"]
+
+    mathlib = _run_host_login_command([lake, "exe", "cache", "get"], cwd=cfg.checkout, env=env)
+    if mathlib.returncode:
+        mathlib = _run_host_login_command([lake, "exe", "cache", "get"], cwd=cfg.checkout, env=env)
+    if mathlib.returncode:
+        detail = ((mathlib.stderr or "") + (mathlib.stdout or "")).strip()[-500:]
+        suffix = f"\n  lake said: {detail}" if detail else ""
+        raise Die(
+            "preflight: Mathlib cache fetch failed twice in the trusted host build view; "
+            f"refusing to launch an agent that would compile Mathlib from scratch.{suffix}"
+        )
+
+    own = _run_host_login_command(
+        [lake, "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI],
+        cwd=cfg.checkout,
+        env=env,
+    )
+    if own.returncode:
+        detail = ((own.stderr or "") + (own.stdout or "")).strip()[-300:]
+        suffix = f" ({detail})" if detail else ""
+        log(f"warning: TauCeti Lake cache miss; the agent will build missing outputs{suffix}")
+
+
+def prepare_host_authoring(cfg: Config) -> None:
+    """Warm host authoring from current main without running a full pre-agent build.
+
+    Mathlib's cache is mandatory: falling back to compiling Mathlib would waste the model round. TauCeti's
+    public root-package cache is an optimization and follows CI/Bubble's non-fatal miss semantics.
+    """
+    if not prepare_checkout(cfg):
+        raise Die("preflight: could not prepare the current-main host authoring checkout")
+    configure_host_lake_cache(cfg)
+    fetch_host_lake_caches(cfg)
 
 
 def bubble_cmd_is_disposable(cmd: list[str] | None = None) -> bool:
@@ -881,7 +1167,9 @@ def isolate_home(wid: str) -> Path:
     operator's external refresher rotates it. The worker itself never refreshes (never touches the
     single-use refresh token). The copy always lives at <home>/.claude and $CLAUDE_CONFIG_DIR is repointed
     there, so both the pacer and the spawned claude read the isolated creds even when the operator's real
-    config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
+    config dir is elsewhere. Elan is intentionally shared: an explicit ``$ELAN_HOME`` is preserved, and
+    otherwise it is pinned to the real pre-isolation home's ``.elan``. Returns the worker home and sets
+    $HOME. Children inherit.
 
     macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
     Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
@@ -894,8 +1182,14 @@ def isolate_home(wid: str) -> Path:
 
     home = _worker_iso_home(wid)
     if Path(os.environ.get("HOME", "")) == home:
+        # An already-isolated child may come from an older launcher that did not export ELAN_HOME.
+        # The login account's home is the only real-home anchor still available at this point.
+        os.environ.setdefault("ELAN_HOME", str(_host_home() / ".elan"))
         return home  # already isolated (a loop child inherits the parent's $HOME) — don't re-copy or warn
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    # HOME isolation is for mutable agent credentials, not multi-gigabyte Lean toolchains. Resolve Elan
+    # while HOME still names the operator's real home; loop children inherit this explicit absolute path.
+    os.environ.setdefault("ELAN_HOME", str(real / ".elan"))
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
     iso_claude = home / ".claude"
     iso_claude.mkdir(parents=True, exist_ok=True)

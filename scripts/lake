@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Host-agent Lake shim. Prompts invoke it by absolute path because login startup files may rewrite
+# PATH. It resolves the real Lake executable from that login shell's PATH, then enters the detached
+# trusted-main build view when one is active. Bubble does not use this shim.
+set -euo pipefail
+
+self_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+real_lake=${TAUCETI_REAL_LAKE:-}
+
+if [[ -n "$real_lake" && ( ! -f "$real_lake" || ! -x "$real_lake" || "$real_lake" -ef "$0" ) ]]; then
+  real_lake=
+fi
+
+if [[ -z "$real_lake" ]]; then
+  IFS=: read -r -a path_dirs <<< "$PATH"
+  for dir in "${path_dirs[@]}"; do
+    [[ -n "$dir" ]] || dir=.
+    if [[ "$dir" == "$self_dir" ]]; then
+      continue
+    fi
+    candidate="$dir/lake"
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      real_lake=$candidate
+      break
+    fi
+  done
+fi
+
+if [[ -z "$real_lake" ]]; then
+  echo "tauceti: no real lake executable is resolvable after $self_dir on PATH" >&2
+  exit 127
+fi
+
+if [[ ${TAUCETI_LAKE_RESOLVE_ONLY:-} == 1 ]]; then
+  printf '%s\n' "$real_lake"
+  exit 0
+fi
+
+if [[ -n ${TAUCETI_TRUSTED_BUILD:-} ]]; then
+  pr_source=${TAUCETI_PR_SOURCE:-}
+  trusted_source=$TAUCETI_TRUSTED_BUILD/TauCeti
+  if [[ -z "$pr_source" || ! -d "$pr_source" || -L "$pr_source" ]]; then
+    echo "tauceti: trusted source overlay is missing or is a symlink: $pr_source" >&2
+    exit 2
+  fi
+  bad_link=$(find "$pr_source" -type l -print -quit)
+  if [[ -n "$bad_link" ]]; then
+    echo "tauceti: trusted source overlay rejects symlink: $bad_link" >&2
+    exit 2
+  fi
+  if [[ ! -d "$trusted_source" || -L "$trusted_source" ]]; then
+    echo "tauceti: trusted build source target is not a real directory: $trusted_source" >&2
+    exit 2
+  fi
+  find "$trusted_source" -mindepth 1 -delete
+  cp -a -- "$pr_source"/. "$trusted_source"/
+
+  if [[ -n ${TAUCETI_PR_ROOT_SOURCE:-} ]]; then
+    if [[ ! -f "$TAUCETI_PR_ROOT_SOURCE" || -L "$TAUCETI_PR_ROOT_SOURCE" ]]; then
+      echo "tauceti: trusted root source overlay is not a regular file" >&2
+      exit 2
+    fi
+    cp -p -- "$TAUCETI_PR_ROOT_SOURCE" "$TAUCETI_TRUSTED_BUILD/TauCeti.lean"
+  fi
+  if [[ ${TAUCETI_TRUSTED_PINS:-} == 1 ]]; then
+    pr_checkout=$(dirname -- "$pr_source")
+    for pin in lake-manifest.json lean-toolchain; do
+      if [[ ! -f "$pr_checkout/$pin" || -L "$pr_checkout/$pin" ]]; then
+        echo "tauceti: trusted bump pin is not a regular file: $pin" >&2
+        exit 2
+      fi
+      cp -p -- "$pr_checkout/$pin" "$TAUCETI_TRUSTED_BUILD/$pin"
+    done
+  fi
+  if [[ ${TAUCETI_LAKE_SYNC_ONLY:-} == 1 ]]; then
+    exit 0
+  fi
+  cd -- "$TAUCETI_TRUSTED_BUILD"
+fi
+exec "$real_lake" "$@"
