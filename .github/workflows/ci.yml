@@ -117,6 +117,10 @@ jobs:
             set -e
             ! printf "%s\n" "$claude_output" | grep -F "cannot be used with root/sudo privileges"
           '
+      - name: Smoke-test configurable worker options
+        run: |
+          TAUCETI_WORKER_ARGS=--help docker compose run --rm --no-deps tauceti 2>&1 |
+            grep -F "usage: tauceti work"
       # Exercise the actual tini -> uv -> Python process tree used by Compose. The
       # unit test invokes Python directly and cannot prove that SIGTERM crosses uv.
       - name: Graceful stop reaches the worker loop

@@ -11,6 +11,7 @@ services:
     command: ["./tauceti", "work", "--loop"]
     environment:
       TAUCETI_WORKER_ID: docker
+      TAUCETI_WORKER_ARGS: "${TAUCETI_WORKER_ARGS:-}"
     volumes:
       # Agent and GitHub subscription credentials, created by the one-time login step.
       - claude-worker:/root/.claude:ro

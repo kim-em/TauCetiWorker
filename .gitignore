@@ -4,6 +4,9 @@
 /state/
 /logs/
 
+# Local Docker Compose options (may contain operator-specific configuration).
+/.env
+
 # Python bytecode (tauceti is a single-file script; tests import it).
 __pycache__/
 *.pyc

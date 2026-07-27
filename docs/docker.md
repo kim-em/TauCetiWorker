@@ -42,6 +42,31 @@ Codex and Claude credentials should report `[ok]`. Missing `bubble`, `incus`, an
 are expected for the standard host-mode deployment; they are only needed for Bubble
 sandboxing or the DeepSeek and MiniMax agents.
 
+## Worker options
+
+Pass options to the long-running worker when starting it:
+
+```bash
+TAUCETI_WORKER_ARGS="--only roadmap --roadmap-only Topology" docker compose up -d
+```
+
+To keep those options for future `docker compose up` commands, put the setting in
+`.env` at the repository root instead:
+
+```dotenv
+TAUCETI_WORKER_ARGS=--only roadmap --roadmap-only Topology
+```
+
+Then apply it normally:
+
+```bash
+docker compose up -d
+```
+
+The options are appended to `tauceti work --loop`. Edit or remove the line and run
+`docker compose up -d` again to change or clear them; credentials and worker data are
+retained.
+
 ## Operations
 
 Stop the deployment while retaining all data:

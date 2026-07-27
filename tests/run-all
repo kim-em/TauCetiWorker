@@ -58,7 +58,7 @@ RUN_STDLIB=(
 # special-cased python tests (handled explicitly below)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
 # bash tests
-RUN_SH=(lifecycle.sh)
+RUN_SH=(docker_entrypoint.sh lifecycle.sh)
 # deliberately not run here (needs the bubble sandbox/proxy)
 SKIP=(egress.sh)
 

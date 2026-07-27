@@ -20,4 +20,19 @@ if [[ "${TAUCETI_SKIP_GIT_IDENTITY:-0}" != 1 ]]; then
   echo "tauceti-entrypoint: git author $git_name <$git_email>"
 fi
 
+# Compose supplies the stable `./tauceti work --loop` command as separate arguments.
+# Append operator options from .env using Python's shell-like parser; never evaluate them
+# as shell code. Restrict this to the worker command so setup and diagnostic overrides are
+# unaffected.
+if [[ -n "${TAUCETI_WORKER_ARGS:-}" && "${1:-}" == "./tauceti" && "${2:-}" == "work" && "${3:-}" == "--loop" ]]; then
+  exec python3 -c '
+import os
+import shlex
+import sys
+
+argv = sys.argv[1:] + shlex.split(os.environ["TAUCETI_WORKER_ARGS"])
+os.execvp(argv[0], argv)
+' "$@"
+fi
+
 exec "$@"
