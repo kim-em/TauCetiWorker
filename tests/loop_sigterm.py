@@ -28,7 +28,7 @@ def driver(started: Path, cleaned: Path) -> int:
     import tauceti_worker.loop as loop
     import tauceti_worker.round as round_lifecycle
 
-    loop.choose_model = lambda *_args: ("codex", {})
+    loop.choose_model = lambda *_args, **_kwargs: ("codex", {})
     loop.github_budget = lambda: {}
     round_lifecycle.spawn_round = lambda _tail: subprocess.Popen(
         [sys.executable, __file__, "child", str(started), str(cleaned)],
