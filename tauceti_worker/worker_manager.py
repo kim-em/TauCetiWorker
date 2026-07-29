@@ -1004,24 +1004,39 @@ def add_dashboard_worker(
     return spec
 
 
-def _follow_log(path: Path, lines: int, follow: bool) -> int:
-    while not path.exists():
-        if not follow:
-            workers_die(f"log does not exist: {path}")
-        time.sleep(0.25)
-    with path.open(errors="replace") as src:
-        content = src.readlines()
-        sys.stdout.writelines(content[-lines:])
-        sys.stdout.flush()
-        if not follow:
-            return 0
+def _follow_log(worker_id: str, initial_path: Path, lines: int, follow: bool) -> int:
+    """Tail a worker across wrapper restarts, switching when status names a new durable log."""
+    current = initial_path
+    src = None
+    try:
         while True:
+            raw = read_json(status_path(worker_id)).get("log_file")
+            candidate = Path(raw) if isinstance(raw, str) and raw else current
+            if candidate != current or src is None:
+                if not candidate.exists():
+                    if not follow:
+                        workers_die(f"log does not exist: {candidate}")
+                    time.sleep(0.25)
+                    continue
+                if src is not None:
+                    src.close()
+                    print(f"\n--- {worker_id} restarted; following {candidate} ---", flush=True)
+                current = candidate
+                src = current.open(errors="replace")
+                content = src.readlines()
+                sys.stdout.writelines(content[-lines:])
+                sys.stdout.flush()
+                if not follow:
+                    return 0
             chunk = src.read()
             if chunk:
                 sys.stdout.write(chunk)
                 sys.stdout.flush()
             else:
                 time.sleep(0.25)
+    finally:
+        if src is not None:
+            src.close()
 
 
 def _tmux_shell(argv: list[str]) -> str:
@@ -1054,10 +1069,21 @@ def cmd_tmux(config: Path, attach: bool) -> int:
             ],
             check=True,
         )
+        subprocess.run(
+            [tmux, "set-window-option", "-t", f"{TMUX_SESSION}:dashboard", "@tauceti-managed", "dashboard"],
+            check=True,
+        )
     result = subprocess.run(
-        [tmux, "list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"], capture_output=True, text=True, check=True
+        [tmux, "list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}\t#{@tauceti-managed}"],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    windows = set(result.stdout.splitlines())
+    managed = {}
+    for line in result.stdout.splitlines():
+        name, _, marker = line.partition("\t")
+        managed[name] = marker
+    windows = set(managed)
     wanted = {spec.id for spec in specs if spec.enabled}
     for spec in specs:
         name = spec.id
@@ -1075,7 +1101,11 @@ def cmd_tmux(config: Path, attach: bool) -> int:
                 ],
                 check=True,
             )
-    for name in sorted((windows - wanted) - {"dashboard"}):
+            subprocess.run(
+                [tmux, "set-window-option", "-t", f"{TMUX_SESSION}:{name}", "@tauceti-managed", "worker"],
+                check=True,
+            )
+    for name in sorted(name for name, marker in managed.items() if marker == "worker" and name not in wanted):
         subprocess.run([tmux, "kill-window", "-t", f"{TMUX_SESSION}:{name}"], check=False)
     if attach:
         action = "switch-client" if os.environ.get("TMUX") else "attach-session"
@@ -1383,7 +1413,7 @@ def cmd_workers(args) -> int:
             raw = item.get("log_file")
             if not raw:
                 raise WorkersError(f"worker {args.worker_id} has no log yet")
-            return _follow_log(Path(raw), args.lines, args.follow)
+            return _follow_log(args.worker_id, Path(raw), args.lines, args.follow)
         if action == "tmux":
             return cmd_tmux(config, not args.no_attach)
         if action == "manager":
