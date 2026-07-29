@@ -130,7 +130,7 @@ try:
     if sys.platform != "darwin":
         assert wm._service_path() == root / "config" / "systemd" / "user" / "tauceti-workers.service"
         unit = wm._systemd_unit(config)
-        assert "Environment=\"PATH=" in unit and "Environment=\"PYTHONPATH=" in unit
+        assert 'Environment="PATH=' in unit and 'Environment="PYTHONPATH=' in unit
         assert "ExecStart=" in unit and str(config.resolve()) in unit
 
     manager = start_manager(config)

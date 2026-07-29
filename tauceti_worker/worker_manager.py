@@ -804,7 +804,10 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         continue
                     if is_live or not should_run or wid in children:
                         if not is_live and spec is None and live.get("managed"):
-                            for stale in (status_path(wid, state_dir), status_path(wid, state_dir).with_suffix(".json.lock")):
+                            for stale in (
+                                status_path(wid, state_dir),
+                                status_path(wid, state_dir).with_suffix(".json.lock"),
+                            ):
                                 try:
                                     stale.unlink()
                                 except FileNotFoundError:
@@ -1137,8 +1140,8 @@ Description=Keep configured Tau Ceti workers running
 Type=simple
 WorkingDirectory={working_directory}
 ExecStart={command}
-Environment={_systemd_quote('PATH=' + os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'))}
-Environment={_systemd_quote('PYTHONPATH=' + self_env()['PYTHONPATH'])}
+Environment={_systemd_quote("PATH=" + os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))}
+Environment={_systemd_quote("PYTHONPATH=" + self_env()["PYTHONPATH"])}
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
@@ -1166,9 +1169,7 @@ def service_action(action: str, config: Path) -> int:
         domain = f"gui/{os.getuid()}"
         service = f"{domain}/{_launchd_label()}"
         if action in ("install", "start", "restart"):
-            probe = subprocess.run(
-                ["launchctl", "print", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            probe = subprocess.run(["launchctl", "print", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if probe.returncode:
                 raise WorkersError("macOS LaunchAgents require an active graphical login session")
         if action == "install":

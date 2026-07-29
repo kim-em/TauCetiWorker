@@ -569,8 +569,7 @@ def _dashboard_app(cfg, loader=None):
             head.append(TAUCETI, style="bold")
             head.append("   persistent workers")
             head.append(
-                f"\nmanager: {'running' if self.worker_manager_online else 'offline'}   "
-                f"config: {self.workers_config}"
+                f"\nmanager: {'running' if self.worker_manager_online else 'offline'}   config: {self.workers_config}"
             )
             self.query_one("#hdr", Static).update(Panel(head, title="tauceti — workers"))
 
