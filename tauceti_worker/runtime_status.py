@@ -69,5 +69,5 @@ def report_runtime(state: str | None = None, **changes) -> None:
     changes["activity_at"] = time.time()
     try:
         update_status(Path(raw), **changes)
-    except OSError:
+    except Exception:
         pass

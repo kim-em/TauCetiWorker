@@ -73,6 +73,10 @@ Useful controls are:
 ./tauceti workers edit
 ```
 
+CLI and TUI mutations serialize through a sibling lock and rewrite `workers.toml` in canonical
+form. Use `workers edit` when comments or hand formatting should be retained; a later
+enable/disable/add/remove action intentionally normalizes the file.
+
 `workers apply` starts a detached manager for the current login session when one
 is not already running. For login-independent operation and startup after a
 reboot, install the native user service:
@@ -86,7 +90,9 @@ This installs a systemd user service on Linux/NixOS or a LaunchAgent on macOS.
 The reconciler and worker control sockets are portable Unix code; no Linux
 `/proc` interface is required. On Linux systems that stop the user manager after
 the last logout, `loginctl enable-linger "$USER"` keeps user services running
-with no login session.
+with no login session. A macOS LaunchAgent survives terminal and SSH-session loss,
+but starts only after a graphical login; installation reports that requirement
+explicitly when no GUI login domain is active.
 
 Tmux is an optional view, not the supervisor. `tauceti workers tmux` opens one
 dashboard window and one log-following window per enabled worker. Killing that

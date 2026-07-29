@@ -7,6 +7,7 @@ viewers: a tmux session created here tails durable logs and can disappear withou
 from __future__ import annotations
 
 import base64
+import contextlib
 import dataclasses
 import fcntl
 import json
@@ -99,11 +100,22 @@ def workers_runtime_dir() -> Path:
         root = Path(os.environ["XDG_RUNTIME_DIR"]) / "tauceti"
     else:
         root = Path("/tmp") / f"tauceti-{os.getuid()}"
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise WorkersError(f"cannot create runtime directory {root}: {exc}") from None
+    try:
+        owner = root.stat().st_uid
+    except OSError as exc:
+        raise WorkersError(f"cannot inspect runtime directory {root}: {exc}") from None
+    if owner != os.getuid():
+        raise WorkersError(f"refusing runtime directory not owned by uid {os.getuid()}: {root}")
     try:
         root.chmod(0o700)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise WorkersError(f"cannot secure runtime directory {root}: {exc}") from None
+    if root.stat().st_mode & 0o077:
+        raise WorkersError(f"runtime directory is accessible by other users: {root}")
     return root
 
 
@@ -301,10 +313,19 @@ def _toml_value(value) -> str:
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    raise TypeError(value)
+    raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
-def save_worker_specs(path: Path, specs: list[WorkerSpec]) -> None:
+@contextlib.contextmanager
+def _config_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _write_worker_specs(path: Path, specs: list[WorkerSpec]) -> None:
     lines = ["# Managed by `tauceti workers`; edit while the manager is running and it will reconcile.", "version = 1"]
     for spec in specs:
         lines += ["", "[[workers]]"]
@@ -314,13 +335,26 @@ def save_worker_specs(path: Path, specs: list[WorkerSpec]) -> None:
     text = "\n".join(lines) + "\n"
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(text)
+        with tmp.open("w") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
         os.replace(tmp, path)
     finally:
         try:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+def save_worker_specs(path: Path, specs: list[WorkerSpec]) -> None:
+    """Atomically replace the desired state.
+
+    CLI/TUI read-modify-write operations hold the same sibling lock across their read. Direct
+    callers get an atomic, serialized full-generation replacement here.
+    """
+    with _config_lock(path):
+        _write_worker_specs(path, specs)
 
 
 def next_worker_id(specs: list[WorkerSpec]) -> str:
@@ -370,13 +404,27 @@ def manager_request(action: str, **fields) -> dict | None:
     return _socket_request(manager_socket(), {"action": action, **fields})
 
 
-def runner_status(worker_id: str) -> dict:
-    live = _socket_request(runner_socket(worker_id), {"action": "status"}, timeout=0.15)
+def _lock_is_held(path: Path) -> bool:
+    """Return whether another process owns an advisory lock, without trusting a stored PID."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return False
+
+
+def runner_status(worker_id: str, state_dir: Path | None = None, runtime_dir: Path | None = None) -> dict:
+    live = _socket_request(runner_socket(worker_id, runtime_dir), {"action": "status"}, timeout=0.15)
     if live is not None:
         live["alive"] = True
         return live
-    value = read_json(status_path(worker_id))
-    value["alive"] = False
+    value = read_json(status_path(worker_id, state_dir))
+    # A wrapper keeps this lock through its graceful child teardown. Its control socket may be
+    # temporarily busy, but the lock still proves that a runner owns the slot.
+    value["alive"] = _lock_is_held((runtime_dir or workers_runtime_dir()) / f"w-{worker_id}.lock")
     return value
 
 
@@ -407,16 +455,17 @@ def worker_snapshots(specs: list[WorkerSpec] | None = None, config: Path | None 
             state_name = str(actual.get("state") or "stopped")
         snapshots.append(
             {
+                **actual,
                 "id": wid,
                 "desired": desired,
                 "actual": state_name,
                 "alive": alive,
                 "enabled": bool(spec and spec.enabled),
+                "actual_spec_hash": actual.get("spec_hash"),
                 "spec_hash": spec.fingerprint() if spec else None,
                 "agent": spec.agent if spec else actual.get("agent"),
                 "only": list(spec.only) if spec else actual.get("only", []),
                 "sandbox": spec.sandbox if spec else actual.get("sandbox"),
-                **actual,
             }
         )
     return snapshots
@@ -572,9 +621,12 @@ def cmd_managed_runner(args) -> int:
                     os.killpg(child.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                try:
-                    child.wait(20)
-                except subprocess.TimeoutExpired:
+                deadline = time.monotonic() + 20
+                while child.poll() is None and time.monotonic() < deadline:
+                    ready, _, _ = select.select([server], [], [], 0.2)
+                    if ready:
+                        _serve_one(server, request)
+                if child.poll() is None:
                     try:
                         os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -613,8 +665,8 @@ def cmd_managed_runner(args) -> int:
                         pass
 
 
-def _stop_runner(worker_id: str) -> bool:
-    response = _socket_request(runner_socket(worker_id), {"action": "stop"})
+def _stop_runner(worker_id: str, runtime_dir: Path | None = None) -> bool:
+    response = _socket_request(runner_socket(worker_id, runtime_dir), {"action": "stop"})
     return bool(response and response.get("ok"))
 
 
@@ -654,12 +706,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         stop_workers = False
         restart_ids: set[str] = set()
         children: dict[str, subprocess.Popen] = {}
+        launch_failures: dict[str, tuple[str, int, float]] = {}
         last_good: list[WorkerSpec] | None = None
         last_error: str | None = None
 
         def stop(signum=None, frame=None) -> None:
-            nonlocal exiting
+            nonlocal exiting, stop_workers
             exiting = True
+            stop_workers = True
 
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
@@ -708,6 +762,24 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 for wid, process in list(children.items()):
                     if process.poll() is not None:
                         children.pop(wid, None)
+                        status = read_json(status_path(wid, state_dir))
+                        terminal = (
+                            status.get("wrapper_pid") == process.pid
+                            and not status.get("alive")
+                            and status.get("stopped_at") is not None
+                        )
+                        if not terminal:
+                            spec = wanted.get(wid)
+                            fingerprint = spec.fingerprint() if spec else "removed"
+                            previous = launch_failures.get(wid)
+                            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
+                            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
+                            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
+                            print(
+                                f"tauceti workers: wrapper {wid} exited before publishing terminal state; "
+                                f"retrying in {delay}s",
+                                file=sys.stderr,
+                            )
                 known_ids = set(wanted)
                 try:
                     known_ids.update(path.stem for path in state_dir.glob("*.json"))
@@ -715,45 +787,61 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     pass
                 for wid in sorted(known_ids):
                     spec = wanted.get(wid)
-                    live = _socket_request(runner_socket(wid, runtime_dir), {"action": "status"}, timeout=0.1)
+                    live = runner_status(wid, state_dir, runtime_dir)
+                    is_live = bool(live.get("alive"))
                     should_run = bool(spec and spec.enabled)
-                    changed = bool(live and spec and live.get("spec_hash") != spec.fingerprint())
+                    changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
                     if (
-                        live
+                        is_live
                         and not changed
                         and int(live.get("restart_count", 0))
                         and time.time() - float(live.get("started_at") or time.time()) >= 300
                     ):
                         update_status(status_path(wid, state_dir), restart_count=0)
-                    if live and (not should_run or changed or wid in restart_ids):
-                        _stop_runner(wid)
+                        launch_failures.pop(wid, None)
+                    if is_live and (not should_run or changed or wid in restart_ids):
+                        _stop_runner(wid, runtime_dir)
                         continue
-                    if live or not should_run or wid in children:
+                    if is_live or not should_run or wid in children:
+                        if not is_live and spec is None and live.get("managed"):
+                            for stale in (status_path(wid, state_dir), status_path(wid, state_dir).with_suffix(".json.lock")):
+                                try:
+                                    stale.unlink()
+                                except FileNotFoundError:
+                                    pass
                         continue
                     prior = read_json(status_path(wid, state_dir))
+                    forced = wid in restart_ids
                     if (
-                        spec.restart == "never"
+                        not forced
+                        and spec.restart == "never"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("stopped_at")
                     ):
                         continue
-                    if spec.restart == "on-failure" and prior.get("exit_code") == 0:
+                    if not forced and spec.restart == "on-failure" and prior.get("exit_code") == 0:
                         continue
                     failures = int(prior.get("restart_count", 0))
                     delay = min(5 * (2 ** min(failures, 6)), 300) if prior.get("state") == "failed" else 0
-                    if float(prior.get("stopped_at") or 0) + delay > time.time():
+                    manager_failure = launch_failures.get(wid)
+                    manager_retry_at = (
+                        manager_failure[2] if manager_failure and manager_failure[0] == spec.fingerprint() else 0
+                    )
+                    if not forced and max(float(prior.get("stopped_at") or 0) + delay, manager_retry_at) > time.time():
                         continue
                     children[wid] = _launch_runner(spec, state_dir, runtime_dir)
-                restart_ids.intersection_update({wid for wid in restart_ids if runner_status(wid).get("alive")})
+                    restart_ids.discard(wid)
                 ready, _, _ = select.select([server], [], [], max(0.1, interval))
                 if ready:
                     _serve_one(server, handle)
             if stop_workers:
-                for item in worker_snapshots(last_good or []):
-                    if item.get("alive"):
-                        _stop_runner(item["id"])
+                live_ids = [item["id"] for item in worker_snapshots(last_good or []) if item.get("alive")]
+                for wid in live_ids:
+                    _stop_runner(wid, runtime_dir)
                 deadline = time.monotonic() + 25
-                while time.monotonic() < deadline and any(runner_status(spec.id).get("alive") for spec in last_good):
+                while time.monotonic() < deadline and any(
+                    runner_status(wid, state_dir, runtime_dir).get("alive") for wid in live_ids
+                ):
                     time.sleep(0.1)
             return 0
         finally:
@@ -766,27 +854,57 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 pass
 
 
+def _manager_lock_held() -> bool:
+    return _lock_is_held(workers_runtime_dir() / "manager.lock")
+
+
+def _check_manager_config(reply: dict, config: Path) -> None:
+    active = Path(str(reply.get("config", ""))).expanduser().resolve()
+    if active != config.resolve():
+        raise WorkersError(f"manager already uses {active}, not {config}")
+
+
 def ensure_manager(config: Path) -> bool:
-    online = manager_request("ping")
-    if online:
-        active = Path(str(online.get("config", ""))).expanduser()
-        if active != config.expanduser():
-            raise WorkersError(f"manager already uses {active}, not {config}")
-        manager_request("apply")
-        return False
-    state = workers_state_dir()
-    state.mkdir(parents=True, exist_ok=True)
-    log = (state / "manager.log").open("ab", buffering=0)
-    subprocess.Popen(
-        self_argv("workers", "--config", config, "manager"),
-        cwd=HERE,
-        env=self_env(),
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    return True
+    """Return only after the requested manager is demonstrably accepting control requests."""
+    config = config.expanduser().resolve()
+    spawned: subprocess.Popen | None = None
+    deadline = time.monotonic() + 35
+    while time.monotonic() < deadline:
+        online = manager_request("ping")
+        if online:
+            _check_manager_config(online, config)
+            manager_request("apply")
+            return spawned is not None
+        if not _manager_lock_held():
+            if spawned is not None and spawned.poll() is not None:
+                raise WorkersError(f"worker manager exited during startup with status {spawned.returncode}")
+            if spawned is None:
+                state = workers_state_dir()
+                state.mkdir(parents=True, exist_ok=True)
+                log = (state / "manager.log").open("ab", buffering=0)
+                try:
+                    spawned = subprocess.Popen(
+                        self_argv("workers", "--config", config, "manager"),
+                        cwd=HERE,
+                        env=self_env(),
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                finally:
+                    log.close()
+        time.sleep(0.1)
+    raise WorkersError("worker manager did not become responsive within 35 seconds")
+
+
+def wait_manager_stopped(timeout: float = 35) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _manager_lock_held():
+            return
+        time.sleep(0.1)
+    raise WorkersError(f"worker manager did not stop within {timeout:g} seconds")
 
 
 def _format_age(value) -> str:
@@ -804,10 +922,7 @@ def _format_age(value) -> str:
 
 
 def print_worker_status(config: Path, *, as_json: bool = False) -> bool:
-    try:
-        specs = load_worker_specs(config)
-    except WorkersError as exc:
-        workers_die(str(exc))
+    specs = load_worker_specs(config)
     snapshots = worker_snapshots(specs)
     online = manager_request("ping")
     if as_json:
@@ -830,12 +945,17 @@ def print_worker_status(config: Path, *, as_json: bool = False) -> bool:
 
 
 def _mutate_enabled(config: Path, wid: str, enabled: bool) -> None:
-    specs = load_worker_specs(config)
-    if not any(spec.id == wid for spec in specs):
-        raise WorkersError(f"unknown worker: {wid}")
-    save_worker_specs(
-        config, [dataclasses.replace(spec, enabled=enabled) if spec.id == wid else spec for spec in specs]
-    )
+    with _config_lock(config):
+        specs = load_worker_specs(config)
+        if not any(spec.id == wid for spec in specs):
+            raise WorkersError(f"unknown worker: {wid}")
+        _write_worker_specs(
+            config, [dataclasses.replace(spec, enabled=enabled) if spec.id == wid else spec for spec in specs]
+        )
+    if enabled:
+        # Re-enabling is an explicit request to run, even for restart="never" or after a clean
+        # on-failure exit. Clear the terminal policy record after persisting desired state.
+        update_status(status_path(wid), stopped_at=None, exit_code=None, state="queued")
 
 
 def set_worker_enabled(config: Path, wid: str, enabled: bool) -> None:
@@ -847,36 +967,39 @@ def restart_worker(config: Path, wid: str) -> None:
     specs = load_worker_specs(config)
     if not any(spec.id == wid for spec in specs):
         raise WorkersError(f"unknown worker: {wid}")
-    started = ensure_manager(config)
-    if not started and not manager_request("restart", id=wid):
+    ensure_manager(config)
+    response = manager_request("restart", id=wid)
+    if not response or not response.get("ok"):
         raise WorkersError("worker manager did not accept the restart request")
 
 
 def _remove_spec(config: Path, wid: str) -> None:
-    specs = load_worker_specs(config)
-    if not any(spec.id == wid for spec in specs):
-        raise WorkersError(f"unknown worker: {wid}")
-    save_worker_specs(config, [spec for spec in specs if spec.id != wid])
+    with _config_lock(config):
+        specs = load_worker_specs(config)
+        if not any(spec.id == wid for spec in specs):
+            raise WorkersError(f"unknown worker: {wid}")
+        _write_worker_specs(config, [spec for spec in specs if spec.id != wid])
 
 
 def add_dashboard_worker(
     config: Path, *, only: str | None, agent: str, bubble: bool, roadmap_only: str | None, roadmap_skip: str | None
 ) -> WorkerSpec:
-    try:
-        specs = load_worker_specs(config)
-    except WorkersError:
-        if config.exists():
-            raise
-        specs = []
-    spec = WorkerSpec(
-        id=next_worker_id(specs),
-        agent=agent,
-        only=(only,) if only else (),
-        sandbox="bubble" if bubble else "host",
-        roadmap_only=roadmap_only,
-        roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
-    )
-    save_worker_specs(config, [*specs, spec])
+    with _config_lock(config):
+        try:
+            specs = load_worker_specs(config)
+        except WorkersError:
+            if config.exists():
+                raise
+            specs = []
+        spec = WorkerSpec(
+            id=next_worker_id(specs),
+            agent=agent,
+            only=(only,) if only else (),
+            sandbox="bubble" if bubble else "host",
+            roadmap_only=roadmap_only,
+            roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
+        )
+        _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
     return spec
 
@@ -903,7 +1026,12 @@ def _follow_log(path: Path, lines: int, follow: bool) -> int:
 
 def _tmux_shell(argv: list[str]) -> str:
     env = self_env()
-    return shlex.join([shutil.which("env") or "/usr/bin/env", f"PYTHONPATH={env['PYTHONPATH']}", *argv])
+    assignments = [
+        f"PYTHONPATH={env['PYTHONPATH']}",
+        f"TAUCETI_WORKERS_STATE_DIR={workers_state_dir()}",
+        f"TAUCETI_RUNTIME_DIR={workers_runtime_dir()}",
+    ]
+    return shlex.join([shutil.which("env") or "/usr/bin/env", *assignments, *argv])
 
 
 def cmd_tmux(config: Path, attach: bool) -> int:
@@ -950,7 +1078,8 @@ def cmd_tmux(config: Path, attach: bool) -> int:
     for name in sorted((windows - wanted) - {"dashboard"}):
         subprocess.run([tmux, "kill-window", "-t", f"{TMUX_SESSION}:{name}"], check=False)
     if attach:
-        os.execvp(tmux, [tmux, "attach-session", "-t", TMUX_SESSION])
+        action = "switch-client" if os.environ.get("TMUX") else "attach-session"
+        os.execvp(tmux, [tmux, action, "-t", TMUX_SESSION])
     print(f"tmux session {TMUX_SESSION!r} is ready")
     return 0
 
@@ -962,8 +1091,12 @@ def _service_command(config: Path) -> list[str]:
     return [*entry, "workers", "--config", str(config), "manager"]
 
 
+def _systemd_quote(value: str) -> str:
+    return json.dumps(value.replace("%", "%%"))
+
+
 def _systemd_unit(config: Path) -> str:
-    command = " ".join(json.dumps(part) for part in _service_command(config))
+    command = " ".join(_systemd_quote(part) for part in _service_command(config))
     # Assignment values are not shell syntax: quotes become literal in WorkingDirectory=. Escape the
     # small set systemd treats specially while keeping the path absolute after parsing.
     working_directory = str(HERE).replace("\\", "\\\\").replace(" ", "\\x20").replace("%", "%%")
@@ -974,6 +1107,8 @@ Description=Keep configured Tau Ceti workers running
 Type=simple
 WorkingDirectory={working_directory}
 ExecStart={command}
+Environment={_systemd_quote('PATH=' + os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'))}
+Environment={_systemd_quote('PYTHONPATH=' + self_env()['PYTHONPATH'])}
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
@@ -990,7 +1125,9 @@ def _launchd_label() -> str:
 def _service_path() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "LaunchAgents" / f"{_launchd_label()}.plist"
-    return Path.home() / ".config" / "systemd" / "user" / "tauceti-workers.service"
+    raw = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(raw).expanduser() if raw else Path.home() / ".config"
+    return base / "systemd" / "user" / "tauceti-workers.service"
 
 
 def service_action(action: str, config: Path) -> int:
@@ -998,6 +1135,12 @@ def service_action(action: str, config: Path) -> int:
     if sys.platform == "darwin":
         domain = f"gui/{os.getuid()}"
         service = f"{domain}/{_launchd_label()}"
+        if action in ("install", "start", "restart"):
+            probe = subprocess.run(
+                ["launchctl", "print", domain], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            if probe.returncode:
+                raise WorkersError("macOS LaunchAgents require an active graphical login session")
         if action == "install":
             path.parent.mkdir(parents=True, exist_ok=True)
             workers_state_dir().mkdir(parents=True, exist_ok=True)
@@ -1170,11 +1313,17 @@ def add_workers_parser(subparsers) -> None:
 
 def cmd_workers(args) -> int:
     action = args.workers_action or "status"
-    config = args.config.expanduser()
+    config = args.config.expanduser().resolve()
     try:
         if action == "status":
             while True:
-                healthy = print_worker_status(config, as_json=args.json)
+                try:
+                    healthy = print_worker_status(config, as_json=args.json)
+                except WorkersError as exc:
+                    if not args.watch:
+                        raise
+                    healthy = False
+                    print(f"tauceti workers: {exc}", file=sys.stderr)
                 if not args.watch:
                     return 0 if healthy else 1
                 time.sleep(2)
@@ -1191,31 +1340,32 @@ def cmd_workers(args) -> int:
             ensure_manager(config)
             return 0
         if action == "add":
-            try:
-                specs = load_worker_specs(config)
-            except WorkersError:
-                if config.exists():
-                    raise
-                specs = []
-            wid = args.worker_id or next_worker_id(specs)
-            if any(spec.id == wid for spec in specs):
-                raise WorkersError(f"worker already exists: {wid}")
-            raw = {
-                "id": wid,
-                "agent": args.agent,
-                "only": [item for item in args.only.split(",") if item],
-                "sandbox": args.sandbox,
-                "ignore_quota": args.ignore_quota,
-                "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
-                "stream": args.stream,
-                "isolate_home": args.isolate_home,
-            }
-            for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
-                value = getattr(args, key)
-                if value is not None:
-                    raw[key] = value
-            spec = WorkerSpec.from_dict(raw, len(specs))
-            save_worker_specs(config, [*specs, spec])
+            with _config_lock(config):
+                try:
+                    specs = load_worker_specs(config)
+                except WorkersError:
+                    if config.exists():
+                        raise
+                    specs = []
+                wid = args.worker_id or next_worker_id(specs)
+                if any(spec.id == wid for spec in specs):
+                    raise WorkersError(f"worker already exists: {wid}")
+                raw = {
+                    "id": wid,
+                    "agent": args.agent,
+                    "only": [item for item in args.only.split(",") if item],
+                    "sandbox": args.sandbox,
+                    "ignore_quota": args.ignore_quota,
+                    "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
+                    "stream": args.stream,
+                    "isolate_home": args.isolate_home,
+                }
+                for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
+                    value = getattr(args, key)
+                    if value is not None:
+                        raw[key] = value
+                spec = WorkerSpec.from_dict(raw, len(specs))
+                _write_worker_specs(config, [*specs, spec])
             ensure_manager(config)
             print(f"added {spec.id}")
             return 0
@@ -1242,6 +1392,7 @@ def cmd_workers(args) -> int:
             response = manager_request("shutdown", stop_workers=not args.leave_workers)
             if not response:
                 workers_die("manager is offline")
+            wait_manager_stopped()
             return 0
         if action == "service":
             try:

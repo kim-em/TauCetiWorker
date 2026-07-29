@@ -17,6 +17,13 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 root = Path(tempfile.mkdtemp(prefix="tauceti-workers-test-"))
+for key in (
+    "TAUCETI_CONFIG_HOME",
+    "TAUCETI_WORKERS_CONFIG",
+    "TAUCETI_WORKERS_STATE_DIR",
+    "TAUCETI_RUNTIME_DIR",
+):
+    os.environ.pop(key, None)
 os.environ["XDG_CONFIG_HOME"] = str(root / "config")
 os.environ["XDG_STATE_HOME"] = str(root / "state")
 os.environ["TAUCETI_RUNTIME_DIR"] = str(root / "run")
@@ -25,6 +32,7 @@ os.environ["TAUCETI_MANAGER_TEST_COMMAND"] = shlex.join(
 )
 
 import tauceti_worker.worker_manager as wm
+from tauceti_worker.cli import build_parser
 from tauceti_worker.runtime_status import report_runtime
 
 
@@ -60,6 +68,7 @@ def start_manager(config):
 
 
 config = wm.default_workers_config()
+assert config.is_relative_to(root), f"test configuration escaped its temporary root: {config}"
 specs = [
     wm.WorkerSpec(id="worker1"),
     wm.WorkerSpec(id="worker2", agent="codex", only=("review",)),
@@ -83,6 +92,46 @@ try:
     assert imported[0].id == "worker2"
     assert imported[0].only == ("rebase", "review")
     assert imported[0].ignore_quota is True
+
+    # The full semantic model must remain parseable by the real work CLI.
+    maximal = wm.WorkerSpec(
+        id="maximal",
+        agent="codex",
+        only=("roadmap", "review"),
+        sandbox="bubble",
+        ignore_quota=True,
+        roadmap_only="RepresentationTheory",
+        roadmap_skip=("Algebra",),
+        roadmap_extra_identities=("Maintainer",),
+        respect_claims=False,
+        source="https://example.invalid/source",
+        author_model="gpt-5",
+        author_effort="high",
+        pace="50%@1h",
+        stream=True,
+        isolate_home=True,
+    )
+    parsed = build_parser().parse_args(maximal.work_argv()[3:])
+    assert parsed.cmd == "work" and parsed.worker_id == "maximal"
+
+    # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
+    wm.update_status(
+        wm.status_path("snapshot"),
+        managed=True,
+        agent="codex",
+        only=["review"],
+        sandbox="bubble",
+        spec_hash="old",
+    )
+    desired_snapshot = wm.worker_snapshots([wm.WorkerSpec(id="snapshot", agent="claude")])[0]
+    assert desired_snapshot["agent"] == "claude"
+    assert desired_snapshot["actual_spec_hash"] == "old"
+
+    if sys.platform != "darwin":
+        assert wm._service_path() == root / "config" / "systemd" / "user" / "tauceti-workers.service"
+        unit = wm._systemd_unit(config)
+        assert "Environment=\"PATH=" in unit and "Environment=\"PYTHONPATH=" in unit
+        assert "ExecStart=" in unit and str(config.resolve()) in unit
 
     manager = start_manager(config)
     wait_for(lambda: wm.manager_request("ping"))
@@ -145,15 +194,33 @@ try:
     wait_for(lambda: (reply := wm.manager_request("ping")) and reply.get("error"))
     assert {wid: wm.runner_status(wid).get("wrapper_pid") for wid in survivors} == survivors
 
-    wm.save_worker_specs(config, current)
-    assert wm.manager_request("apply")
+    # Shutdown against an initially malformed config stops surviving wrappers without iterating None.
+    assert wm.manager_request("shutdown", stop_workers=True)
+    manager.wait(15)
+    assert manager.returncode == 0
+    manager = None
+    wait_for(lambda: not any(wm.runner_status(wid).get("alive") for wid in survivors))
+
+    # Explicit restart revives a terminal restart="never" worker without changing its policy.
+    never = wm.WorkerSpec(id="never", restart="never")
+    wm.save_worker_specs(config, [never])
+    manager = start_manager(config)
+    wait_for(lambda: wm.runner_status("never").get("alive"))
+    assert wm.manager_request("shutdown", stop_workers=True)
+    manager.wait(15)
+    manager = start_manager(config)
+    wait_for(lambda: wm.manager_request("ping"))
+    time.sleep(0.3)
+    assert not wm.runner_status("never").get("alive")
+    wm.restart_worker(config, "never")
+    wait_for(lambda: wm.runner_status("never").get("alive"))
 
     # Manager shutdown can stop the complete fleet, leaving readable terminal status records.
     assert wm.manager_request("shutdown", stop_workers=True)
     manager.wait(15)
     assert manager.returncode == 0
     manager = None
-    wait_for(lambda: not any(wm.runner_status(spec.id).get("alive") for spec in specs))
+    wait_for(lambda: not wm.runner_status("never").get("alive"))
     print("worker manager: OK")
 finally:
     if manager is not None and manager.poll() is None:
@@ -163,4 +230,12 @@ finally:
         except subprocess.TimeoutExpired:
             manager.terminate()
             manager.wait(5)
+    for state_file in (root / "state" / "tauceti" / "workers").glob("*.json"):
+        wm._stop_runner(state_file.stem)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        ids = [path.stem for path in (root / "state" / "tauceti" / "workers").glob("*.json")]
+        if not any(wm.runner_status(wid).get("alive") for wid in ids):
+            break
+        time.sleep(0.05)
     shutil.rmtree(root, ignore_errors=True)

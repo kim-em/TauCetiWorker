@@ -402,7 +402,10 @@ def _dashboard_app(cfg, loader=None):
             self.workers_config = default_workers_config()
             self.worker_rows = []
             self.worker_sel = 0
+            self.worker_selected_id = None
             self.worker_error = None
+            self.worker_manager_online = False
+            self._worker_load_seq = 0
 
         def compose(self) -> ComposeResult:
             yield Static(id="hdr")
@@ -526,17 +529,38 @@ def _dashboard_app(cfg, loader=None):
             self.query_one("#status", Static).update(s)
 
         def _refresh_workers(self) -> None:
+            self._worker_load_seq += 1
+            selected = None
+            if self.worker_rows:
+                selected = self.worker_rows[self.worker_sel]["id"]
+            self._load_workers(self._worker_load_seq, selected)
+
+        @work(thread=True, exclusive=True, group="workers")
+        def _load_workers(self, seq: int, selected: str | None) -> None:
             try:
                 specs = load_worker_specs(self.workers_config)
-                self.worker_rows = worker_snapshots(specs)
-                self.worker_error = None
-            except WorkersError as exc:
-                self.worker_rows = []
-                self.worker_error = str(exc)
-            if self.worker_rows:
-                self.worker_sel %= len(self.worker_rows)
+                rows = worker_snapshots(specs)
+                online = bool(manager_request("ping"))
+                self.call_from_thread(self._workers_loaded, seq, selected, rows, online, None)
+            except Exception as exc:  # local I/O failures must never tear down the dashboard
+                self.call_from_thread(self._workers_loaded, seq, selected, [], False, str(exc))
+
+        def _workers_loaded(self, seq, selected, rows, online, error) -> None:
+            if seq != self._worker_load_seq:
+                return
+            self.worker_rows = rows
+            self.worker_error = error
+            self.worker_manager_online = online
+            if rows:
+                ids = [row["id"] for row in rows]
+                if selected in ids:
+                    self.worker_sel = ids.index(selected)
+                else:
+                    self.worker_sel %= len(rows)
+                self.worker_selected_id = rows[self.worker_sel]["id"]
             else:
                 self.worker_sel = 0
+                self.worker_selected_id = None
             if self.view == "workers":
                 self._render()
 
@@ -545,7 +569,8 @@ def _dashboard_app(cfg, loader=None):
             head.append(TAUCETI, style="bold")
             head.append("   persistent workers")
             head.append(
-                f"\nmanager: {'running' if manager_request('ping') else 'offline'}   config: {self.workers_config}"
+                f"\nmanager: {'running' if self.worker_manager_online else 'offline'}   "
+                f"config: {self.workers_config}"
             )
             self.query_one("#hdr", Static).update(Panel(head, title="tauceti — workers"))
 
@@ -595,6 +620,7 @@ def _dashboard_app(cfg, loader=None):
             if self.view == "workers":
                 if self.worker_rows:
                     self.worker_sel = (self.worker_sel - 1) % len(self.worker_rows)
+                    self.worker_selected_id = self.worker_rows[self.worker_sel]["id"]
                     self._render()
                 return
             self._sel_init = True  # a deliberate move; don't let the first survey snap it back
@@ -605,6 +631,7 @@ def _dashboard_app(cfg, loader=None):
             if self.view == "workers":
                 if self.worker_rows:
                     self.worker_sel = (self.worker_sel + 1) % len(self.worker_rows)
+                    self.worker_selected_id = self.worker_rows[self.worker_sel]["id"]
                     self._render()
                 return
             self._sel_init = True

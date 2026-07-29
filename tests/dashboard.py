@@ -21,6 +21,13 @@ from types import SimpleNamespace
 
 # Isolate the prefs file: persistence must land here, not in the operator's real ~/.config.
 _CFGDIR = tempfile.mkdtemp(prefix="tauceti-prefs-")
+for _key in (
+    "TAUCETI_CONFIG_HOME",
+    "TAUCETI_WORKERS_CONFIG",
+    "TAUCETI_WORKERS_STATE_DIR",
+    "TAUCETI_RUNTIME_DIR",
+):
+    os.environ.pop(_key, None)
 os.environ["XDG_CONFIG_HOME"] = _CFGDIR
 os.environ["XDG_STATE_HOME"] = str(Path(_CFGDIR) / "state-home")
 os.environ["TAUCETI_RUNTIME_DIR"] = str(Path(_CFGDIR) / "runtime")
@@ -30,6 +37,10 @@ os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
+
+assert tc.default_workers_config().is_relative_to(Path(_CFGDIR)), (
+    f"dashboard test configuration escaped its temporary root: {tc.default_workers_config()}"
+)
 
 fails = 0
 

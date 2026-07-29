@@ -61,7 +61,7 @@ from .round import Claims, RoundContext, cmd_heartbeat
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .work_units import RoundOpts, Worker, _bubble, run_round, want
-from .worker_manager import add_workers_parser, cmd_managed_runner, cmd_workers
+from .worker_manager import WorkersError, add_workers_parser, cmd_managed_runner, cmd_workers
 
 # ============================================================================
 # CLI
@@ -751,6 +751,9 @@ def cli_main() -> int:
     except NoProgress as e:
         log(str(e))
         return EX_NOPROGRESS
+    except WorkersError as e:
+        print(f"tauceti workers: {e}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         return 130
 
