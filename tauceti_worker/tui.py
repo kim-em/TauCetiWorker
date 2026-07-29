@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 from .agents import _shq
@@ -18,6 +16,18 @@ from .paths import entry_cmd
 from .quota import Quota, _read_json_file, quota_line
 from .review_state import ReviewState
 from .survey import Candidate, Counters, Survey, survey
+from .worker_manager import (
+    WorkersError,
+    _format_age,
+    add_dashboard_worker,
+    config_home,
+    default_workers_config,
+    load_worker_specs,
+    manager_request,
+    restart_worker,
+    set_worker_enabled,
+    worker_snapshots,
+)
 
 
 def _sample(cands: list[Candidate], n: int = 3) -> str:
@@ -168,14 +178,8 @@ def launch_cmd(
 
 
 def _prefs_path(cfg: Config) -> Path:
-    """Where the dashboard remembers its dials. A stable per-user config file (honoring
-    $XDG_CONFIG_HOME, default ~/.config/tauceti/), NOT the per-worker state dir: `state` lives under
-    HERE — i.e. inside the installed tree when `uv tool install`ed — which a `uv tool upgrade` can
-    discard. These are operator preferences that should outlive the install, and be shared whether you
-    run `./tauceti` from a clone or the installed `tauceti`."""
-    base = os.environ.get("XDG_CONFIG_HOME")
-    root = Path(base) if base else (cfg.home / ".config")
-    return root / "tauceti" / "dashboard.json"
+    """Where the dashboard remembers its dials, beside the persistent worker configuration."""
+    return config_home() / "dashboard.json"
 
 
 def load_dashboard_prefs(cfg: Config) -> dict:
@@ -329,6 +333,7 @@ def _dashboard_app(cfg, loader=None):
         Screen { layers: base; }
         #hdr { height: auto; }
         #tbl { height: 1fr; }
+        #workers-tbl { height: 1fr; display: none; }
         #status { height: auto; padding: 1 0 0 1; color: $text-muted; }
         ModalScreen { align: center middle; }
         #dialog {
@@ -356,6 +361,9 @@ def _dashboard_app(cfg, loader=None):
             Binding("x", "set_skip", "skip"),
             Binding("r", "refresh", "refresh"),
             Binding("c", "copy_cmd", "copy"),
+            Binding("w", "toggle_view", "work/workers"),
+            Binding("space", "toggle_worker", "enable", show=False),
+            Binding("ctrl+r", "restart_worker", "restart", show=False),
             Binding("q", "quit", "quit"),
         ] + [Binding(k, f"run_kind('{k}')", f"#{k}", show=False) for k in KIND_KEYS]
 
@@ -390,19 +398,29 @@ def _dashboard_app(cfg, loader=None):
             self._saved_skip = prefs.get("roadmap_skip") if isinstance(prefs.get("roadmap_skip"), str) else None
             self._skip_set_by_user = False  # only a skip set via [x] is persisted (not an env override)
             self.followup = None  # ("exec", cmd) read by cmd_tui once the alt-screen is gone
+            self.view = "work"
+            self.workers_config = default_workers_config()
+            self.worker_rows = []
+            self.worker_sel = 0
+            self.worker_error = None
 
         def compose(self) -> ComposeResult:
             yield Static(id="hdr")
             yield WorkGrid(id="tbl", cursor_type="row")
+            yield WorkGrid(id="workers-tbl", cursor_type="row")
             yield Static(id="status")
             yield Footer()
 
         def on_mount(self) -> None:
-            t = self.query_one(DataTable)
+            t = self.query_one("#tbl", DataTable)
             t.add_columns("#", "KIND", "READY", "SAMPLE / NOTE")
+            workers = self.query_one("#workers-tbl", DataTable)
+            workers.add_columns("WORKER", "DESIRED", "ACTUAL", "WORK", "AGENT", "ACTIVITY", "RESTARTS")
             self._render()
             self._refresh()  # first survey fetch (background thread)
             self.set_interval(90, self._refresh)  # keep it live without per-keypress refetches
+            self._refresh_workers()
+            self.set_interval(2, self._refresh_workers)
 
         # ---- survey load: a background thread, because gh shells out (this was the old lag) ----------
         def _refresh(self) -> None:
@@ -436,6 +454,11 @@ def _dashboard_app(cfg, loader=None):
 
         # ---- rendering: pure local state, so cursor moves never touch the network -------------------
         def _render(self) -> None:
+            if self.view == "workers":
+                self._render_worker_header()
+                self._render_worker_table()
+                self._render_worker_status()
+                return
             self._render_header()
             self._render_table()
             self._render_status()
@@ -459,7 +482,7 @@ def _dashboard_app(cfg, loader=None):
             self.query_one("#hdr", Static).update(Panel(head, title="tauceti"))
 
         def _render_table(self) -> None:
-            t = self.query_one(DataTable)
+            t = self.query_one("#tbl", DataTable)
             t.clear()
             self._hdr_row = {}
             sv = self.sv
@@ -502,18 +525,95 @@ def _dashboard_app(cfg, loader=None):
             s.append(nxt_s, style="bold")
             self.query_one("#status", Static).update(s)
 
+        def _refresh_workers(self) -> None:
+            try:
+                specs = load_worker_specs(self.workers_config)
+                self.worker_rows = worker_snapshots(specs)
+                self.worker_error = None
+            except WorkersError as exc:
+                self.worker_rows = []
+                self.worker_error = str(exc)
+            if self.worker_rows:
+                self.worker_sel %= len(self.worker_rows)
+            else:
+                self.worker_sel = 0
+            if self.view == "workers":
+                self._render()
+
+        def _render_worker_header(self) -> None:
+            head = Text()
+            head.append(TAUCETI, style="bold")
+            head.append("   persistent workers")
+            head.append(
+                f"\nmanager: {'running' if manager_request('ping') else 'offline'}   config: {self.workers_config}"
+            )
+            self.query_one("#hdr", Static).update(Panel(head, title="tauceti — workers"))
+
+        def _render_worker_table(self) -> None:
+            table = self.query_one("#workers-tbl", DataTable)
+            table.clear()
+            for index, item in enumerate(self.worker_rows):
+                selected = index == self.worker_sel
+
+                def cell(value, sel=selected):
+                    return Text(str(value), style="reverse bold" if sel else "")
+
+                work_name = item.get("phase") or ",".join(item.get("only") or []) or "auto"
+                target = item.get("target")
+                if target:
+                    work_name = f"{work_name} {target}"
+                table.add_row(
+                    cell(("▸ " if selected else "  ") + item["id"]),
+                    cell(item["desired"]),
+                    cell(item["actual"]),
+                    cell(work_name),
+                    cell(item.get("agent") or "auto"),
+                    cell(_format_age(item.get("activity_at"))),
+                    cell(item.get("restart_count", 0)),
+                )
+            if table.row_count:
+                table.move_cursor(row=self.worker_sel, animate=False)
+
+        def _render_worker_status(self) -> None:
+            status = Text()
+            if self.worker_error:
+                status.append(self.worker_error, style="red")
+                status.append("\n[l/L] creates the first persistent worker from the Work view")
+            elif not self.worker_rows:
+                status.append("No configured workers. Press [w] for Work, choose the dials, then [l] or [L].")
+            else:
+                item = self.worker_rows[self.worker_sel]
+                status.append("[space] enable/disable   [ctrl+r] restart   [enter] follow log", style="bold")
+                if item.get("detail"):
+                    status.append(f"\n{item['detail']}")
+                if item.get("log_file"):
+                    status.append(f"   log: {item['log_file']}")
+            self.query_one("#status", Static).update(status)
+
         # ---- cursor + expansion (instant, local) ----------------------------------------------------
         def action_cursor_up(self) -> None:
+            if self.view == "workers":
+                if self.worker_rows:
+                    self.worker_sel = (self.worker_sel - 1) % len(self.worker_rows)
+                    self._render()
+                return
             self._sel_init = True  # a deliberate move; don't let the first survey snap it back
             self.sel = (self.sel - 1) % len(ALLOWED_TASKS)
             self._render_table()
 
         def action_cursor_down(self) -> None:
+            if self.view == "workers":
+                if self.worker_rows:
+                    self.worker_sel = (self.worker_sel + 1) % len(self.worker_rows)
+                    self._render()
+                return
             self._sel_init = True
             self.sel = (self.sel + 1) % len(ALLOWED_TASKS)
             self._render_table()
 
         def action_expand(self) -> None:
+            if self.view == "workers":
+                return
             name = ALLOWED_TASKS[self.sel]
             if name == "roadmap" and not self.areas:
                 self._refresh()  # the area list arrives with the next survey
@@ -521,16 +621,22 @@ def _dashboard_app(cfg, loader=None):
             self._render_table()
 
         def action_collapse(self) -> None:
+            if self.view == "workers":
+                return
             self.expanded.discard(ALLOWED_TASKS[self.sel])
             self._render_table()
 
         # ---- dials ----------------------------------------------------------------------------------
         def action_cycle_model(self) -> None:
+            if self.view == "workers":
+                return
             self.model_dial = MODELS[(MODELS.index(self.model_dial) + 1) % len(MODELS)]
             self._render_status()
             self._save_prefs()
 
         def action_toggle_sandbox(self) -> None:
+            if self.view == "workers":
+                return
             self.bubble = not self.bubble
             self._render_status()
             self._save_prefs()
@@ -551,8 +657,41 @@ def _dashboard_app(cfg, loader=None):
             save_dashboard_prefs(self.cfg, data)
 
         def action_refresh(self) -> None:
+            if self.view == "workers":
+                self.notify("refreshing workers…", timeout=2)
+                self._refresh_workers()
+                return
             self.notify("refreshing…", timeout=2)
             self._refresh()
+
+        def action_toggle_view(self) -> None:
+            self.view = "workers" if self.view == "work" else "work"
+            self.query_one("#tbl", DataTable).display = self.view == "work"
+            self.query_one("#workers-tbl", DataTable).display = self.view == "workers"
+            if self.view == "workers":
+                self._refresh_workers()
+            self._render()
+
+        def action_toggle_worker(self) -> None:
+            if self.view != "workers" or not self.worker_rows:
+                return
+            item = self.worker_rows[self.worker_sel]
+            try:
+                set_worker_enabled(self.workers_config, item["id"], not item["enabled"])
+                self.notify(f"{item['id']}: {'disabled' if item['enabled'] else 'enabled'}", timeout=3)
+                self._refresh_workers()
+            except WorkersError as exc:
+                self.notify(str(exc), title="worker configuration error", severity="error", timeout=8)
+
+        def action_restart_worker(self) -> None:
+            if self.view != "workers" or not self.worker_rows:
+                return
+            item = self.worker_rows[self.worker_sel]
+            try:
+                restart_worker(self.workers_config, item["id"])
+                self.notify(f"restarting {item['id']}", timeout=3)
+            except WorkersError as exc:
+                self.notify(str(exc), title="worker restart error", severity="error", timeout=8)
 
         def _apply_only(self, value: str) -> None:
             os.environ["TAUCETI_ROADMAP_ONLY"] = value
@@ -564,6 +703,8 @@ def _dashboard_app(cfg, loader=None):
             self._render()
 
         def action_set_only(self) -> None:
+            if self.view == "workers":
+                return
             cur = roadmap_only() or ""  # None (auto) → "" so the picker/prompt starts at all-areas
             if self.areas:
                 opts = ["(all areas)"] + self.areas
@@ -593,6 +734,8 @@ def _dashboard_app(cfg, loader=None):
             self._render()
 
         def action_set_skip(self) -> None:
+            if self.view == "workers":
+                return
             cur = ",".join(roadmap_skip())
 
             def done(val):
@@ -603,6 +746,8 @@ def _dashboard_app(cfg, loader=None):
 
         # ---- launch ---------------------------------------------------------------------------------
         def action_copy_cmd(self) -> None:
+            if self.view == "workers":
+                return
             skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
             one = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.bubble, False, roadmap_only(), skip))
             loop = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.bubble, True, roadmap_only(), skip))
@@ -617,17 +762,42 @@ def _dashboard_app(cfg, loader=None):
             only = ALLOWED_TASKS[self.sel] if only_selected else None
             skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
             cmd = launch_cmd(only, self.model_dial, self.bubble, loop, roadmap_only(), skip)
-            if loop:  # detached: the TUI is a launcher, not a supervisor
-                pid, logf = _launch_detached(self.cfg, cmd)
-                self.notify(f"pid {pid}  →  {logf}\nstop it:  kill {pid}", title="loop launched", timeout=10)
+            if loop:
+                try:
+                    spec = add_dashboard_worker(
+                        self.workers_config,
+                        only=only,
+                        agent=self.model_dial,
+                        bubble=self.bubble,
+                        roadmap_only=roadmap_only(),
+                        roadmap_skip=skip,
+                    )
+                    self.notify(
+                        f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",
+                        title="persistent worker added",
+                        timeout=10,
+                    )
+                    self._refresh_workers()
+                except WorkersError as exc:
+                    self.notify(str(exc), title="worker configuration error", severity="error", timeout=10)
             else:  # foreground: hand the tty over by replacing this process
                 self.followup = ("exec", cmd)
                 self.exit()
 
         def action_run_selected(self) -> None:
+            if self.view == "workers":
+                if self.worker_rows and self.worker_rows[self.worker_sel].get("log_file"):
+                    wid = self.worker_rows[self.worker_sel]["id"]
+                    self.followup = (
+                        "exec",
+                        entry_cmd() + ["workers", "--config", str(self.workers_config), "logs", wid, "--follow"],
+                    )
+                    self.exit()
+                return
             self._launch(loop=False, only_selected=True)
 
         def action_run_kind(self, key: str) -> None:
+            self.view = "work"
             self.sel = ALLOWED_TASKS.index(KIND_KEYS[key])
             self._launch(loop=False, only_selected=True)
 
@@ -641,9 +811,9 @@ def _dashboard_app(cfg, loader=None):
 
 
 def cmd_tui(args) -> int:
-    """Default view: a Textual dashboard of available work + a launcher. NOT a supervisor — launching a
-    loop detaches it (coordination lives in GitHub, not here). Over a pipe / no TTY it prints a
-    snapshot. Selecting a one-round action exits the dashboard and execs the round so it owns the tty."""
+    """Default view: available work plus persistent desired/actual worker monitoring. Over a pipe or
+    without a TTY it prints a survey snapshot. A one-round action exits and owns the tty; a loop action
+    adds a durable worker definition for the portable manager to reconcile."""
     from rich.console import Console
 
     console = Console()
@@ -664,14 +834,3 @@ def cmd_tui(args) -> int:
         console.print(f"\n  running: {' '.join(_shq(a) for a in cmd)}\n")
         os.execvp(cmd[0], cmd)  # replace this process; the round owns the tty
     return 0
-
-
-def _launch_detached(cfg: Config, cmd: list[str]) -> tuple[int, Path]:
-    """Spawn a loop in its own session, logging to a timestamped file; return (pid, logfile) so the
-    caller can report how to watch and stop it. Detached because the TUI is a launcher, not a
-    supervisor — the loop coordinates through GitHub, not this process."""
-    cfg.logdir.mkdir(parents=True, exist_ok=True)
-    logf = cfg.logdir / f"loop-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    f = open(logf, "ab")
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=f, start_new_session=True)
-    return p.pid, logf

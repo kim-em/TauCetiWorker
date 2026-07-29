@@ -39,6 +39,60 @@ shim that runs the `tauceti_worker` package), and every command above works the 
 current round and exits, and `tauceti doctor` checks your environment and tells
 you what's missing.
 
+### Persistent workers
+
+Persistent workers are declarative and do not belong to a terminal session. Put
+their desired state in `workers.toml` (start with `workers.toml.example`) and
+apply it:
+
+```bash
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/tauceti"
+cp workers.toml.example "${XDG_CONFIG_HOME:-$HOME/.config}/tauceti/workers.toml"
+./tauceti workers apply
+./tauceti workers status
+```
+
+On macOS without `XDG_CONFIG_HOME`, the default is `~/Library/Application
+Support/tauceti/workers.toml`. `$TAUCETI_CONFIG_HOME` and
+`$TAUCETI_WORKERS_CONFIG` override discovery, and every command also accepts
+`tauceti workers --config PATH ...`. An old line-oriented file can be migrated
+once with `tauceti workers import workers.conf`.
+
+The manager validates the entire TOML generation before applying it. It starts
+missing enabled workers, gracefully stops disabled or removed workers, restarts
+only definitions that changed, and backs off repeated failures. Each managed
+worker publishes structured state such as `waiting-quota`, `surveying`,
+`running`, or `backoff`, its current phase and target, and its durable logfile.
+Useful controls are:
+
+```bash
+./tauceti workers enable worker2
+./tauceti workers disable worker2
+./tauceti workers restart worker2
+./tauceti workers logs --follow worker2
+./tauceti workers edit
+```
+
+`workers apply` starts a detached manager for the current login session when one
+is not already running. For login-independent operation and startup after a
+reboot, install the native user service:
+
+```bash
+./tauceti workers service install
+./tauceti workers service status
+```
+
+This installs a systemd user service on Linux/NixOS or a LaunchAgent on macOS.
+The reconciler and worker control sockets are portable Unix code; no Linux
+`/proc` interface is required. On Linux systems that stop the user manager after
+the last logout, `loginctl enable-linger "$USER"` keeps user services running
+with no login session.
+
+Tmux is an optional view, not the supervisor. `tauceti workers tmux` opens one
+dashboard window and one log-following window per enabled worker. Killing that
+tmux session does not stop any worker; running the command again reconstructs
+the view from the configuration and durable logs.
+
 ### Docker deployment
 
 From the repository root:
@@ -78,14 +132,20 @@ re-queries GitHub. It reacts to single keypresses (no Enter):
 | `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the areas) |
 | `Enter` | run one round of the selected kind |
 | `1`–`6` | run one round of that numbered kind directly |
-| `l` / `L` | loop the auto cascade / loop just the selected kind |
+| `l` / `L` | add a persistent worker for the auto cascade / selected kind |
 | `o` / `x` | pick the single roadmap area (`--roadmap-only`) / edit the skipped areas (`--roadmap-skip`) |
 | `m` / `s` | cycle the agent / toggle the sandbox (host ↔ bubble) |
+| `w` | switch between available Work and desired/actual Workers |
 | `r` / `c` / `q` | refresh / copy the launch command to the clipboard / quit |
 
-The agent, sandbox, and roadmap area dials you pick are remembered between runs in
-`$XDG_CONFIG_HOME/tauceti/dashboard.json` (default `~/.config/tauceti/`), so the
-dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_ONLY` /
+In the Workers view, arrows select a worker, Space persists enabled/disabled
+desired state, Ctrl-R restarts it, and Enter follows its current logfile. Local
+runtime state refreshes every two seconds independently of the 90-second GitHub
+survey.
+
+The agent, sandbox, and roadmap area dials you pick are remembered beside
+`workers.toml` as `dashboard.json` (`$XDG_CONFIG_HOME/tauceti` or the platform
+default), so the dashboard reopens on your last selections. An explicit `TAUCETI_ROADMAP_ONLY` /
 `TAUCETI_ROADMAP_SKIP` in the environment still overrides the saved value. The saved
 values are dashboard-only: a bare `tauceti work` never reads them (rounds launched from
 the dashboard carry them via explicit `--roadmap-only` / `--roadmap-skip`). The file is a user config dir, not
@@ -460,7 +520,8 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 
 - `tauceti_worker/`: the worker package, split by concern — `constants`, `config`, `paths`,
   `github`, `quota`, `review_state`, `survey`, `round`, `agents`, `work_units`, `loop`, `tui`,
-  and `cli` (the entry point). `rich`/`textual` are imported lazily and only by `tui`.
+  `runtime_status`, `worker_manager`, and `cli` (the entry point). `rich`/`textual` are imported
+  lazily and only by `tui`.
 - `tauceti`: a small PEP 723 `uv` shim ([PEP 723](https://peps.python.org/pep-0723/)) so
   `./tauceti` runs the package from a clone; `uv tool install` exposes the same CLI as the
   `tauceti` console script (`tauceti_worker.cli:cli_main`).

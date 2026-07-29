@@ -61,6 +61,7 @@ RUN_STDLIB=(
   source_argument.py
   spread_candidates.py
   status_labels.py
+  worker_manager.py
 )
 # special-cased python tests (handled explicitly below)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)

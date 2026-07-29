@@ -18,8 +18,10 @@ import argparse
 import dataclasses
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -59,6 +61,7 @@ from .round import Claims, RoundContext, cmd_heartbeat
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .work_units import RoundOpts, Worker, _bubble, run_round, want
+from .worker_manager import add_workers_parser, cmd_managed_runner, cmd_workers
 
 # ============================================================================
 # CLI
@@ -374,6 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
 
+    add_workers_parser(sub)
+
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
     add_work_flags(r)
@@ -382,6 +387,10 @@ def build_parser() -> argparse.ArgumentParser:
     hb.add_argument("--ppipe", type=int, default=None)
     ep = sub.add_parser("_egress-probe", add_help=False)
     ep.add_argument("--worker-id", dest="worker_id", default=None)
+    mr = sub.add_parser("_managed-run", add_help=False)
+    mr.add_argument("--spec", required=True)
+    mr.add_argument("--state-dir", required=True)
+    mr.add_argument("--runtime-dir", required=True)
     return p
 
 
@@ -410,10 +419,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_work(args, only=only, agent=agent, one_round=(cmd == "_round"))
     if cmd == "doctor":
         return cmd_doctor(args)
+    if cmd == "workers":
+        return cmd_workers(args)
     if cmd == "_heartbeat":
         return cmd_heartbeat(args)
     if cmd == "_egress-probe":
         return cmd_egress_probe(args)
+    if cmd == "_managed-run":
+        return cmd_managed_runner(args)
     parser.print_help()
     return 64
 
@@ -487,6 +500,26 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # the chosen id in the env makes Config.resolve and loop children agree on it.
     explicit = getattr(args, "worker_id", None) or os.environ.get("TAUCETI_WORKER_ID")
     is_loop_driver = getattr(args, "loop", False) and not one_round
+    # The managed wrapper holds the write end of this inherited pipe. EOF means that wrapper was
+    # hard-killed before it could forward SIGTERM; stop this loop so it cannot become an orphan.
+    parent_pipe = os.environ.pop("TAUCETI_PARENT_PIPE_FD", None)
+    if parent_pipe is not None and is_loop_driver:
+        fd = int(parent_pipe)
+
+        def stop_with_parent() -> None:
+            try:
+                while os.read(fd, 1):
+                    pass
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=stop_with_parent, name="tauceti-parent-watch", daemon=True).start()
     if explicit:
         wid = sanitize_wid(explicit)
         # A top-level loop driver also reserves its slot, so an auto-assigned peer in another terminal
@@ -494,6 +527,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         # _round children (which inherit this id) and one-shot rounds skip this; they arbitrate via the
         # per-round round.lock instead, so reserving here would only make a child collide with its parent.
         if is_loop_driver and not acquire_slot(wid):
+            if os.environ.get("TAUCETI_MANAGED") == "1":
+                raise Die(f"worker slot '{wid}' is already held by another loop; the manager will retry after it exits")
             warn_red(
                 f"another loop already holds worker slot '{wid}'; they will contend on its state, "
                 f"$HOME, and quota pacing — use a distinct --worker-id"
@@ -611,6 +646,7 @@ def cmd_doctor(args) -> int:
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
+    rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
     rows.append(("codex creds", _safe_exists(cfg.home / ".codex" / "auth.json"), "~/.codex/auth.json"))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
     if _safe_exists(claude_creds) or sys.platform != "darwin":

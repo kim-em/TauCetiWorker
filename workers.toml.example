@@ -1,0 +1,20 @@
+# Semantic desired state for `tauceti workers`.
+version = 1
+
+[[workers]]
+id = "worker1"
+enabled = true
+
+[[workers]]
+id = "worker2"
+enabled = true
+agent = "codex"
+only = ["rebase", "review"]
+ignore_quota = true
+
+[[workers]]
+id = "worker3"
+enabled = true
+only = ["roadmap", "fix", "fix-ci"]
+roadmap_only = "RepresentationTheory"
+source = "https://github.com/FormalFrontier/Etingof-RepresentationTheory-draft1"

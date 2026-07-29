@@ -48,6 +48,7 @@ from .paths import HERE
 from .quota import Quota, _unavail_reason, mirror_creds
 from .review_state import ReviewState
 from .round import Claims, RoundContext
+from .runtime_status import report_runtime
 from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
 
 # ============================================================================
@@ -320,6 +321,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         effort = profile.effort or "none"
         detail = f"provider={profile.provider}, model={profile.model}, effort={effort}, sandbox={where}"
     log(f"→ {stage.upper()}: {what}   [{detail}]")
+    report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
     rc = fn(w, sv, c, opts, bubble)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another

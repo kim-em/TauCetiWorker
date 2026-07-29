@@ -22,6 +22,8 @@ from types import SimpleNamespace
 # Isolate the prefs file: persistence must land here, not in the operator's real ~/.config.
 _CFGDIR = tempfile.mkdtemp(prefix="tauceti-prefs-")
 os.environ["XDG_CONFIG_HOME"] = _CFGDIR
+os.environ["XDG_STATE_HOME"] = str(Path(_CFGDIR) / "state-home")
+os.environ["TAUCETI_RUNTIME_DIR"] = str(Path(_CFGDIR) / "runtime")
 os.environ.pop("TAUCETI_ROADMAP_ONLY", None)  # start from a known (unset) area state
 os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
 
@@ -416,6 +418,37 @@ async def test_skip_dashboard():
             os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
+async def test_persistent_workers_view():
+    """The dashboard's loop action writes desired state, and the Workers view monitors and edits it."""
+    config = tc.default_workers_config()
+    tc.save_worker_specs(
+        config,
+        [tc.WorkerSpec(id="worker1"), tc.WorkerSpec(id="worker2", agent="codex", only=("review",))],
+    )
+    old_ensure = tc.worker_manager.ensure_manager
+    tc.worker_manager.ensure_manager = lambda _config: False
+    try:
+        app = tc._dashboard_app(CFG, loader=loader)
+        async with app.run_test() as pilot:
+            await await_survey(app, pilot)
+            await pilot.press("w")
+            await pilot.pause(0.05)
+            check("w opens the persistent Workers view", app.view == "workers")
+            check("Workers view lists configured workers", app.query_one("#workers-tbl").row_count == 2)
+            await pilot.press("down")
+            await pilot.press("space")
+            await pilot.pause(0.05)
+            check("space persists desired stopped state", tc.load_worker_specs(config)[1].enabled is False)
+            await pilot.press("w")
+            await pilot.press("l")
+            await pilot.pause(0.05)
+            specs = tc.load_worker_specs(config)
+            check("loop action adds a persistent worker", len(specs) == 3 and specs[-1].id == "worker3")
+            check("persistent launch carries dashboard model", specs[-1].agent == app.model_dial)
+    finally:
+        tc.worker_manager.ensure_manager = old_ensure
+
+
 def test_dashboard_migrates_host_pref():
     """The sandbox pref key was renamed host -> bubble when the default flipped to host. An old prefs
     file (only the `host` key) must migrate as bubble = not host, so a user who was reviewing untrusted
@@ -458,6 +491,7 @@ async def run_all():
     test_dashboard_uses_saved_pref()
     test_dashboard_migrates_host_pref()
     await test_skip_dashboard()
+    await test_persistent_workers_view()
 
 
 asyncio.run(run_all())

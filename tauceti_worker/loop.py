@@ -13,6 +13,7 @@ from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, 
 from .github import github_budget
 from .quota import Provider, Quota, _unavail_reason, quota_line
 from .round import run_round_subprocess
+from .runtime_status import report_runtime
 
 
 class _LoopTerminated(KeyboardInterrupt):
@@ -73,6 +74,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
     log(f"loop start: worker={cfg.wid} only={','.join(only) or '(all)'} agent={agent}{' [bubble]' if bubble else ''}")
+    report_runtime("idle", detail="loop started", phase=None, target=None, next_action_at=None)
     streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
@@ -84,6 +86,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
+            report_runtime("checking-quota", detail="checking provider availability", phase=None, target=None)
             # 1) Decide the model and whether to run this cycle. `pending_init` means Claude was picked
             # while a window of it is reset-but-unopened: the round is authorized to spend ONE small
             # request to open it, but only once it has found work (see work_units.dispatch).
@@ -117,6 +120,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     log(
                         f"quota: {agent} hard-blocked ({why}) — --ignore-quota still waits out a hard block; sleeping {nap}s"
                     )
+                    report_runtime("waiting-quota", detail=why, next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
                 if verdict == "over-pace":
@@ -138,6 +142,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                             # workers or operator activity are still observed reasonably promptly.
                             nap = max(nap, min(int(min(eligible) - time.time()) + 5, 3600))
                     log(f"quota: {_wait_quota_line(snap)} — sleeping {nap}s")
+                    report_runtime("waiting-quota", detail=_wait_quota_line(snap), next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
 
@@ -158,6 +163,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     f"github: REST budget low ({detail} remaining < {GH_MIN_BUDGET}) — "
                     f"waiting {nap}s for the reset before launching a round"
                 )
+                report_runtime("waiting-github", detail=detail, next_action_at=time.time() + nap)
                 time.sleep(nap)
                 continue
 
@@ -191,17 +197,22 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             source = getattr(args, "source", None)
             if source is not None:
                 tail += ["--source", source]
+            report_runtime("surveying", detail="selecting the next work unit", next_action_at=None)
             rc = run_round_subprocess(tail)
 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
             if rc == 0:
                 streak = 0
+                report_runtime(
+                    "idle", detail="round completed", phase=None, target=None, next_action_at=time.time() + INTERROUND
+                )
                 time.sleep(INTERROUND)
             else:
                 streak += 1
                 nap = min(BACKOFF_BASE * (1 << min(streak, 5)), BACKOFF_MAX)
                 tag = "timed out" if rc in (124, 137) else ("no progress" if rc == EX_NOPROGRESS else f"rc={rc}")
                 log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
+                report_runtime("backoff", detail=tag, phase=None, target=None, next_action_at=time.time() + nap)
                 time.sleep(nap)
     except _LoopTerminated:
         log("loop terminated — stopping")
@@ -210,6 +221,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
         log("loop interrupted — stopping")
         return 130
     finally:
+        report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
 
 
