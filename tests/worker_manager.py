@@ -132,9 +132,11 @@ try:
         sandbox="bubble",
         spec_hash="old",
     )
-    desired_snapshot = wm.worker_snapshots([wm.WorkerSpec(id="snapshot", agent="claude")])[0]
+    desired_spec = wm.WorkerSpec(id="snapshot", agent="claude")
+    desired_snapshot = wm.worker_snapshots([desired_spec])[0]
     assert desired_snapshot["agent"] == "claude"
     assert desired_snapshot["actual_spec_hash"] == "old"
+    assert desired_snapshot["spec"] == desired_spec.as_dict()
 
     # Human status is a scan-friendly block, with URLs and provider quota details on separate lines.
     legacy_log = root / "legacy-worker.log"
@@ -152,6 +154,7 @@ try:
                     "desired": "running",
                     "actual": "waiting-quota",
                     "only": [],
+                    "spec": {"id": "worker1", "enabled": True},
                     "detail": "codex ~ (weekly ahead, 84% left)   claude ~ (weekly ahead, 56% left)",
                 },
                 {
@@ -161,6 +164,13 @@ try:
                     "agent": "codex",
                     "phase": "review",
                     "target": "PR #1441  https://github.com/TauCetiProject/TauCeti/pull/1441",
+                    "spec": {
+                        "id": "worker2",
+                        "enabled": True,
+                        "agent": "codex",
+                        "only": ["rebase", "review"],
+                        "ignore_quota": True,
+                    },
                     "detail": "provider=codex, sandbox=host",
                 },
                 {
@@ -168,6 +178,24 @@ try:
                     "desired": "running",
                     "actual": "backoff",
                     "only": ["roadmap", "fix", "fix-ci"],
+                    "spec": {
+                        "id": "worker3",
+                        "enabled": True,
+                        "agent": "claude",
+                        "only": ["roadmap", "fix", "fix-ci"],
+                        "sandbox": "bubble",
+                        "roadmap_only": "RepresentationTheory",
+                        "roadmap_skip": ["Algebra"],
+                        "roadmap_extra_identities": ["maintainer"],
+                        "respect_claims": False,
+                        "source": "https://example.invalid/source",
+                        "author_model": "claude-opus-5",
+                        "author_effort": "high",
+                        "pace": "50%@1h",
+                        "stream": True,
+                        "isolate_home": True,
+                        "restart": "on-failure",
+                    },
                     "detail": "rc=1",
                     "log_file": str(legacy_log),
                 },
@@ -182,28 +210,42 @@ try:
 config:  /tmp/workers.toml
 
 worker1 — waiting for quota
-  tasks:    auto
-  agent:    auto
+  phases:   rebase, review, fix-ci, fix, bump, roadmap
+  agent:    auto · host sandbox
+  pacing:   normal
+  roadmap:  auto (random each round)
   activity: —
   quota:    codex ~ (weekly ahead, 84% left)
             claude ~ (weekly ahead, 56% left)
 
 worker2 — running
+  phases:   rebase, review
+  agent:    codex · host sandbox
+  pacing:   ignored (--ignore-quota; hard limits still apply)
   work:     review
             PR #1441
             https://github.com/TauCetiProject/TauCeti/pull/1441
-  agent:    codex
   activity: —
   runtime:  codex · host sandbox
 
 worker3 — backing off
-  tasks:    roadmap, fix, fix-ci
-  agent:    auto
+  phases:   roadmap, fix, fix-ci
+  agent:    claude · bubble sandbox
+  pacing:   normal · curve 50%@1h
+  roadmap:  RepresentationTheory
+            skip: Algebra
+            also treat as self: maintainer
+            claims: ignored
+  source:   https://example.invalid/source
+  author:   model claude-opus-5 · high effort
+  options:  stream output
+            isolated home
+            restart: on-failure
   activity: —
   reason:   claude agent: API Error: 529 Overloaded. This is a temporary
             server-side issue.
   logs:     tauceti workers logs worker3"""
-    )
+    ), human_status
     assert max(map(len, human_status.splitlines())) <= 80
 
     if sys.platform != "darwin":

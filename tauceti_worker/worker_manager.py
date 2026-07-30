@@ -465,6 +465,7 @@ def worker_snapshots(specs: list[WorkerSpec] | None = None, config: Path | None 
                 "enabled": bool(spec and spec.enabled),
                 "actual_spec_hash": actual.get("spec_hash"),
                 "spec_hash": spec.fingerprint() if spec else None,
+                "spec": spec.as_dict() if spec else None,
                 "agent": spec.agent if spec else actual.get("agent"),
                 "only": list(spec.only) if spec else actual.get("only", []),
                 "sandbox": spec.sandbox if spec else actual.get("sandbox"),
@@ -1038,6 +1039,60 @@ def _backoff_reason(item: dict) -> str:
     return f"round exited with status {match.group(1)}" if match else (detail or "unknown failure")
 
 
+def _worker_configuration_lines(item: dict, width: int) -> list[str]:
+    """Render the desired worker definition independently of its transient runtime state."""
+    raw = item.get("spec")
+    spec = raw if isinstance(raw, dict) else {}
+    selected = spec.get("only") if isinstance(spec.get("only"), list) else item.get("only")
+    phases = [str(phase) for phase in selected] if selected else list(ALLOWED_TASKS)
+    lines = _status_field("phases", [", ".join(phases)], width)
+
+    agent = str(spec.get("agent") or item.get("agent") or "auto")
+    sandbox = str(spec.get("sandbox") or item.get("sandbox") or "host")
+    lines.extend(_status_field("agent", [f"{agent} · {sandbox} sandbox"], width))
+
+    pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
+    if spec.get("pace"):
+        pacing += f" · curve {spec['pace']}"
+    lines.extend(_status_field("pacing", [pacing], width))
+
+    if "roadmap" in phases:
+        focus = spec.get("roadmap_only")
+        roadmap = "auto (random each round)" if focus is None else ("all areas" if focus == "" else str(focus))
+        roadmap_values = [roadmap]
+        skips = spec.get("roadmap_skip")
+        if isinstance(skips, list) and skips:
+            roadmap_values.append("skip: " + ", ".join(map(str, skips)))
+        identities = spec.get("roadmap_extra_identities")
+        if isinstance(identities, list) and identities:
+            roadmap_values.append("also treat as self: " + ", ".join(map(str, identities)))
+        if spec.get("respect_claims", True) is False:
+            roadmap_values.append("claims: ignored")
+        lines.extend(_status_field("roadmap", roadmap_values, width))
+
+    if spec.get("source"):
+        lines.extend(_status_field("source", [str(spec["source"])], width))
+
+    authoring = []
+    if spec.get("author_model"):
+        authoring.append(f"model {spec['author_model']}")
+    if spec.get("author_effort"):
+        authoring.append(f"{spec['author_effort']} effort")
+    if authoring:
+        lines.extend(_status_field("author", [" · ".join(authoring)], width))
+
+    options = []
+    if spec.get("stream"):
+        options.append("stream output")
+    if spec.get("isolate_home"):
+        options.append("isolated home")
+    if spec.get("restart") and spec["restart"] != "always":
+        options.append(f"restart: {spec['restart']}")
+    if options:
+        lines.extend(_status_field("options", options, width))
+    return lines
+
+
 def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, width: int) -> list[str]:
     lines = [f"manager: {'running' if online else 'offline'}", f"config:  {config}"]
     if not snapshots:
@@ -1055,14 +1110,15 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
         if item["desired"] == "stopped" or state in {"missing", "restarting", "stale", "stopped", "stopping"}:
             heading += f" (desired: {item['desired']})"
         lines.extend(["", heading])
-        work = item.get("phase") or ", ".join(item.get("only") or []) or "auto"
-        target = item.get("target")
-        work_values = [work]
-        if target:
-            # Round targets deliberately separate a human label and its URL with two spaces.
-            work_values.extend(part for part in target.split("  ") if part)
-        lines.extend(_status_field("work" if item.get("phase") else "tasks", work_values, width))
-        lines.extend(_status_field("agent", [item.get("agent") or "auto"], width))
+        lines.extend(_worker_configuration_lines(item, width))
+        phase = item.get("phase")
+        if phase:
+            work_values = [str(phase)]
+            target = item.get("target")
+            if target:
+                # Round targets deliberately separate a human label and its URL with two spaces.
+                work_values.extend(part for part in target.split("  ") if part)
+            lines.extend(_status_field("work", work_values, width))
         age = _format_age(item.get("activity_at"))
         lines.extend(_status_field("activity", [f"{age} ago" if age != "—" else age], width))
         detail = item.get("detail")
