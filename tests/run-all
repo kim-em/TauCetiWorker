@@ -53,6 +53,7 @@ RUN_STDLIB=(
   quota_reason.py
   review_codex_model.py
   review_daily_cap.py
+  review_diagnostics.py
   roadmap_backpressure.py
   roadmap_claims.py
   round_group_sweep.py

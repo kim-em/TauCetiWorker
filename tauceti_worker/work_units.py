@@ -46,6 +46,12 @@ from .github import GitHub, GitHubError, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import HERE
 from .quota import Quota, _unavail_reason, mirror_creds
+from .review_diagnostics import (
+    clear_review_failure,
+    public_review_failure,
+    read_review_failure,
+    record_review_failure,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
@@ -146,11 +152,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # human must intervene; surfacing them loudly is the alternative to stranding them in silence.
     for pr in sv.review_stuck:
         n_err = w.counters.read(f"review-err-{pr}")
+        diagnostic = public_review_failure(read_review_failure(w.cfg.state, pr))
         warn_red(
             f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
-            f"review it. Needs a human. https://github.com/{TAUCETI}/pull/{pr}"
+            f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"
         )
-        w.gh.ensure_stuck_issue(pr, f"its review has errored {n_err} times without posting a verdict")
+        reason = f"its review has errored {n_err} times without posting a verdict"
+        w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
     # Spread concurrent workers across different PRs: shuffle each CONTENDED stage's candidates so workers
     # starting together don't all pick the lowest-numbered PR and probe the same target in lockstep
@@ -395,6 +403,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # combine with one later engine error to trip the escalation cap a round after a verdict was
             # in fact posted, contradicting the "errored Nx without posting a verdict" message.
             w.counters.write(errkey, 0)
+            clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
             # outbox mean the merge gate can't see this round, so don't report the round as a success.
@@ -428,6 +437,17 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             if not runtime_snapshot().get("failure_reason"):
                 report_failure(f"review #{pr} exited with status {rc}", code=rc)
             w.counters.incr(errkey)
+            failure = runtime_snapshot()
+            record_review_failure(
+                w.cfg.state,
+                worker=w.cfg.wid,
+                pr=pr,
+                head=head,
+                provider=reviewers,
+                code=rc,
+                reason=str(failure.get("failure_reason") or ""),
+                log_file=None if bubble else logf,
+            )
         return rc
     finally:
         # Drop the claim: on success the watermark now prevents a re-fire; on failure releasing it lets
