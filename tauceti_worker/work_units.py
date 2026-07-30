@@ -51,6 +51,7 @@ from .review_diagnostics import (
     public_review_failure,
     read_review_failure,
     record_review_failure,
+    recover_review_failures,
 )
 from .review_state import ReviewState
 from .round import Claims, RoundContext
@@ -152,7 +153,11 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # human must intervene; surfacing them loudly is the alternative to stranding them in silence.
     for pr in sv.review_stuck:
         n_err = w.counters.read(f"review-err-{pr}")
-        diagnostic = public_review_failure(read_review_failure(w.cfg.state, pr))
+        head = next((item.head_oid for item in sv.open_prs if item.number == pr), "")
+        retained = read_review_failure(w.cfg.state, pr)
+        if not retained:
+            retained = recover_review_failures(w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=pr, head=head)
+        diagnostic = public_review_failure(retained)
         warn_red(
             f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
             f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"

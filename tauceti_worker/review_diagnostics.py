@@ -78,6 +78,44 @@ def read_review_failure(state: Path, pr: int) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def recover_review_failures(state: Path, log_dir: Path, *, worker: str, pr: int, head: str = "") -> dict:
+    """Backfill diagnostics from review logs written before structured retention was deployed."""
+    existing = read_review_failure(state, pr)
+    if existing:
+        return existing
+    try:
+        logs = sorted(log_dir.glob(f"review-{pr}-*.log"), key=lambda path: path.stat().st_mtime)[-3:]
+    except OSError:
+        return {}
+    attempts = []
+    for log_file in logs:
+        summary = sanitize_failure(_last_log_line(log_file))
+        if not summary:
+            continue
+        try:
+            stamp = datetime.datetime.fromtimestamp(log_file.stat().st_mtime, datetime.UTC)
+        except OSError:
+            stamp = datetime.datetime.now(datetime.UTC)
+        attempts.append(
+            {
+                "at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "worker": worker,
+                "head": head,
+                "provider": "unknown",
+                "code": None,
+                "category": classify_failure(summary),
+                "summary": summary,
+                "log": log_file.name,
+                "recovered": True,
+            }
+        )
+    if not attempts:
+        return {}
+    value = {"schema": "tauceti.review-failure/v1", "pr": pr, "attempts": attempts}
+    atomic_json(_path(state, pr), value)
+    return value
+
+
 def record_review_failure(
     state: Path,
     *,
@@ -124,8 +162,10 @@ def public_review_failure(value: dict) -> str:
         if not isinstance(attempt, dict):
             continue
         summary = sanitize_failure(attempt.get("summary", "")).replace("`", "'").replace("<", "&lt;")
+        code = attempt.get("code")
+        exit_note = f"exit {code}" if isinstance(code, int) else "exit unknown"
         rows.append(
             f"- {attempt.get('at', 'unknown time')}: `{attempt.get('category', 'review-command')}` "
-            f"via `{attempt.get('provider', 'unknown')}` (exit {attempt.get('code', '?')}): {summary}"
+            f"via `{attempt.get('provider', 'unknown')}` ({exit_note}): {summary}"
         )
     return "\n".join(rows)

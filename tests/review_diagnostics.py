@@ -15,6 +15,7 @@ from tauceti_worker.review_diagnostics import (
     public_review_failure,
     read_review_failure,
     record_review_failure,
+    recover_review_failures,
     sanitize_failure,
 )
 
@@ -59,6 +60,14 @@ with tempfile.TemporaryDirectory() as raw:
     check("history capped at three", len(read_review_failure(state, 1388)["attempts"]), 3)
     clear_review_failure(state, 1388)
     check("successful review clears diagnostic", read_review_failure(state, 1388), {})
+
+    old_log = state / "review-1500-20260730-185500.log"
+    old_log.write_text("clone setup\nfatal: could not resolve host github.com\n")
+    recovered = recover_review_failures(state, state, worker="worker7", pr=1500, head="cafebabe")
+    check("legacy log is recovered", len(recovered["attempts"]), 1)
+    check("legacy log is classified", recovered["attempts"][0]["category"], "checkout-or-network")
+    check("legacy log records provenance", recovered["attempts"][0]["recovered"], True)
+    check("legacy log does not invent an exit code", "(exit unknown)" in public_review_failure(recovered), True)
 
 secret = "OPENAI_API_KEY=sk-secretvalue123 /Users/alice/work https://token@example.com/repo"
 clean = sanitize_failure(secret)
