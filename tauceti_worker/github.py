@@ -284,8 +284,7 @@ class GitHub:
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
         detail = (
-            "\n\nLatest sanitized worker diagnostics:\n\n"
-            f"{diagnostic}"
+            f"\n\nLatest sanitized worker diagnostics:\n\n{diagnostic}"
             if diagnostic
             else "\n\nNo sanitized worker diagnostic was retained."
         )
