@@ -58,6 +58,7 @@ from .paths import HERE
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
+from .runtime_status import report_failure
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .work_units import RoundOpts, Worker, _bubble, run_round, want
@@ -747,9 +748,11 @@ def cli_main() -> int:
         return main() or 0
     except Die as e:
         log(str(e))
+        report_failure(str(e), code=1)
         return 1
     except NoProgress as e:
         log(str(e))
+        report_failure(str(e), code=EX_NOPROGRESS)
         return EX_NOPROGRESS
     except WorkersError as e:
         print(f"tauceti workers: {e}", file=sys.stderr)

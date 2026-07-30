@@ -13,7 +13,7 @@ from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, 
 from .github import github_budget
 from .quota import Provider, Quota, _unavail_reason, quota_line
 from .round import run_round_subprocess
-from .runtime_status import report_runtime
+from .runtime_status import report_runtime, runtime_snapshot
 
 
 class _LoopTerminated(KeyboardInterrupt):
@@ -86,7 +86,15 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     signal.signal(signal.SIGTERM, terminate)
     try:
         while True:
-            report_runtime("checking-quota", detail="checking provider availability", phase=None, target=None)
+            report_runtime(
+                "checking-quota",
+                detail="checking provider availability",
+                phase=None,
+                target=None,
+                failure_reason=None,
+                failure_code=None,
+                failure_log=None,
+            )
             # 1) Decide the model and whether to run this cycle. `pending_init` means Claude was picked
             # while a window of it is reset-but-unopened: the round is authorized to spend ONE small
             # request to open it, but only once it has found work (see work_units.dispatch).
@@ -211,8 +219,21 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                 streak += 1
                 nap = min(BACKOFF_BASE * (1 << min(streak, 5)), BACKOFF_MAX)
                 tag = "timed out" if rc in (124, 137) else ("no progress" if rc == EX_NOPROGRESS else f"rc={rc}")
+                failed = runtime_snapshot()
+                published = failed.get("failure_reason")
+                reason = (
+                    str(published)
+                    if published
+                    else ("round timed out" if rc in (124, 137) else f"round exited with status {rc}")
+                )
                 log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
-                report_runtime("backoff", detail=tag, phase=None, target=None, next_action_at=time.time() + nap)
+                report_runtime(
+                    "backoff",
+                    detail=reason,
+                    phase=failed.get("phase"),
+                    target=failed.get("target"),
+                    next_action_at=time.time() + nap,
+                )
                 time.sleep(nap)
     except _LoopTerminated:
         log("loop terminated — stopping")

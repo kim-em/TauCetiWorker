@@ -48,7 +48,7 @@ from .paths import HERE
 from .quota import Quota, _unavail_reason, mirror_creds
 from .review_state import ReviewState
 from .round import Claims, RoundContext
-from .runtime_status import report_runtime
+from .runtime_status import report_failure, report_runtime, runtime_snapshot
 from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
 
 # ============================================================================
@@ -425,6 +425,8 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
         else:
+            if not runtime_snapshot().get("failure_reason"):
+                report_failure(f"review #{pr} exited with status {rc}", code=rc)
             w.counters.incr(errkey)
         return rc
     finally:
@@ -523,6 +525,7 @@ def _do_fixlike(
     else:
         if not prepare_checkout(w.cfg):
             log(f"checkout failed for #{pr} — skipping this attempt")
+            report_failure(f"{label} #{pr}: checkout preparation failed", code=1)
             return 1
         co = w.cfg.checkout
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
@@ -531,6 +534,7 @@ def _do_fixlike(
         if chk.returncode:
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
+            report_failure(f"{label} #{pr}: gh pr checkout failed: {detail or 'no diagnostic'}", code=1)
             return 1
         rev = subprocess.run(["git", "-C", str(co), "rev-parse", "HEAD"], capture_output=True, text=True)
         checked = rev.stdout.strip() or head

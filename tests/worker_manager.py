@@ -33,7 +33,7 @@ os.environ["TAUCETI_MANAGER_TEST_COMMAND"] = shlex.join(
 
 import tauceti_worker.worker_manager as wm
 from tauceti_worker.cli import build_parser
-from tauceti_worker.runtime_status import report_runtime
+from tauceti_worker.runtime_status import report_failure, report_runtime
 
 
 def wait_for(predicate, timeout=10):
@@ -88,6 +88,10 @@ try:
     os.environ["TAUCETI_RUNTIME_STATUS"] = str(runtime_probe)
     report_runtime("waiting-quota", detail="test", next_action_at=123)
     assert wm.read_json(runtime_probe)["state"] == "waiting-quota"
+    report_failure("claude agent: API Error 529 Overloaded", code=1, log_file="/tmp/agent.log")
+    failure = wm.read_json(runtime_probe)
+    assert failure["failure_reason"] == "claude agent: API Error 529 Overloaded"
+    assert failure["failure_code"] == 1 and failure["failure_log"] == "/tmp/agent.log"
     os.environ.pop("TAUCETI_RUNTIME_STATUS")
 
     # Legacy command import produces the same semantic settings without retaining shell syntax.
@@ -133,6 +137,12 @@ try:
     assert desired_snapshot["actual_spec_hash"] == "old"
 
     # Human status is a scan-friendly block, with URLs and provider quota details on separate lines.
+    legacy_log = root / "legacy-worker.log"
+    legacy_log.write_text(
+        "2026-07-30 06:24:55 tauceti: agent-claude: exited 1; last lines of agent.log:\n"
+        "    API Error: 529 Overloaded. This is a temporary server-side issue.\n"
+        "2026-07-30 06:24:56 tauceti: round rc=1; no-progress streak=5 — backing off 900s\n"
+    )
     human_status = "\n".join(
         wm._worker_status_lines(
             Path("/tmp/workers.toml"),
@@ -153,6 +163,14 @@ try:
                     "target": "PR #1441  https://github.com/TauCetiProject/TauCeti/pull/1441",
                     "detail": "provider=codex, sandbox=host",
                 },
+                {
+                    "id": "worker3",
+                    "desired": "running",
+                    "actual": "backoff",
+                    "only": ["roadmap", "fix", "fix-ci"],
+                    "detail": "rc=1",
+                    "log_file": str(legacy_log),
+                },
             ],
             True,
             width=80,
@@ -163,20 +181,28 @@ try:
         == """manager: running
 config:  /tmp/workers.toml
 
-worker1 — waiting-quota (desired: running)
-  work:     auto
+worker1 — waiting for quota
+  tasks:    auto
   agent:    auto
   activity: —
-  detail:   codex ~ (weekly ahead, 84% left)
+  quota:    codex ~ (weekly ahead, 84% left)
             claude ~ (weekly ahead, 56% left)
 
-worker2 — running (desired: running)
+worker2 — running
   work:     review
             PR #1441
             https://github.com/TauCetiProject/TauCeti/pull/1441
   agent:    codex
   activity: —
-  detail:   provider=codex, sandbox=host"""
+  runtime:  codex · host sandbox
+
+worker3 — backing off
+  tasks:    roadmap, fix, fix-ci
+  agent:    auto
+  activity: —
+  reason:   claude agent: API Error: 529 Overloaded. This is a temporary
+            server-side issue.
+  logs:     tauceti workers logs worker3"""
     )
     assert max(map(len, human_status.splitlines())) <= 80
 

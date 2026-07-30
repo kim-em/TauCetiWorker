@@ -64,6 +64,7 @@ print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")
 # stream; Codex then waits for more prompt text until EOF. Both output modes must close stdin.
 saved_run = tc.agents.subprocess.run
 saved_stream = os.environ.get("TAUCETI_STREAM")
+saved_runtime_status = os.environ.get(tc.runtime_status.STATUS_ENV)
 calls = []
 tc.agents.subprocess.run = lambda *a, **k: calls.append(k) or SimpleNamespace(returncode=0)
 try:
@@ -74,12 +75,34 @@ try:
         os.environ.pop("TAUCETI_STREAM")
         tc.run_agent_proc(["agent"], env={}, logdir=Path(td), label="test")
         check("logged agent stdin is closed", calls[-1].get("stdin"), tc.agents.subprocess.DEVNULL)
+
+        status_file = Path(td) / "status.json"
+        os.environ[tc.runtime_status.STATUS_ENV] = str(status_file)
+
+        def fail_with_diagnostic(*_args, **kwargs):
+            kwargs["stdout"].write(b"API Error: 529 Overloaded\n")
+            return SimpleNamespace(returncode=1)
+
+        tc.agents.subprocess.run = fail_with_diagnostic
+        tc.run_agent_proc(["claude"], env={}, logdir=Path(td), label="agent-claude")
+        failure = tc.runtime_status.read_json(status_file)
+        check(
+            "agent failure publishes its diagnostic",
+            failure.get("failure_reason"),
+            "claude agent exited with status 1: API Error: 529 Overloaded",
+        )
+        check("agent failure publishes its exit code", failure.get("failure_code"), 1)
+        assert Path(failure["failure_log"]).name.startswith("agent-claude-")
 finally:
     tc.agents.subprocess.run = saved_run
     if saved_stream is None:
         os.environ.pop("TAUCETI_STREAM", None)
     else:
         os.environ["TAUCETI_STREAM"] = saved_stream
+    if saved_runtime_status is None:
+        os.environ.pop(tc.runtime_status.STATUS_ENV, None)
+    else:
+        os.environ[tc.runtime_status.STATUS_ENV] = saved_runtime_status
 
 # Host configuration must not change worker authoring. Both backends consume the
 # committed/provider-specific profile instead.

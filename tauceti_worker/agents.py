@@ -43,6 +43,7 @@ from .quota import (
     claude_dir,
     mirror_creds,
 )
+from .runtime_status import report_failure
 
 # ============================================================================
 
@@ -419,7 +420,10 @@ def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd:
     # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
     # Codex then treats it as additional prompt input and waits forever for EOF.
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL).returncode
+        rc = subprocess.run(argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL).returncode
+        if rc != 0:
+            report_failure(f"{label.removeprefix('agent-')} agent exited with status {rc}", code=rc)
+        return rc
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     log(f"{label}: output → {logf}  (run with --stream to watch live)")
@@ -429,12 +433,18 @@ def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd:
         ).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
+        tail: list[str] = []
         try:
             tail = logf.read_text(errors="replace").splitlines()[-20:]
             for line in tail:
                 print("    " + line)
         except OSError:
             pass
+        summary = next((line.strip() for line in reversed(tail) if line.strip()), "")
+        reason = f"{label.removeprefix('agent-')} agent exited with status {rc}"
+        if summary:
+            reason += f": {summary}"
+        report_failure(reason, code=rc, log_file=logf)
     return rc
 
 
@@ -452,11 +462,18 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
         rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
+        tail: list[str] = []
         try:
-            for line in logf.read_text(errors="replace").splitlines()[-20:]:
+            tail = logf.read_text(errors="replace").splitlines()[-20:]
+            for line in tail:
                 log("    " + line)
         except OSError:
             pass
+        summary = next((line.strip() for line in reversed(tail) if line.strip()), "")
+        reason = f"{label} exited with status {rc}"
+        if summary:
+            reason += f": {summary}"
+        report_failure(reason, code=rc, log_file=logf)
     return rc
 
 

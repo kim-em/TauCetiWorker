@@ -113,4 +113,43 @@ print(
     f"[{'OK ' if driver_ok else 'XX '}] paced and ignore-quota drivers refresh: "
     f"got={driver_calls!r} want={driver_want!r}"
 )
-sys.exit(0 if ok and semantic_ok and driver_ok else 1)
+
+# A nonzero round result must carry the child's structured diagnostic into backoff status instead of
+# reducing every failure to rc=N.
+events = []
+saved_choose = tc.loop.choose_model
+saved_budget = tc.loop.github_budget
+saved_round = tc.loop.run_round_subprocess
+saved_sleep = tc.loop.time.sleep
+saved_report = tc.loop.report_runtime
+saved_snapshot = tc.loop.runtime_snapshot
+tc.loop.choose_model = lambda *_a, **_k: ("claude", {"claude": tc.Provider("claude", True, "opus")})
+tc.loop.github_budget = lambda: {}
+tc.loop.run_round_subprocess = lambda _tail: 1
+tc.loop.runtime_snapshot = lambda: {
+    "failure_reason": "claude agent: API Error 529 Overloaded",
+    "phase": "fix",
+    "target": "PR #1441",
+}
+tc.loop.report_runtime = lambda state=None, **changes: events.append((state, changes))
+tc.loop.time.sleep = lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt)
+try:
+    args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None, source=None)
+    tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=["fix"], agent="claude")
+finally:
+    tc.loop.choose_model = saved_choose
+    tc.loop.github_budget = saved_budget
+    tc.loop.run_round_subprocess = saved_round
+    tc.loop.time.sleep = saved_sleep
+    tc.loop.report_runtime = saved_report
+    tc.loop.runtime_snapshot = saved_snapshot
+
+backoff = next(changes for state, changes in events if state == "backoff")
+status_ok = (
+    backoff["detail"] == "claude agent: API Error 529 Overloaded"
+    and backoff["phase"] == "fix"
+    and backoff["target"] == "PR #1441"
+)
+print(f"[{'OK ' if status_ok else 'XX '}] backoff preserves the child diagnostic: {backoff['detail']!r}")
+
+sys.exit(0 if ok and semantic_ok and driver_ok and status_ok else 1)

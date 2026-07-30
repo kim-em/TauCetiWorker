@@ -71,3 +71,19 @@ def report_runtime(state: str | None = None, **changes) -> None:
         update_status(Path(raw), **changes)
     except Exception:
         pass
+
+
+def runtime_snapshot() -> dict:
+    """Read this process tree's shared runtime status, if it is managed."""
+    raw = os.environ.get(STATUS_ENV)
+    return read_json(Path(raw)) if raw else {}
+
+
+def report_failure(reason: str, *, code: int | None = None, log_file: Path | str | None = None) -> None:
+    """Publish a concise, structured failure for the supervising loop and human status views."""
+    clean = _RICH_STYLE_RE.sub("", str(reason)).strip()
+    report_runtime(
+        failure_reason=clean[-1000:] or "unknown failure",
+        failure_code=code,
+        failure_log=str(log_file) if log_file is not None else None,
+    )

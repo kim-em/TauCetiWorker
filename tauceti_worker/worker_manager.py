@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import plistlib
+import re
 import select
 import shlex
 import shutil
@@ -945,29 +946,141 @@ def _status_field(label: str, values: list[str], width: int) -> list[str]:
     return lines
 
 
+def _format_until(value) -> str:
+    try:
+        seconds = max(0, int(float(value) - time.time()))
+    except (TypeError, ValueError):
+        return "—"
+    if seconds == 0:
+        return "now"
+    if seconds < 60:
+        return f"in {seconds}s"
+    if seconds < 3600:
+        return f"in {(seconds + 59) // 60}m"
+    return f"in {(seconds + 3599) // 3600}h"
+
+
+def _runtime_summary(detail: str) -> str:
+    """Turn structured key=value launch metadata into a short human sentence."""
+    parts = [part.split("=", 1) for part in detail.split(", ")]
+    if not parts or any(len(part) != 2 for part in parts):
+        return detail
+    fields = dict(parts)
+    if "provider" not in fields:
+        return detail
+    values = [fields.pop("provider")]
+    model = fields.pop("model", None)
+    if model and model != values[0]:
+        values.append(model)
+    effort = fields.pop("effort", None)
+    if effort and effort != "none":
+        values.append(f"{effort} effort")
+    sandbox = fields.pop("sandbox", None)
+    if sandbox:
+        values.append(f"{sandbox} sandbox")
+    values.extend(f"{key} {value}" for key, value in fields.items())
+    return " · ".join(values)
+
+
+def _legacy_backoff_reason(item: dict) -> str | None:
+    """Recover the useful error tail written before old loops reduced it to ``rc=N``."""
+    detail = str(item.get("detail") or "")
+    if not re.fullmatch(r"(?:rc=\d+|no progress|timed out)", detail):
+        return detail or None
+    log_file = item.get("log_file")
+    if not log_file:
+        return None
+    try:
+        with Path(log_file).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 65536))
+            lines = stream.read().decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    marker = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if re.search(r"tauceti: round (?:rc=\d+|timed out|no progress)", lines[index])
+        ),
+        None,
+    )
+    if marker is None:
+        return None
+    summary = next(
+        (
+            lines[index].strip()
+            for index in range(marker - 1, max(-1, marker - 25), -1)
+            if lines[index].startswith("    ")
+        ),
+        None,
+    )
+    if not summary:
+        return None
+    provider = next(
+        (
+            match.group(1)
+            for index in range(marker - 1, max(-1, marker - 25), -1)
+            if (match := re.search(r"agent-([^:]+): exited", lines[index]))
+        ),
+        None,
+    )
+    prefix = f"{provider} agent: " if provider else ""
+    return prefix + summary[-800:]
+
+
+def _backoff_reason(item: dict) -> str:
+    reason = item.get("failure_reason") or _legacy_backoff_reason(item)
+    if reason:
+        return str(reason)
+    detail = str(item.get("detail") or "")
+    match = re.fullmatch(r"rc=(\d+)", detail)
+    return f"round exited with status {match.group(1)}" if match else (detail or "unknown failure")
+
+
 def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, width: int) -> list[str]:
     lines = [f"manager: {'running' if online else 'offline'}", f"config:  {config}"]
     if not snapshots:
         return [*lines, "", "workers: none"]
 
     for item in snapshots:
-        lines.extend(["", f"{item['id']} — {item['actual']} (desired: {item['desired']})"])
-        work = item.get("phase") or ",".join(item.get("only") or []) or "auto"
+        state = str(item["actual"])
+        display_state = {
+            "backoff": "backing off",
+            "checking-quota": "checking quota",
+            "waiting-github": "waiting for GitHub",
+            "waiting-quota": "waiting for quota",
+        }.get(state, state)
+        heading = f"{item['id']} — {display_state}"
+        if item["desired"] == "stopped" or state in {"missing", "restarting", "stale", "stopped", "stopping"}:
+            heading += f" (desired: {item['desired']})"
+        lines.extend(["", heading])
+        work = item.get("phase") or ", ".join(item.get("only") or []) or "auto"
         target = item.get("target")
         work_values = [work]
         if target:
             # Round targets deliberately separate a human label and its URL with two spaces.
             work_values.extend(part for part in target.split("  ") if part)
-        lines.extend(_status_field("work", work_values, width))
+        lines.extend(_status_field("work" if item.get("phase") else "tasks", work_values, width))
         lines.extend(_status_field("agent", [item.get("agent") or "auto"], width))
         age = _format_age(item.get("activity_at"))
         lines.extend(_status_field("activity", [f"{age} ago" if age != "—" else age], width))
         detail = item.get("detail")
-        if detail:
+        if state == "backoff":
+            lines.extend(_status_field("reason", [_backoff_reason(item)], width))
+        elif detail:
             # Quota summaries use three spaces between providers. Keeping each provider on its own
             # continuation line makes the bottleneck legible without coupling this view to quota types.
             detail_values = [part for part in detail.split("   ") if part]
-            lines.extend(_status_field("detail", detail_values, width))
+            label = "quota" if state == "waiting-quota" else ("runtime" if state == "running" else "status")
+            if state == "running":
+                detail_values = [_runtime_summary(part) for part in detail_values]
+            lines.extend(_status_field(label, detail_values, width))
+        if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
+            label = "retry" if state == "backoff" else "recheck"
+            lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
+        if state == "backoff":
+            lines.extend(_status_field("logs", [f"tauceti workers logs {item['id']}"], width))
     return lines
 
 
