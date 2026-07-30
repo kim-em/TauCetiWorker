@@ -284,9 +284,9 @@ class GitHub:
     @staticmethod
     def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
         detail = (
-            f"\n\nLatest sanitized worker diagnostics:\n\n{diagnostic}"
+            f"\n\nLatest allow-listed worker diagnostics:\n\n{diagnostic}"
             if diagnostic
-            else "\n\nNo sanitized worker diagnostic was retained."
+            else "\n\nNo public worker diagnostic was retained."
         )
         return (
             f"The autonomous worker cannot make progress on #{pr}: {reason}\n"
@@ -329,7 +329,13 @@ class GitHub:
                 ]
             if matches:
                 issue = matches[0]
-                if issue.get("body") != body:
+                existing_body = issue.get("body") if isinstance(issue.get("body"), str) else ""
+                # The issue is fleet-wide but retained diagnostics are per-worker. Once any worker
+                # has supplied an allow-listed diagnostic, do not let peers continually overwrite
+                # it with their own attempt or a generic bubble failure. We still upgrade an older
+                # issue that has no public diagnostic at all.
+                has_public_diagnostic = "Latest allow-listed worker diagnostics:" in existing_body
+                if existing_body != body and not has_public_diagnostic:
                     self._gh(
                         [
                             "issue",

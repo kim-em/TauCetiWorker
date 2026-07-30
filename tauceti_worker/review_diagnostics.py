@@ -1,4 +1,4 @@
-"""Persistent, public-safe diagnostics for review commands that exit before posting a verdict."""
+"""Persistent local diagnostics and allow-listed public summaries for failed review commands."""
 
 from __future__ import annotations
 
@@ -21,13 +21,34 @@ _SECRET_RE = [
     re.compile(r"https://[^/\s@]+@"),
 ]
 _HOME_RE = re.compile(r"(?:(?:/home|/Users)/)[^/\s]+")
+_PUBLIC_CATEGORIES = {
+    "reviewer-auth",
+    "missing-tool",
+    "stale-head",
+    "provider-unavailable",
+    "checkout-or-network",
+    "review-engine",
+    "review-command",
+}
+_PUBLIC_PROVIDERS = {"claude", "codex", "deepseek", "minimax", "sonnet"}
+_PUBLIC_DETAILS = {
+    "reviewer-auth": "reviewer authentication failed",
+    "missing-tool": "reviewer executable unavailable",
+    "stale-head": "PR head changed before review",
+    "provider-unavailable": "review provider unavailable",
+    "checkout-or-network": "checkout or network operation failed",
+    "review-engine": "review engine failed",
+    "review-command": "review command failed",
+}
+_STAMP_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
 
 def sanitize_failure(text: str, limit: int = 500) -> str:
-    """Return a one-line diagnostic safe to copy into a public GitHub issue.
+    """Return a concise one-line diagnostic for local retention only.
 
-    Reviewer logs stay local. This keeps only one concise summary after removing common credential
-    shapes, credential-bearing URLs, user-specific home paths, terminal escapes, and control bytes.
+    This best-effort cleanup makes local state easier to inspect, but it is deliberately not a
+    publication boundary: arbitrary subprocess output can contain unanticipated credential forms.
+    `public_review_failure` publishes only fixed allow-listed facts and never this returned text.
     """
     clean = _ANSI_RE.sub("", str(text or ""))
     clean = _CONTROL_RE.sub(" ", clean)
@@ -155,17 +176,25 @@ def clear_review_failure(state: Path, pr: int) -> None:
 
 
 def public_review_failure(value: dict) -> str:
-    """Compact Markdown-safe account of the retained attempts, with no local paths or raw logs."""
+    """Compact public account built only from fixed labels; never publish subprocess text."""
     attempts = value.get("attempts") if isinstance(value.get("attempts"), list) else []
     rows = []
     for attempt in attempts[-3:]:
         if not isinstance(attempt, dict):
             continue
-        summary = sanitize_failure(attempt.get("summary", "")).replace("`", "'").replace("<", "&lt;")
+        category = attempt.get("category")
+        category = category if category in _PUBLIC_CATEGORIES else "review-command"
+        provider = attempt.get("provider")
+        provider = provider if provider in _PUBLIC_PROVIDERS else "unknown"
+        stamp = attempt.get("at")
+        stamp = stamp if isinstance(stamp, str) and _STAMP_RE.fullmatch(stamp) else "unknown time"
         code = attempt.get("code")
         exit_note = f"exit {code}" if isinstance(code, int) else "exit unknown"
-        rows.append(
-            f"- {attempt.get('at', 'unknown time')}: `{attempt.get('category', 'review-command')}` "
-            f"via `{attempt.get('provider', 'unknown')}` ({exit_note}): {summary}"
+        summary = str(attempt.get("summary", "")).lower()
+        detail = (
+            "review prompt exceeded the OS argument limit"
+            if "argument list too long" in summary or "e2big" in summary
+            else _PUBLIC_DETAILS[category]
         )
+        rows.append(f"- {stamp}: `{category}` via `{provider}` ({exit_note}): {detail}")
     return "\n".join(rows)

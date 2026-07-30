@@ -75,6 +75,56 @@ check("API key redacted", "secretvalue" in clean, False)
 check("home user redacted", "alice" in clean, False)
 check("credential URL redacted", "token@" in clean, False)
 
+adversarial = {
+    "schema": "tauceti.review-failure/v1",
+    "attempts": [
+        {
+            "at": "now ](https://example.com)",
+            "provider": "codex` token",
+            "code": 1,
+            "category": "review-engine`",
+            "summary": (
+                "Authorization: Basic dXNlcjpwYXNzd29yZA== "
+                "ANTHROPIC_API_KEY = supersecretvalue "
+                '{"api_key":"jsonsecret"} client_secret: oauthsecret '
+                "cookie=sessionsecret eyJhbGciOiJIUzI1NiJ9.payload.signature"
+            ),
+        }
+    ],
+}
+public = public_review_failure(adversarial)
+for leaked in (
+    "dXNlcjpwYXNzd29yZA",
+    "supersecretvalue",
+    "jsonsecret",
+    "oauthsecret",
+    "sessionsecret",
+    "eyJhbGci",
+    "https://example.com",
+    "codex` token",
+):
+    check(f"public output excludes {leaked}", leaked in public, False)
+check(
+    "unknown public fields fail closed",
+    public,
+    "- unknown time: `review-command` via `unknown` (exit 1): review command failed",
+)
+
+e2big = {
+    "attempts": [
+        {
+            "at": "2026-07-30T23:00:00Z",
+            "provider": "codex",
+            "code": 1,
+            "category": "review-engine",
+            "summary": "OSError: [Errno 7] Argument list too long: 'codex' SECRET=do-not-copy",
+        }
+    ]
+}
+public = public_review_failure(e2big)
+check("E2BIG has fixed public diagnostic", "review prompt exceeded the OS argument limit" in public, True)
+check("E2BIG raw summary stays private", "do-not-copy" in public, False)
+
 
 class FakeGitHub(gh_mod.GitHub):
     def __init__(self, existing=None):
@@ -106,6 +156,12 @@ client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body":
 client.ensure_stuck_issue(1388, "its review errored", diagnostic)
 check("existing issue is enriched", client.calls[-1][:2], ["issue", "edit"])
 check("right issue is edited", client.calls[-1][2], "1504")
+
+other_diagnostic = "- 2026-07-30T18:56:00Z: `review-command` via `codex` (exit 1): review command failed"
+existing_body = gh_mod.GitHub._stuck_issue_body(1388, "its review errored", diagnostic)
+client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": existing_body}])
+client.ensure_stuck_issue(1388, "its review errored again", other_diagnostic)
+check("peer diagnostic does not clobber existing evidence", len(client.calls), 1)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
