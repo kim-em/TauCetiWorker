@@ -976,9 +976,8 @@ def _runtime_summary(detail: str) -> str:
     effort = fields.pop("effort", None)
     if effort and effort != "none":
         values.append(f"{effort} effort")
-    sandbox = fields.pop("sandbox", None)
-    if sandbox:
-        values.append(f"{sandbox} sandbox")
+    # The desired sandbox is already shown alongside the configured agent.
+    fields.pop("sandbox", None)
     values.extend(f"{key} {value}" for key, value in fields.items())
     return " · ".join(values)
 

@@ -226,7 +226,7 @@ worker2 — running
             PR #1441
             https://github.com/TauCetiProject/TauCeti/pull/1441
   activity: —
-  runtime:  codex · host sandbox
+  runtime:  codex
 
 worker3 — backing off
   phases:   roadmap, fix, fix-ci
