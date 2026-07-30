@@ -83,7 +83,6 @@ try:
     bare_workers = build_parser().parse_args(["workers"])
     assert bare_workers.workers_action is None
     assert bare_workers.json is False and bare_workers.watch is False
-    assert wm.cmd_workers(bare_workers) == 1  # manager is intentionally offline at this point
 
     runtime_probe = root / "runtime-probe.json"
     os.environ["TAUCETI_RUNTIME_STATUS"] = str(runtime_probe)
@@ -144,7 +143,7 @@ try:
 
     def healthy_rows():
         rows = wm.worker_snapshots(specs)
-        return rows if len(rows) == 3 and all(row.get("alive") for row in rows) else None
+        return rows if len(rows) == 3 and all(row.get("alive") and row.get("wrapper_pid") for row in rows) else None
 
     first = wait_for(healthy_rows)
     pids = {row["id"]: row["wrapper_pid"] for row in first}
@@ -227,6 +226,7 @@ try:
     assert manager.returncode == 0
     manager = None
     wait_for(lambda: not wm.runner_status("never").get("alive"))
+    assert wm.cmd_workers(bare_workers) == 1  # the shorthand runs status against the stopped manager
     print("worker manager: OK")
 finally:
     if manager is not None and manager.poll() is None:
