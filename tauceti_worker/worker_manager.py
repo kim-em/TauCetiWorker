@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import time
 import tomllib
 import uuid
@@ -924,6 +925,52 @@ def _format_age(value) -> str:
     return f"{seconds // 86400}d"
 
 
+def _status_field(label: str, values: list[str], width: int) -> list[str]:
+    """Format one human-facing status field with aligned wrapped continuations."""
+    prefix = f"  {label + ':':<10}"
+    continuation = " " * len(prefix)
+    lines: list[str] = []
+    for value in values:
+        lines.extend(
+            textwrap.wrap(
+                value,
+                width=max(width, len(prefix) + 20),
+                initial_indent=prefix if not lines else continuation,
+                subsequent_indent=continuation,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or [prefix.rstrip()]
+        )
+    return lines
+
+
+def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, width: int) -> list[str]:
+    lines = [f"manager: {'running' if online else 'offline'}", f"config:  {config}"]
+    if not snapshots:
+        return [*lines, "", "workers: none"]
+
+    for item in snapshots:
+        lines.extend(["", f"{item['id']} — {item['actual']} (desired: {item['desired']})"])
+        work = item.get("phase") or ",".join(item.get("only") or []) or "auto"
+        target = item.get("target")
+        work_values = [work]
+        if target:
+            # Round targets deliberately separate a human label and its URL with two spaces.
+            work_values.extend(part for part in target.split("  ") if part)
+        lines.extend(_status_field("work", work_values, width))
+        lines.extend(_status_field("agent", [item.get("agent") or "auto"], width))
+        age = _format_age(item.get("activity_at"))
+        lines.extend(_status_field("activity", [f"{age} ago" if age != "—" else age], width))
+        detail = item.get("detail")
+        if detail:
+            # Quota summaries use three spaces between providers. Keeping each provider on its own
+            # continuation line makes the bottleneck legible without coupling this view to quota types.
+            detail_values = [part for part in detail.split("   ") if part]
+            lines.extend(_status_field("detail", detail_values, width))
+    return lines
+
+
 def print_worker_status(config: Path, *, as_json: bool = False) -> bool:
     specs = load_worker_specs(config)
     snapshots = worker_snapshots(specs)
@@ -931,18 +978,8 @@ def print_worker_status(config: Path, *, as_json: bool = False) -> bool:
     if as_json:
         print(json.dumps({"manager": online, "config": str(config), "workers": snapshots}, indent=2))
     else:
-        print(f"manager: {'running' if online else 'offline'}   config: {config}")
-        for item in snapshots:
-            work = item.get("phase") or ",".join(item.get("only") or []) or "auto"
-            target = item.get("target")
-            if target:
-                work += f" {target}"
-            detail = item.get("detail")
-            suffix = f" — {detail}" if detail else ""
-            print(
-                f"  {item['id']:<16} desired={item['desired']:<7} actual={item['actual']:<14} "
-                f"agent={item.get('agent') or 'auto':<8} work={work:<24} activity={_format_age(item.get('activity_at'))}{suffix}"
-            )
+        width = shutil.get_terminal_size(fallback=(100, 24)).columns
+        print("\n".join(_worker_status_lines(config, snapshots, bool(online), width=width)))
     healthy = bool(online) and all(item["desired"] == "stopped" or item.get("alive") for item in snapshots)
     return healthy
 

@@ -132,6 +132,54 @@ try:
     assert desired_snapshot["agent"] == "claude"
     assert desired_snapshot["actual_spec_hash"] == "old"
 
+    # Human status is a scan-friendly block, with URLs and provider quota details on separate lines.
+    human_status = "\n".join(
+        wm._worker_status_lines(
+            Path("/tmp/workers.toml"),
+            [
+                {
+                    "id": "worker1",
+                    "desired": "running",
+                    "actual": "waiting-quota",
+                    "only": [],
+                    "detail": "codex ~ (weekly ahead, 84% left)   claude ~ (weekly ahead, 56% left)",
+                },
+                {
+                    "id": "worker2",
+                    "desired": "running",
+                    "actual": "running",
+                    "agent": "codex",
+                    "phase": "review",
+                    "target": "PR #1441  https://github.com/TauCetiProject/TauCeti/pull/1441",
+                    "detail": "provider=codex, sandbox=host",
+                },
+            ],
+            True,
+            width=80,
+        )
+    )
+    assert (
+        human_status
+        == """manager: running
+config:  /tmp/workers.toml
+
+worker1 — waiting-quota (desired: running)
+  work:     auto
+  agent:    auto
+  activity: —
+  detail:   codex ~ (weekly ahead, 84% left)
+            claude ~ (weekly ahead, 56% left)
+
+worker2 — running (desired: running)
+  work:     review
+            PR #1441
+            https://github.com/TauCetiProject/TauCeti/pull/1441
+  agent:    codex
+  activity: —
+  detail:   provider=codex, sandbox=host"""
+    )
+    assert max(map(len, human_status.splitlines())) <= 80
+
     if sys.platform != "darwin":
         assert wm._service_path() == root / "config" / "systemd" / "user" / "tauceti-workers.service"
         unit = wm._systemd_unit(config)
