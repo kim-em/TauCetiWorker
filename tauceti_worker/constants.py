@@ -24,6 +24,16 @@ MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't
 # head until the PR merges or CI closes it — so every PR reaches a terminal state.
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without posting a verdict
 
+# Progress reporting (TauCetiProgress). Pinned by SHA, not a branch: the worker's generator and the
+# merge gate in TauCetiRoadmap must run the SAME version, or the worker can emit headers the gate does
+# not recognise and every report wedges. Bump this together with the two pins in
+# TauCetiRoadmap/.github/workflows/progress-*.yml.
+PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "main")
+PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
+MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
+PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "86400"))  # min seconds between attempts
+
 # (the engine can't produce a review at all), stop retrying and ESCALATE —
 # a loud per-round warning + a tracking issue — since a PR that can never be
 # reviewed neither merges nor reaches CI's round cap, so a human must step in.
@@ -159,7 +169,8 @@ CLAUDE_CMD = os.environ.get("TAUCETI_CLAUDE_CMD", "claude")
 
 
 # Task taxonomy. Every task drives a model; merge/abandon/dedup housekeeping lives in the repo's CI now.
-ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "roadmap"]
+# `progress` writes the per-roadmap STATUS.md / PROGRESS.md reports in TauCetiRoadmap.
+ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadmap"]
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
@@ -167,7 +178,13 @@ WORK_TASKS = list(ALLOWED_TASKS)
 # before fleet-wide review work, so an awaiting-author head cannot be starved by
 # a steady supply of unrelated reviewable PRs. Roadmap is the final fallback and
 # is handled separately after these PR-backed stages.
-AUTO_STAGES = ("rebase", "fix-ci", "fix", "review", "bump")
+#
+# `progress` is last of these, immediately before roadmap authoring. It is rate-limited to one landed
+# report a day (and one ATTEMPT a day), so it cannot crowd out queue tending; and putting it ahead of
+# open-ended roadmap authoring — the fallback that always has work — is what stops a busy queue
+# deferring it for ever. Placing it FIRST would be wrong: the cadence check keys on the last *landed*
+# report, so a stuck or rejected report would leave it due indefinitely and burn every round.
+AUTO_STAGES = ("rebase", "fix-ci", "fix", "review", "bump", "progress")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
@@ -179,6 +196,11 @@ KIND_BY_NAME = {name: num for num, name in KIND_KEYS.items()}  # "rebase" -> "1"
 # Every mode runs a MODEL on third-party content, so each is eligible for the bubble sandbox
 # (opt in with --bubble; the host is the default).
 SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
+# `progress` is the exception: there is no untrusted checkout to confine. It needs `gh` against
+# TauCetiRoadmap (the bubble proxy is scoped to TauCeti) and the model is handed bounded text rather
+# than a working tree to roam. Its remaining exposure — merged PR descriptions reaching the model — is
+# bounded by the merge gate, which only ever admits two markdown files in one directory.
+SANDBOX_DEFAULT["progress"] = False
 
 
 AGENTS = ["auto", "codex", "claude", "deepseek", "minimax"]

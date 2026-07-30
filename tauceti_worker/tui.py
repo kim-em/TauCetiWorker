@@ -53,6 +53,12 @@ def _kind_note(sv: Survey, name: str) -> tuple[str, str]:
     note = (_sample(wk.actionable) or "") + extra
     if name == "bump" and not wk.actionable and not wk.suppressed:
         note = "no broken bump-mathlib PR"
+    if name == "progress":
+        # Not about a PR of ours, so the candidate carries pr=0 and _sample's "#0" says nothing. The
+        # cadence verdict is the useful cell, whether a report is due or not.
+        cands = wk.actionable or wk.suppressed
+        note = cands[0].reason if cands else "not checked (shallow survey)"
+        ready = "1" if wk.actionable else "—"
     return ready, note
 
 

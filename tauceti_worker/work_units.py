@@ -4,6 +4,7 @@ its work unit (review/fix/fix-ci/rebase/bump/roadmap) on the host or in a bubble
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import re
@@ -33,8 +34,11 @@ from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, ro
 from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
+    CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
+    EX_NOPROGRESS,
     MAX_OPEN_PRS,
+    PROGRESS_REF,
     OPENROUTER_MODELS,
     REVIEW,
     REVIEW_DAILY_CAP,
@@ -44,12 +48,21 @@ from .constants import (
 )
 from .github import GitHub, GitHubError, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
-from .paths import HERE
+from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
-from .survey import TARGET_MARKER_RE, Candidate, Counters, Survey, spread_candidates, survey
+from .survey import (
+    TARGET_MARKER_RE,
+    Candidate,
+    Counters,
+    Survey,
+    bust_progress_cache,
+    progress_argv,
+    spread_candidates,
+    survey,
+)
 
 # ============================================================================
 # Round — the want-gated cascade over survey(): classify every open PR, then do ONE work unit.
@@ -186,6 +199,10 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 
 # Authoring/fixing stages whose success MUST leave a mark on GitHub (a push, a new PR, or — for a
 # contested fix — a comment). `review` is excluded: it posts a scoreboard and its rc is the engine's.
+# `progress` is excluded too, and for a sharper reason: _progress_snapshot looks for a mark in
+# TAUCETI, and a progress round's PR lands in TauCetiRoadmap, so the guard would report "nothing
+# landed" on every successful report. Its postcondition is `tauceti-progress apply`'s own exit code,
+# which already distinguishes opened / already-in-flight / already-merged.
 PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
 
 
@@ -303,6 +320,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "fix-ci": do_fix_ci,
         "rebase": do_rebase,
         "bump": do_bump,
+        "progress": do_progress,
         "roadmap": do_roadmap,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
@@ -312,6 +330,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         what = f"PR #{c.pr}  https://github.com/{TAUCETI}/pull/{c.pr}"
     elif stage == "roadmap":
         what = f"new PR (area: {c.reason or 'any'})"
+    elif stage == "progress":
+        what = c.reason or "roadmap progress report"
     else:
         what = c.reason or (c.head[:12] if c.head else "")
     if stage == "review":
@@ -571,6 +591,147 @@ def do_bump(w, sv, c, opts, bubble) -> int | None:
     w.counters.incr(f"bump-{pr}-{head[:12]}")  # count up front so an un-checkout-able PR can't loop
     w.counters.incr(f"bump-pr-{pr}")
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump")
+
+
+def do_progress(w, sv, c, opts, bubble) -> int | None:
+    """Write the per-roadmap progress report: STATUS.md + PROGRESS.md, as a PR to TauCetiRoadmap.
+
+    The division of labour is the point of this kind. Every decision and every mechanical step is
+    `tauceti-progress`, a tested tool: it picks the roadmap and the commit window, extracts from git
+    the declarations that actually landed, writes both files, and opens the pull request. The model is
+    handed a bounded context and asked for prose, nothing else — it never touches git or the API.
+
+    Unlike the other kinds this does not run in a bubble (see SANDBOX_DEFAULT). There is no untrusted
+    checkout to confine: the tool needs `gh` against a repo the bubble proxy does not cover, and the
+    model is given text rather than a working tree to roam. The prompt-injection exposure that remains
+    — merged PR descriptions reaching the model — is bounded by the merge gate, which only ever admits
+    two markdown files in one directory.
+    """
+    # ONE global claim, not one per area: the decision itself (which roadmap is busiest) is global, so
+    # two workers must not be choosing at the same moment. `claim.sh` takes arbitrary keys, so this uses
+    # a bare `progress` key rather than Claims.begin_branch_work, which is branch-shaped and also sets
+    # push-arbiter env this kind has no use for.
+    #
+    # This is [COOP] dedup only, and deliberately so: the guarantees that actually hold are GitHub-side
+    # — `plan` refuses an area with an open progress PR, and the branch name is a pure function of the
+    # window so `apply` reconciles with whatever already exists. The claim just stops two workers paying
+    # a model for the same report in the same minute, so a claim error proceeds rather than aborting.
+    rc_claim = subprocess.run([CLAIM_SH, "acquire", "progress", str(CLAIM_TTL_S)], capture_output=True).returncode
+    if rc_claim == 1:
+        log("progress: another worker holds the progress claim — skipping (COOP dedup)")
+        return None
+    claimed = rc_claim == 0
+    if not claimed:
+        log(f"progress: claim acquire errored (rc={rc_claim}) — proceeding unclaimed")
+    try:
+        return _do_progress_inner(w, opts)
+    finally:
+        if claimed:
+            subprocess.run([CLAIM_SH, "release", "progress"], capture_output=True)
+
+
+def _do_progress_inner(w, opts) -> int:
+    # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
+    # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
+    # round, for ever.
+    w.counters.write("progress-attempt-ts", int(time.time()))
+
+    # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
+    # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
+    roadmap_dir = w.cfg.state / "progress" / "roadmap"
+    if (roadmap_dir / ".git").is_dir():
+        ok = (
+            subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode == 0
+            and subprocess.run(
+                ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
+            ).returncode == 0
+        )
+        subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
+        if not ok:
+            raise Die(f"refreshing {roadmap_dir} failed")
+    else:
+        roadmap_dir.parent.mkdir(parents=True, exist_ok=True)
+        if subprocess.run(["git", "clone", "-q", f"https://github.com/{ROADMAP}", str(roadmap_dir)]).returncode:
+            raise Die(f"cloning {ROADMAP} failed")
+
+    # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
+    if not prepare_checkout(w.cfg):
+        raise Die("checkout failed")
+
+    work = w.cfg.state / "progress" / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    plan_file = work / "plan.json"
+    facts_file = work / "facts.json"
+    status_body = work / "status-body.md"
+    section_body = work / "section-body.md"
+    for stale in (status_body, section_body):
+        stale.unlink(missing_ok=True)  # never ship a previous round's prose
+
+    def run_tool(*args: str, capture: bool = False):
+        log(f"  $ tauceti-progress {args[0]} …")
+        return subprocess.run(progress_argv(*args), capture_output=capture, text=True, timeout=1800)
+
+    # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
+    #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
+    proc = run_tool(
+        "plan", "--roadmap-dir", str(roadmap_dir), "--code-dir", str(w.cfg.checkout),
+        "--out", str(plan_file), capture=True,
+    )
+    if proc.returncode == EX_NOPROGRESS:
+        log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
+        bust_progress_cache(w.cfg)
+        raise NoProgress("progress: no roadmap qualifies right now")
+    if proc.returncode != 0:
+        w.counters.incr("progress-err")
+        raise Die(f"tauceti-progress plan failed: {(proc.stderr or proc.stdout or '').strip()[:400]}")
+    plan = json.loads(plan_file.read_text())
+    log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
+
+    # 2) Ground truth from git, so the prose can be checked against what really landed.
+    if run_tool("facts", "--plan", str(plan_file), "--code-dir", str(w.cfg.checkout),
+                "--out", str(facts_file)).returncode != 0:
+        w.counters.incr("progress-err")
+        raise Die("tauceti-progress facts failed")
+
+    # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
+    prompt = fill_prompt(
+        HERE / "prompts" / "progress.md",
+        ROADMAP=plan["roadmap"], ROADMAP_DIR=str(roadmap_dir),
+        PLAN_FILE=str(plan_file), FACTS_FILE=str(facts_file),
+        STATUS_OUT=str(status_body), SECTION_OUT=str(section_body),
+        AGENT=opts.agent_name,
+    )
+    rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
+    if rc != 0:
+        w.counters.incr("progress-err")
+        raise Die(f"the writing agent exited {rc}")
+    for f in (status_body, section_body):
+        if not f.is_file() or not f.read_text().strip():
+            w.counters.incr("progress-err")
+            raise Die(f"the agent did not write {f.name}")
+
+    # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
+    #    resumable, so a retry after an interrupted run converges rather than duplicating.
+    proc = run_tool(
+        "apply", "--plan", str(plan_file), "--status-body", str(status_body),
+        "--section-body", str(section_body), "--roadmap-dir", str(roadmap_dir),
+        "--version", PROGRESS_REF, capture=True,
+    )
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    log(out[:600])
+    if proc.returncode == EX_NOPROGRESS:
+        bust_progress_cache(w.cfg)
+        raise NoProgress("progress: this window is already in flight or already landed")
+    if proc.returncode != 0:
+        w.counters.incr("progress-err")
+        raise Die(f"tauceti-progress apply failed: {out[:400]}")
+
+    # A report landed (as a PR). Clear the error streak, and drop the cached "due" verdict immediately:
+    # otherwise this same worker would still read `due` from cache on its next round, minutes from now,
+    # and open a second report before the first one merged.
+    w.counters.write("progress-err", 0)
+    bust_progress_cache(w.cfg)
+    return 0
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:

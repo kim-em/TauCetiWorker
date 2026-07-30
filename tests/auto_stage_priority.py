@@ -23,7 +23,9 @@ sv.needs_fix.actionable.append(candidate)
 
 checks = [
     check("fix beats unrelated review", tc._next_auto_stage(sv), "fix"),
-    check("single shared auto order", tc.AUTO_STAGES, ("rebase", "fix-ci", "fix", "review", "bump")),
+    # `progress` is last: rate-limited to one report a day, so it cannot crowd out queue tending, and
+    # ahead of roadmap authoring (handled separately after these) so a busy queue cannot defer it.
+    check("single shared auto order", tc.AUTO_STAGES, ("rebase", "fix-ci", "fix", "review", "bump", "progress")),
 ]
 
 # Drive the real cascade as well as its status predictor. A future edit must not let their shared
@@ -40,6 +42,23 @@ finally:
     tc.work_units.survey = saved_survey
     tc.work_units.dispatch = saved_dispatch
 checks.append(check("runtime cascade agrees with predictor", seen, ["fix"]))
+
+# A due progress report must never preempt queue tending: it is cosmetic next to a red PR or a
+# waiting review, and it is rate-limited anyway, so anything actionable wins.
+busy = tc.Survey(worker_id="test")
+busy.progress.actionable.append(tc.Candidate(0, "", "due"))
+busy.reviewable.actionable.append(candidate)
+checks.append(check("review beats a due progress report", tc._next_auto_stage(busy), "review"))
+
+# But with the queue empty it must be chosen ahead of roadmap authoring, or the open-ended fallback
+# (which always has work) would defer it for ever.
+quiet = tc.Survey(worker_id="test")
+quiet.progress.actionable.append(tc.Candidate(0, "", "due"))
+checks.append(check("progress beats roadmap authoring", tc._next_auto_stage(quiet), "progress"))
+
+# And when no report is due, the fallback is roadmap authoring as before.
+idle = tc.Survey(worker_id="test")
+checks.append(check("no report due falls back to roadmap", tc._next_auto_stage(idle), "roadmap"))
 
 sv.red_ci.actionable.append(candidate)
 checks.append(check("red CI beats review findings", tc._next_auto_stage(sv), "fix-ci"))

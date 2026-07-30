@@ -210,7 +210,7 @@ try:
 config:  /tmp/workers.toml
 
 worker1 — waiting for quota
-  phases:   rebase, review, fix-ci, fix, bump, roadmap
+  phases:   rebase, review, fix-ci, fix, bump, progress, roadmap
   agent:    auto · host sandbox
   pacing:   normal
   roadmap:  auto (random each round)

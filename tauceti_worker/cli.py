@@ -75,6 +75,7 @@ the cascade (priority order; a round does the first that applies):
   fix       address review feedback on one of our PRs
   review    review an open PR (runs the tauceti-review engine)
   bump      adapt a red bump-mathlib PR (the worker never authors one)
+  progress  write a roadmap's STATUS.md / PROGRESS.md report (at most one a day, whole fleet)
   roadmap   open a new PR for a roadmap item
 
   With no --only a round walks the whole cascade; --only pins it to a subset,

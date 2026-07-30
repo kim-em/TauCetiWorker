@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import random
 import re
+import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import UTC
 from pathlib import Path
@@ -15,6 +17,7 @@ from .constants import (
     AUTO_STAGES,
     BUMP_HEAD_PREFIX,
     CONTEST_CLAIM_TTL,
+    EX_NOPROGRESS,
     MAX_BUMP_ATTEMPTS,
     MAX_BUMP_PR_ATTEMPTS,
     MAX_CI_ATTEMPTS,
@@ -24,7 +27,12 @@ from .constants import (
     MAX_REBASE_ATTEMPTS,
     MAX_REVIEW_CONTESTS,
     MAX_REVIEW_CONTESTS_PER_RUBRIC,
+    MAX_PROGRESS_ERRORS,
     MAX_REVIEW_ERRORS,
+    PROGRESS,
+    PROGRESS_ATTEMPT_GAP,
+    PROGRESS_REF,
+    PROGRESS_TTL,
     REVIEW_DAILY_CAP,
     STATUS_LABELS,
     TAUCETI_OWNER,
@@ -173,6 +181,7 @@ class Survey:
     needs_fix: WorkKind = field(default_factory=lambda: WorkKind("fix"))
     red_ci: WorkKind = field(default_factory=lambda: WorkKind("fix-ci"))
     bump: WorkKind = field(default_factory=lambda: WorkKind("bump"))  # broken bump-mathlib PRs
+    progress: WorkKind = field(default_factory=lambda: WorkKind("progress"))  # a roadmap report is due
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -215,6 +224,7 @@ class Survey:
             "fix": self.needs_fix,
             "fix-ci": self.red_ci,
             "bump": self.bump,
+            "progress": self.progress,
         }[name]
 
     def rescope_roadmap(self) -> None:
@@ -375,6 +385,85 @@ def fix_disposition(
             f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — needs a human",
         )
     return ("actionable", "")
+
+
+def progress_argv(*args: str) -> list[str]:
+    """The TauCetiProgress CLI, fetched on demand like the review engine and the bubble CLI."""
+    return [
+        "uvx", "--from", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}",
+        "tauceti-progress", *args,
+    ]
+
+
+def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
+    """Is a roadmap progress report due? `(due, reason)`.
+
+    Cost discipline matters here, because this runs on EVERY round and every ~90s behind the
+    dashboard, whereas a report is wanted about once a day. So this is the cheap half of the decision:
+    one `gh api` call for the roadmap repo's recent commit subjects, no clone, no PR query — and the
+    VERDICT is cached (not the raw response), so it is not re-derived while a round is in flight. The
+    expensive half (the roadmap checkout, the per-area label queries, the model) happens in the round.
+
+    Never raises. The cascade is first-actionable-wins and a stage that raises aborts the whole round,
+    so a broken `uvx`, a GitHub hiccup or a bad exit here must read as "not due" and let the round fall
+    through to review and fix work. A stage that can throw is a stage that can wedge the worker.
+    """
+    cache = cfg.state / "cache" / "progress-due.json"
+    try:
+        if cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
+            d = json.loads(cache.read_text())
+            return bool(d.get("due")), str(d.get("reason") or "")
+    except (OSError, ValueError):
+        pass
+
+    # A durable attempt breaker, independent of whether a report ever LANDS. The cadence check keys on
+    # the last merged report, so a stuck or rejected PR would otherwise leave it true for ever and
+    # every round would burn on it.
+    last_attempt = counters.read("progress-attempt-ts")
+    if last_attempt and (time.time() - last_attempt) < PROGRESS_ATTEMPT_GAP:
+        gap_h = (time.time() - last_attempt) / 3600.0
+        return False, f"a progress round was attempted {gap_h:.1f}h ago; waiting out the attempt gap"
+    if counters.read("progress-err") >= MAX_PROGRESS_ERRORS:
+        return False, (
+            f"progress rounds have failed {counters.read('progress-err')}x; "
+            f"backing off (clear state/progress-err to retry)"
+        )
+
+    try:
+        proc = subprocess.run(progress_argv("due"), capture_output=True, text=True, timeout=300)
+        # The verdict is on stdout. stderr carries uvx's build chatter ("Updating ...", "Building
+        # ..."), which is not part of the reason and would otherwise fill the dashboard cell.
+        out = (proc.stdout or "").strip().splitlines()
+        verdict = out[-1].strip() if out else ""
+        if proc.returncode == 0:
+            due, reason = True, verdict or "due"
+        elif proc.returncode == EX_NOPROGRESS:
+            due, reason = False, verdict or "not due"
+        else:
+            err = (proc.stderr or "").strip().splitlines()
+            detail = verdict or (err[-1].strip() if err else "")
+            due, reason = False, f"progress due-check failed (rc={proc.returncode}): {detail[:200]}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        due, reason = False, f"progress due-check could not run: {exc}"
+
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"due": due, "reason": reason}))
+    except OSError:
+        pass
+    return due, reason
+
+
+def bust_progress_cache(cfg: Config) -> None:
+    """Drop the cached `due` verdict so the next survey re-derives it.
+
+    Called the moment a report is opened: without it this same worker would still read `due` from
+    cache on its next round, minutes later, and open a second report before the first one merged.
+    """
+    try:
+        (cfg.state / "cache" / "progress-due.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep: bool = True) -> Survey:
@@ -600,6 +689,15 @@ def survey(cfg: Config, gh: GitHub, rs: ReviewState, counters: Counters, *, deep
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)
+
+    # 6) progress: a per-roadmap STATUS.md / PROGRESS.md report is due in TauCetiRoadmap. Unlike every
+    #    other kind this is not about a PR of ours, so it carries a single pr=0 candidate whose reason
+    #    is the cadence verdict. Deep only: the check costs an API call, and the shallow survey exists
+    #    to be cheap. progress_due never raises.
+    if deep:
+        due, reason = progress_due(cfg, counters)
+        c = Candidate(0, "", reason or "progress report")
+        (sv.progress.actionable if due else sv.progress.suppressed).append(c)
 
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv
