@@ -1294,6 +1294,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
 def add_workers_parser(subparsers) -> None:
     workers = subparsers.add_parser("workers", help="configure, supervise, and monitor persistent workers")
     workers.add_argument("--config", type=Path, default=default_workers_config(), help="desired worker TOML file")
+    workers.set_defaults(json=False, watch=False)
     actions = workers.add_subparsers(dest="workers_action")
     status = actions.add_parser("status", help="show desired and actual worker state")
     status.add_argument("--json", action="store_true")

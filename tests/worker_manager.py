@@ -79,6 +79,12 @@ try:
     wm.save_worker_specs(config, specs)
     assert wm.load_worker_specs(config) == specs
 
+    # Bare `tauceti workers` is the documented shorthand for `workers status`.
+    bare_workers = build_parser().parse_args(["workers"])
+    assert bare_workers.workers_action is None
+    assert bare_workers.json is False and bare_workers.watch is False
+    assert wm.cmd_workers(bare_workers) == 1  # manager is intentionally offline at this point
+
     runtime_probe = root / "runtime-probe.json"
     os.environ["TAUCETI_RUNTIME_STATUS"] = str(runtime_probe)
     report_runtime("waiting-quota", detail="test", next_action_at=123)
