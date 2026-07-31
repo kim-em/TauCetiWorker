@@ -52,9 +52,45 @@ cases = [
     # A parsed non-transient status wins over any transport word later in the same tail: a 401 that
     # happens to mention a socket is still a 401.
     ("401 beats transport", "API Error: 401 Invalid credentials\nsocket hang up", None),
-    # Only the last provider line is the outcome; a 529 the CLI retried past and then failed for its
-    # own reasons still classifies as transient, which is the safe direction (worst case: one refund).
-    ("status found in tail", "warming up\nAPI Error: 529 Overloaded", "provider returned 529"),
+    ("short preamble still counts", "warming up\nAPI Error: 529 Overloaded", "provider returned 529"),
+    # The LAST status is the outcome. Taking the first would refund a run that saw a 529, retried past
+    # it, and then died of a dead credential, and would charge the reverse.
+    ("last status wins, transient", "API Error: 401 stale\nAPI Error: 529 Overloaded", "provider returned 529"),
+    ("last status wins, terminal", "API Error: 529 Overloaded\nAPI Error: 401 Invalid", None),
+    # A refund asserts the agent never ran. A transcript means it did, so a quoted status inside real
+    # work is a task failure: a recovered network flake, a test asserting on an error string, the
+    # agent reading a log. These are the false positives that would let a stuck PR retry for ever.
+    (
+        "agent worked, then failed",
+        "\n".join(
+            [
+                "fetching mathlib cache",
+                "warning: transient failure: API Error: 503, retrying",
+                "cache ok",
+                "building TauCeti.Analysis",
+                "error: TauCeti/Foo.lean:12:0: unknown identifier",
+                "build failed with 1 error",
+                "agent: giving up",
+            ]
+        ),
+        None,
+    ),
+    (
+        "test output quoting a status",
+        "\n".join(
+            [
+                "running tests",
+                "FAIL test_retry: expected 'API Error: 529 Overloaded'",
+                "AssertionError",
+                "1 failed",
+                "5 passed",
+                "6 tests run",
+                "exit 1",
+            ]
+        ),
+        None,
+    ),
+    ("colon is required", "API Error529 Overloaded", None),
 ]
 for name, text, want in cases:
     check(f"classify {name}", agents.classify_agent_failure(text), want)
@@ -90,28 +126,40 @@ with tempfile.TemporaryDirectory() as state:
     check("529 refunds the attempt", w.counters.read(KEYS[0]), 0)
     check("529 pauses the round", bool(raised and "not charged" in raised), True)
 
+    # One observed failure grants exactly one refund. Without the read-and-clear accessor a second
+    # caller could spend the same failure again, which is how the earlier version double-counted.
+    w.counters.write(KEYS[0], 1)
+    wu._refund_infra_failure(w, CAND, "fix", KEYS)
+    check("one failure, one refund", w.counters.read(KEYS[0]), 1)
+
     # The refund never drives a counter negative (a stale counter file must not become a credit).
-    wu_raised = False
+    w.counters.write(KEYS[0], 0)
+    agents._LAST_AGENT_FAILURE = "provider returned 529"
+    floored = False
     try:
         wu._refund_infra_failure(w, CAND, "fix", KEYS)
     except NoProgress:
-        wu_raised = True
+        floored = True
     check("refund floors at zero", w.counters.read(KEYS[0]), 0)
-    check("still pauses", wu_raised, True)
+    check("still pauses", floored, True)
 
 # The cap stops a misclassified persistent failure from retrying for ever.
 with tempfile.TemporaryDirectory() as state:
     w = fresh(state)
     agents._LAST_AGENT_FAILURE = "provider returned 529"
     charged_again = False
-    for _ in range(wu.MAX_INFRA_REFUNDS + 1):
+    for i in range(wu.MAX_INFRA_REFUNDS + 1):
         w.counters.write(KEYS[0], 3)
+        agents._LAST_AGENT_FAILURE = "provider returned 529"
+        # A new head each round: the cap is keyed on the PR precisely so pushing cannot reset it
+        # while the per-PR lifetime counters keep being handed back.
+        moved = SimpleNamespace(pr=CAND.pr, head=f"{i:040x}")
         try:
-            wu._refund_infra_failure(w, CAND, "fix", KEYS)
+            wu._refund_infra_failure(w, moved, "fix", KEYS)
         except NoProgress:
             continue
         charged_again = True  # returned without raising ⇒ the cap fired
-    check("cap eventually charges", charged_again, True)
+    check("cap survives a moving head", charged_again, True)
     check("cap leaves the attempt charged", w.counters.read(KEYS[0]), 3)
 
 agents._LAST_AGENT_FAILURE = None

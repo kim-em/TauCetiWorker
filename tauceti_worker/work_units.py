@@ -21,7 +21,6 @@ from .agents import (
     fetch_ref,
     fill_prompt,
     host_agent_argv,
-    last_agent_infra_failure,
     prepare_checkout,
     resolve_authoring_profile,
     resolve_codex_model_access,
@@ -29,6 +28,7 @@ from .agents import (
     run_agent_host,
     run_in_bubble,
     run_to_logfile,
+    take_last_agent_infra_failure,
 )
 from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
@@ -539,11 +539,17 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     The counters are charged UP FRONT on purpose (an un-checkout-able PR must not loop), so a refund
     rather than a late charge is what keeps both properties. MAX_INFRA_REFUNDS bounds it in case a
     persistent PR-specific failure ever matches the transient patterns.
+
+    That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
+    lifetime (`ci-pr-`, `bump-pr-`, `rebase-pr-`), so a head-keyed allowance would reset on every
+    push while still handing those back, and a persistent false positive could evade the lifetime
+    backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
+    per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
     """
-    reason = last_agent_infra_failure()
+    reason = take_last_agent_infra_failure()
     if not reason:
         return
-    refunds = w.counters.incr(f"infra-{label}-{c.pr}-{c.head[:12]}")
+    refunds = w.counters.incr(f"infra-{label}-{c.pr}")
     if refunds > MAX_INFRA_REFUNDS:
         warn_red(
             f"  {label} #{c.pr}: {reason}, but this head has already been refunded "
