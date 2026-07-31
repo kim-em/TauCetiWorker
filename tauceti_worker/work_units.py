@@ -747,6 +747,7 @@ def _do_progress_inner(w, opts) -> int:
     work = w.cfg.state / "progress" / "work"
     work.mkdir(parents=True, exist_ok=True)
     plan_file = work / "plan.json"
+    prompt_file = work / "progress-prompt.md"
     facts_file = work / "facts.json"
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
@@ -790,8 +791,18 @@ def _do_progress_inner(w, opts) -> int:
         raise Die("tauceti-progress facts failed")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
+    #
+    # The prompt comes from TauCetiProgress, not from this repository. It used to live in both, the
+    # copies drifted, and a fix to report length was very nearly made to the one nothing read. Serving
+    # it from the pinned build keeps the words a model is given and the checks its output must pass as
+    # one versioned thing. No new failure mode: `plan` and `facts` above already ran from that build.
+    proc = run_tool("prompt", "progress", capture=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        w.counters.incr("progress-err")
+        raise Die(f"tauceti-progress prompt failed: {(proc.stderr or '').strip()[:200]}")
+    prompt_file.write_text(proc.stdout, encoding="utf-8")
     prompt = fill_prompt(
-        HERE / "prompts" / "progress.md",
+        prompt_file,
         ROADMAP=plan["roadmap"],
         ROADMAP_DIR=str(roadmap_dir),
         PLAN_FILE=str(plan_file),
