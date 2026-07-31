@@ -117,7 +117,9 @@ with tempfile.TemporaryDirectory() as root:
         "darwin", real, iso, inherited={"CLAUDE_CONFIG_DIR": str(iso / ".claude"), "CODEX_HOME": "/somewhere/of/my/own"}
     )
     check("a pre-exported claude dir is not isolation", env["CODEX_HOME"], str(iso / ".codex"))
-    check("setup really ran", (iso / ".codex" / "auth.json").exists(), True)
+    # Codex's finding was that returning early creates neither directory, so that is what to assert:
+    # a copied credential would only prove it for whichever source dir happened to be populated.
+    check("setup really ran", (iso / ".claude").is_dir() and (iso / ".codex").is_dir(), True)
 
 # --- Linux: unchanged, $HOME still moves ----------------------------------------------------------
 with tempfile.TemporaryDirectory() as root:
@@ -130,6 +132,30 @@ with tempfile.TemporaryDirectory() as root:
     check("Linux exports the same data root", env["TAUCETI_DATA_HOME"], str(iso))
     # gh and git config are redirected back at the operator's, since the moved $HOME has neither.
     check("Linux redirects GH_CONFIG_DIR", env["GH_CONFIG_DIR"], str(real / ".config" / "gh"))
+
+# --- a custom $CODEX_HOME is the source we seed FROM ----------------------------------------------
+# isolate_home repoints $CODEX_HOME at the worker's copy, so it must read the operator's ACTIVE codex
+# login to make that copy, not the literal <home>/.codex. Seeding from the wrong directory and then
+# repointing leaves the worker authenticated nowhere: the isolated dir has no auth.json and the
+# operator's real one is no longer on the path anything looks at.
+with tempfile.TemporaryDirectory() as root:
+    real, iso = seeded_real_home(root), Path(root) / "iso"
+    custom = Path(root) / "elsewhere" / "codex"
+    custom.mkdir(parents=True)
+    custom.joinpath("auth.json").write_text('{"tokens": {"access_token": "the-one-actually-in-use"}}')
+    # The login the operator is really using lives only in the custom dir.
+    (real / ".codex" / "auth.json").unlink()
+
+    env = isolate("darwin", real, iso, inherited={"CODEX_HOME": str(custom)})
+
+    check("CODEX_HOME is repointed at the worker copy", env["CODEX_HOME"], str(iso / ".codex"))
+    check("the worker copy is not empty", (iso / ".codex" / "auth.json").exists(), True)
+    check(
+        "seeded from the custom dir",
+        (iso / ".codex" / "auth.json").read_text(),
+        '{"tokens": {"access_token": "the-one-actually-in-use"}}',
+    )
+    check("marker names the custom dir", (iso / ".codex" / ".tauceti-creds-source").read_text(), str(custom))
 
 # --- the worker's data follows the WORKER, not $HOME ----------------------------------------------
 # This is the migration hazard: the review store holds an outbox of unpublished records and the

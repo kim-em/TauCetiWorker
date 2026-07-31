@@ -41,6 +41,7 @@ from .quota import (
     _safe_exists,
     _write_json_atomic,
     claude_dir,
+    codex_dir,
     mirror_creds,
 )
 from .runtime_status import report_failure
@@ -1193,7 +1194,11 @@ def isolate_home(wid: str) -> Path:
             )
     else:
         marker.write_text(str(real_claude))
-    real_codex = real / ".codex"
+    # Honour an operator-supplied $CODEX_HOME, exactly as real_claude honours $CLAUDE_CONFIG_DIR
+    # above. Reading the literal <home>/.codex would seed the isolated dir from a directory the
+    # operator may not be using, and since we then repoint $CODEX_HOME at our own copy, the worker
+    # would end up authenticated nowhere. Must be captured BEFORE the repoint below.
+    real_codex = codex_dir(real)
     src, dst = real_codex / "auth.json", iso_codex / "auth.json"
     if _safe_exists(src) and not dst.exists():
         shutil.copy2(src, dst)
