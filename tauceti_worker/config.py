@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import ROADMAP
+from .constants import ROADMAP, TAUCETI
 from .paths import HERE
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
@@ -131,7 +131,8 @@ class Config:
     """Resolved per-worker configuration (paths derived from the worker id)."""
 
     wid: str
-    home: Path  # HOME the worker runs under (may be isolated)
+    home: Path  # the LOGIN home: where per-user credential stores live (macOS Keychain, gh, git)
+    data_home: Path  # the worker's own data root: per-worker, and independent of where $HOME points
     state: Path  # HERE/state/<wid>
     checkout: Path  # host authoring checkout
     store_dir: Path  # tauceti-review persistent store
@@ -152,13 +153,31 @@ class Config:
         # branch/<pr> lease and git-safe-push fails closed with "lease lost (another agent took over)".
         os.environ["TAUCETI_WORKER_ID"] = wid
         h = home or Path(os.environ.get("HOME", os.path.expanduser("~")))
+        # Two different homes, and conflating them is what made the macOS isolation change risky.
+        # `home` answers "whose credentials?" and must follow the login user, because the macOS
+        # Keychain, gh and git are per-login-user stores. `data_home` answers "whose working data?"
+        # and must follow the WORKER, because the review store holds an outbox of unpublished
+        # records and the scoreboard/thread ids: point it somewhere new and a worker silently
+        # abandons reviews it never sent and re-posts scoreboards it already posted.
+        #
+        # isolate_home() exports $TAUCETI_DATA_HOME (children inherit it); an unisolated worker has
+        # none and its data lives under the login home exactly as before. Every isolated worker's
+        # data path is therefore the same one it had when isolation moved $HOME, on both platforms,
+        # so nothing migrates.
+        dh = Path(os.environ.get("TAUCETI_DATA_HOME") or h)
         state = HERE / "state" / wid
+        # Per-worker claim scratch. claim.sh defaults this under $HOME, which was per-worker only
+        # while $HOME moved; without it every macOS worker would now build claim objects in one
+        # shared bare repo with no local lock around `remote set-url` and fetch.
+        repo = os.environ.get("CLAIM_REPO") or TAUCETI
+        os.environ.setdefault("CLAIM_GITDIR", str(dh / ".cache" / "tauceti-claims" / f"{repo.replace('/', '__')}.git"))
         return Config(
             wid=wid,
             home=h,
+            data_home=dh,
             state=state,
             checkout=HERE / "checkouts" / wid / "TauCeti",
-            store_dir=h / ".cache" / "tauceti-review" / wid / "store" / "TauCetiProject__TauCeti",
+            store_dir=dh / ".cache" / "tauceti-review" / wid / "store" / "TauCetiProject__TauCeti",
             sbcache=state / "cache" / "scoreboard",
             logdir=HERE / "logs" / wid,
             quota_cache=state / "cache",

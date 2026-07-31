@@ -26,7 +26,7 @@ codex_dir = tc.quota.codex_dir
 claude_dir = tc.quota.claude_dir
 fails = 0
 
-ISOLATION_VARS = ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL")
+ISOLATION_VARS = ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "TAUCETI_DATA_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL")
 
 
 def check(name, got, want):
@@ -36,13 +36,17 @@ def check(name, got, want):
     print(f"[{'OK ' if ok else 'XX '}] {name}: got {got!r} want {want!r}")
 
 
-def isolate(platform, real, iso):
-    """Run isolate_home for `platform` with a faked worker home, returning the resulting env."""
+def isolate(platform, real, iso, inherited=None):
+    """Run isolate_home for `platform` with a faked worker home, returning the resulting env.
+
+    `inherited` is the environment a loop child would start with, so the early return is reachable:
+    clearing everything first (as this helper used to) can only ever exercise a cold start."""
     saved_env = {k: os.environ.get(k) for k in ISOLATION_VARS}
     saved_platform, saved_iso_home = agents.sys.platform, agents._worker_iso_home
     try:
         for k in ISOLATION_VARS:
             os.environ.pop(k, None)
+        os.environ.update(inherited or {})
         os.environ["HOME"] = str(real)
         agents.sys.platform = platform
         agents._worker_iso_home = lambda wid, _base=None: Path(iso)
@@ -74,6 +78,7 @@ with tempfile.TemporaryDirectory() as root:
     check("macOS leaves $HOME at the operator's", env["HOME"], str(real))
     check("macOS isolates CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
     check("macOS isolates CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    check("data root is exported", env["TAUCETI_DATA_HOME"], str(iso))
     check("codex credential is copied in", (iso / ".codex" / "auth.json").exists(), True)
     check("codex source marker recorded", (iso / ".codex" / ".tauceti-creds-source").read_text(), str(real / ".codex"))
 
@@ -90,21 +95,29 @@ with tempfile.TemporaryDirectory() as root:
             if v is not None:
                 os.environ[k] = v
 
-# --- macOS: a loop child inherits isolation and must not redo it ----------------------------------
+# --- a loop child inherits isolation and must not redo it -----------------------------------------
 with tempfile.TemporaryDirectory() as root:
     real, iso = seeded_real_home(root), Path(root) / "iso"
-    isolate("darwin", real, iso)
+    child_env = isolate("darwin", real, iso)
     (iso / ".codex" / "auth.json").write_text("REPLACED-BY-A-REFRESH")
 
-    saved = os.environ.get("CLAUDE_CONFIG_DIR")
-    os.environ["CLAUDE_CONFIG_DIR"] = str(iso / ".claude")  # as a child would inherit it
-    try:
-        env = isolate("darwin", real, iso)
-    finally:
-        os.environ.pop("CLAUDE_CONFIG_DIR", None)
-        if saved is not None:
-            os.environ["CLAUDE_CONFIG_DIR"] = saved
+    env = isolate("darwin", real, iso, inherited={k: v for k, v in child_env.items() if v})
     check("re-isolation does not re-copy creds", (iso / ".codex" / "auth.json").read_text(), "REPLACED-BY-A-REFRESH")
+    # The early return still reasserts the redirects: a child that lost one must not silently fall
+    # back to the operator's account.
+    check("early return reasserts CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
+    check("early return reasserts CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+
+# --- the sentinel, not any single redirect, decides "already isolated" ----------------------------
+with tempfile.TemporaryDirectory() as root:
+    real, iso = seeded_real_home(root), Path(root) / "iso"
+    # An operator who exports exactly the Claude path we would have chosen, with no isolation done.
+    # Returning here would leave codex on the operator's credential and create nothing.
+    env = isolate(
+        "darwin", real, iso, inherited={"CLAUDE_CONFIG_DIR": str(iso / ".claude"), "CODEX_HOME": "/somewhere/of/my/own"}
+    )
+    check("a pre-exported claude dir is not isolation", env["CODEX_HOME"], str(iso / ".codex"))
+    check("setup really ran", (iso / ".codex" / "auth.json").exists(), True)
 
 # --- Linux: unchanged, $HOME still moves ----------------------------------------------------------
 with tempfile.TemporaryDirectory() as root:
@@ -114,8 +127,37 @@ with tempfile.TemporaryDirectory() as root:
     check("Linux still moves $HOME", env["HOME"], str(iso))
     check("Linux isolates CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
     check("Linux isolates CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    check("Linux exports the same data root", env["TAUCETI_DATA_HOME"], str(iso))
     # gh and git config are redirected back at the operator's, since the moved $HOME has neither.
     check("Linux redirects GH_CONFIG_DIR", env["GH_CONFIG_DIR"], str(real / ".config" / "gh"))
+
+# --- the worker's data follows the WORKER, not $HOME ----------------------------------------------
+# This is the migration hazard: the review store holds an outbox of unpublished records and the
+# scoreboard/thread ids, so a path that moves means abandoned reviews and duplicate comments. Under
+# the old behaviour $HOME *was* the isolation root, so pinning the data root to it reproduces the
+# exact same paths on both platforms and nothing migrates.
+with tempfile.TemporaryDirectory() as root:
+    iso = Path(root) / "iso"
+    saved = {k: os.environ.get(k) for k in ("TAUCETI_DATA_HOME", "HOME", "CLAIM_GITDIR")}
+    try:
+        os.environ.update(TAUCETI_DATA_HOME=str(iso), HOME=str(Path(root) / "real"))
+        os.environ.pop("CLAIM_GITDIR", None)
+        cfg = tc.Config.resolve("worker1")
+        check("store follows the data root", cfg.store_dir.is_relative_to(iso), True)
+        check("bubble home follows the data root", agents.bubble_home(cfg).is_relative_to(iso), True)
+        check("claim scratch is per worker", Path(os.environ["CLAIM_GITDIR"]).is_relative_to(iso), True)
+        check("login home is untouched", cfg.home, Path(root) / "real")
+
+        # An unisolated worker (the 'default' id) has no sentinel: its data stays under the login
+        # home, exactly where it has always been.
+        os.environ.pop("TAUCETI_DATA_HOME", None)
+        plain = tc.Config.resolve("default")
+        check("unisolated data stays at $HOME", plain.data_home, Path(root) / "real")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
 
 print("\nFAIL" if fails else "\nall macOS isolation checks passed")
 sys.exit(1 if fails else 0)

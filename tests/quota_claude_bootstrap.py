@@ -133,6 +133,7 @@ def make_cfg(home, wid="test"):
     return tc.Config(
         wid=wid,
         home=home,
+        data_home=home,
         state=state,
         checkout=home / "co",
         store_dir=home / "store",

@@ -723,7 +723,7 @@ def bubble_name(cfg: Config) -> str:
 
 def bubble_home(cfg: Config) -> Path:
     env = os.environ.get("TAUCETI_BUBBLE_HOME")
-    return Path(env) if env else (cfg.home / ".cache" / "tauceti-worker" / cfg.wid / "bubble")
+    return Path(env) if env else (cfg.data_home / ".cache" / "tauceti-worker" / cfg.wid / "bubble")
 
 
 def ensure_bubble_home(cfg: Config) -> dict:
@@ -1153,10 +1153,17 @@ def isolate_home(wid: str) -> Path:
 
     home = _worker_iso_home(wid)
     iso_claude, iso_codex = home / ".claude", home / ".codex"
-    # Idempotence: a loop child inherits its parent's isolation and must not re-copy or re-warn. Off
-    # macOS that shows up as $HOME already being the worker home; on macOS $HOME is deliberately left
-    # alone, so the config redirect is the signal instead.
-    if Path(os.environ.get("HOME", "")) == home or os.environ.get("CLAUDE_CONFIG_DIR") == str(iso_claude):
+    # Idempotence: a loop child inherits its parent's isolation and must not re-copy or re-warn. The
+    # signal is one sentinel naming the isolation root, not any individual redirect: keying on
+    # $CLAUDE_CONFIG_DIR alone would return early for an operator who happens to export that path,
+    # leaving codex unisolated and the directories uncreated, and keying on $HOME alone cannot work
+    # on macOS where $HOME deliberately does not move. The sentinel is written last, so it means
+    # "isolation completed", and a partially built environment re-runs the whole setup.
+    if os.environ.get("TAUCETI_DATA_HOME") == str(home):
+        # Reassert the redirects rather than trusting them: they are what every credential read
+        # resolves through, and a child that lost one would silently use the operator's account.
+        os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
+        os.environ["CODEX_HOME"] = str(iso_codex)
         return home
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
@@ -1204,6 +1211,10 @@ def isolate_home(wid: str) -> Path:
     # are the WHOLE isolation on macOS, and they ride alongside the $HOME move elsewhere.
     os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
     os.environ["CODEX_HOME"] = str(iso_codex)
+    # The worker's data root, wherever $HOME ends up pointing. Config.resolve hangs the review store,
+    # the bubble home and the claim scratch off this, so those stay per-worker and stay put on macOS
+    # even though $HOME no longer moves. Written last: it doubles as the completion sentinel above.
+    os.environ["TAUCETI_DATA_HOME"] = str(home)
     if sys.platform == "darwin":
         # Leave $HOME at the operator's, so `security` keeps resolving the login Keychain for the pacer,
         # for the spawned claude, and for gh. See the docstring for why moving it cost three separate
