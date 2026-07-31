@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""macOS isolation must not move $HOME.
+
+Claude Code and gh both keep their credentials in the login Keychain, which `security` resolves through
+$HOME. Repointing $HOME therefore made both unreachable: the pacer found no Claude creds and parked
+every non-default worker in a 300s sleep for ever (kim-em/TauCetiWorker#135, Jeremy Kahn), and gh lost
+its token (Bryan's report). It isolated nothing in exchange, because the Keychain is one per-login-user
+store. So on macOS the isolation is $CLAUDE_CONFIG_DIR + $CODEX_HOME and $HOME is left alone; off macOS
+$HOME still moves and the same two variables ride along.
+
+This pins both platforms with a faked sys.platform and a faked worker home, touching no real Keychain.
+Exit 0 = all assertions hold; 1 = a mismatch.
+"""
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
+
+agents = tc.agents
+codex_dir = tc.quota.codex_dir
+claude_dir = tc.quota.claude_dir
+fails = 0
+
+ISOLATION_VARS = ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL")
+
+
+def check(name, got, want):
+    global fails
+    ok = got == want
+    fails += not ok
+    print(f"[{'OK ' if ok else 'XX '}] {name}: got {got!r} want {want!r}")
+
+
+def isolate(platform, real, iso):
+    """Run isolate_home for `platform` with a faked worker home, returning the resulting env."""
+    saved_env = {k: os.environ.get(k) for k in ISOLATION_VARS}
+    saved_platform, saved_iso_home = agents.sys.platform, agents._worker_iso_home
+    try:
+        for k in ISOLATION_VARS:
+            os.environ.pop(k, None)
+        os.environ["HOME"] = str(real)
+        agents.sys.platform = platform
+        agents._worker_iso_home = lambda wid, _base=None: Path(iso)
+        agents.isolate_home("worker1")
+        return {k: os.environ.get(k) for k in ISOLATION_VARS}
+    finally:
+        agents.sys.platform, agents._worker_iso_home = saved_platform, saved_iso_home
+        for k, v in saved_env.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def seeded_real_home(root):
+    """A plausible operator home: a codex credential to isolate, and a gh config to redirect to."""
+    real = Path(root) / "real"
+    (real / ".codex").mkdir(parents=True)
+    (real / ".codex" / "auth.json").write_text('{"tokens": {"access_token": "operator"}}')
+    (real / ".claude").mkdir(parents=True)
+    (real / ".config" / "gh").mkdir(parents=True)
+    return real
+
+
+# --- macOS: $HOME stays put, the two config vars carry the isolation ------------------------------
+with tempfile.TemporaryDirectory() as root:
+    real, iso = seeded_real_home(root), Path(root) / "iso"
+    env = isolate("darwin", real, iso)
+
+    check("macOS leaves $HOME at the operator's", env["HOME"], str(real))
+    check("macOS isolates CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
+    check("macOS isolates CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    check("codex credential is copied in", (iso / ".codex" / "auth.json").exists(), True)
+    check("codex source marker recorded", (iso / ".codex" / ".tauceti-creds-source").read_text(), str(real / ".codex"))
+
+    # The redirect is what makes the isolation real: with $HOME still the operator's, a bare
+    # <home>/.codex would resolve to the operator's own credential rather than the worker's copy.
+    saved = {k: os.environ.get(k) for k in ("CODEX_HOME", "CLAUDE_CONFIG_DIR")}
+    os.environ.update(CODEX_HOME=env["CODEX_HOME"], CLAUDE_CONFIG_DIR=env["CLAUDE_CONFIG_DIR"])
+    try:
+        check("codex_dir follows the redirect", codex_dir(real), iso / ".codex")
+        check("claude_dir follows CLAUDE_CONFIG_DIR", claude_dir(real), iso / ".claude")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+# --- macOS: a loop child inherits isolation and must not redo it ----------------------------------
+with tempfile.TemporaryDirectory() as root:
+    real, iso = seeded_real_home(root), Path(root) / "iso"
+    isolate("darwin", real, iso)
+    (iso / ".codex" / "auth.json").write_text("REPLACED-BY-A-REFRESH")
+
+    saved = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(iso / ".claude")  # as a child would inherit it
+    try:
+        env = isolate("darwin", real, iso)
+    finally:
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        if saved is not None:
+            os.environ["CLAUDE_CONFIG_DIR"] = saved
+    check("re-isolation does not re-copy creds", (iso / ".codex" / "auth.json").read_text(), "REPLACED-BY-A-REFRESH")
+
+# --- Linux: unchanged, $HOME still moves ----------------------------------------------------------
+with tempfile.TemporaryDirectory() as root:
+    real, iso = seeded_real_home(root), Path(root) / "iso"
+    env = isolate("linux", real, iso)
+
+    check("Linux still moves $HOME", env["HOME"], str(iso))
+    check("Linux isolates CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
+    check("Linux isolates CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    # gh and git config are redirected back at the operator's, since the moved $HOME has neither.
+    check("Linux redirects GH_CONFIG_DIR", env["GH_CONFIG_DIR"], str(real / ".config" / "gh"))
+
+print("\nFAIL" if fails else "\nall macOS isolation checks passed")
+sys.exit(1 if fails else 0)

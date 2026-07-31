@@ -407,12 +407,16 @@ tauceti work --loop --worker-id bob   --only roadmap
 ```
 
 `--worker-id` pins a stable name and is the only knob you need: any id other than
-`default` also gives that worker its own `$HOME` (symlinking your read-only Claude
-tool surface, copying the mutable auth in once) so their credential refreshes don't
-race. Your `gh` and `git` config stays shared, not isolated (it doesn't refresh-race,
-and the host survey and pushes need it), so the worker still authenticates as you.
-(`--isolate-home` still exists, but only to force that same isolation for the
-`default` id; a distinct id already implies it.) The workers coordinate through
+`default` also gives that worker its own credential directories (symlinking your
+read-only Claude tool surface, copying the mutable auth in once) so their credential
+refreshes don't race. On Linux that is a per-worker `$HOME`; on macOS `$HOME` stays
+yours and `$CLAUDE_CONFIG_DIR` + `$CODEX_HOME` are repointed instead, because the
+login Keychain that Claude Code and `gh` both read is resolved through `$HOME` and
+moving it left a worker with no credentials at all. Your `gh` and `git` config stays
+shared, not isolated (it doesn't refresh-race, and the host survey and pushes need
+it), so the worker still authenticates as you. (`--isolate-home` still exists, but
+only to force that same isolation for the `default` id; a distinct id already
+implies it.) The workers coordinate through
 GitHub, not through each other: the per-PR scoreboard comment is the shared review
 state, `git-safe-push` / `gh-safe-pr-create` compare-and-swap so no one clobbers
 another's push, and `claim.sh` hands out branches. Add workers and throughput goes
@@ -429,7 +433,9 @@ before the next round if the worker was hard-killed; your `$CLAUDE_CONFIG_DIR` (
 reads the Keychain directly and never rotates the shared login token.
 Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
 can't give a host worker its own Claude account there; host-mode multi-worker
-isolation on macOS applies to Codex only.
+isolation on macOS applies to Codex only. That is also why `$HOME` is left alone on
+macOS: repointing it could never isolate the Keychain, and it made the Keychain
+unreadable, so every non-default worker found no Claude credentials and slept.
 
 Worker versions before this private handoff may already have left a Keychain
 snapshot at `.claude/.credentials.json` under your configured Claude directory.
@@ -463,8 +469,8 @@ is in `tauceti work -h`.
 | `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): allow ≤ budget% used by elapsed%, interpolated; time 0/100 default to 0/100. Default is `used% ≤ elapsed%`. |
-| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its `$HOME`. |
-| `--isolate-home` | Force the per-worker `$HOME` even for the `default` id (a distinct id already implies it). |
+| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux, `$CLAUDE_CONFIG_DIR` + `$CODEX_HOME` on macOS). |
+| `--isolate-home` | Force that per-worker isolation even for the `default` id (a distinct id already implies it). |
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
 
 ### Environment variables

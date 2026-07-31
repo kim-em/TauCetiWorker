@@ -55,7 +55,7 @@ from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, OPENROUTER_MODELS, 
 from .github import GitHub
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, parse_pace_curve
+from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure
@@ -538,10 +538,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         wid = auto_assign_wid()
         os.environ["TAUCETI_WORKER_ID"] = wid
         log(f"auto-assigned worker slot {wid} (override with --worker-id)")
-    # A distinct worker id implies its own $HOME (so several workers' credential refreshes don't race);
-    # --isolate-home forces it even for the 'default' id. This must set $HOME BEFORE Config.resolve, so
-    # cfg.home + credential paths point at the per-worker copy. isolate_home is a no-op when $HOME is
-    # already the worker home, so loop children that inherit it don't re-isolate.
+    # A distinct worker id implies its own credential directories (so several workers' refreshes don't
+    # race); --isolate-home forces it even for the 'default' id. This must run BEFORE Config.resolve so
+    # cfg.home and the credential paths derived from it point at the per-worker copy. Off macOS that
+    # means moving $HOME; on macOS $HOME deliberately stays put and $CLAUDE_CONFIG_DIR/$CODEX_HOME carry
+    # the isolation instead (see isolate_home). Either way it is a no-op once already isolated, so loop
+    # children that inherit the environment don't re-isolate.
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
@@ -648,7 +650,8 @@ def cmd_doctor(args) -> int:
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
-    rows.append(("codex creds", _safe_exists(cfg.home / ".codex" / "auth.json"), "~/.codex/auth.json"))
+    codex_creds = codex_dir(cfg.home) / "auth.json"
+    rows.append(("codex creds", _safe_exists(codex_creds), str(codex_creds)))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
     if _safe_exists(claude_creds) or sys.platform != "darwin":
         rows.append(("claude creds", _safe_exists(claude_creds), str(claude_creds)))

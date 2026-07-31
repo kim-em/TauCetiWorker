@@ -1089,17 +1089,21 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
 
 
 def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
-    """The per-worker isolated $HOME. On macOS it MUST be short: bubble runs the sandbox in a colima VM
-    whose lima/incus unix sockets nest under $HOME, and the default location beneath the installed package
-    (site-packages) pushes those socket paths past UNIX_PATH_MAX (104) — colima then refuses to start
-    ("instance name … too long"). Anchor it at the real login user's home (via `pwd`, NOT $HOME, which a
-    loop child has already had repointed) so the path is short and stable across re-isolations, and bound
-    the per-worker component against the longest socket bubble nests under the home so that even a long
-    --worker-id (or login name) can't reoverflow it — hashing (deterministically; a loop child must
-    recompute the same path) only when the raw wid wouldn't fit, so ordinary ids stay readable. Linux uses
-    native incus (no $HOME-nested sockets, no colima), so it keeps the in-tree location beside the worker's
-    other state. The path must be a pure function of wid (no $HOME) so the early-return below recognises an
-    already-isolated child."""
+    """The per-worker isolated home: on macOS the parent of the isolated $CLAUDE_CONFIG_DIR and
+    $CODEX_HOME, elsewhere the isolated $HOME itself.
+
+    The macOS location is kept SHORT and anchored at the real login user's home (via `pwd`, NOT $HOME).
+    That began as a hard requirement — bubble ran the sandbox in a colima VM whose lima/incus unix
+    sockets nested under the isolated $HOME, and the location beneath the installed package
+    (site-packages) pushed those socket paths past UNIX_PATH_MAX (104), so colima refused to start
+    ("instance name … too long"). isolate_home no longer moves $HOME on macOS, so those sockets nest
+    under the operator's real home and the bound no longer binds anything. The path is unchanged anyway:
+    workers already hold their codex credential copy and their creds-source markers here, and moving it
+    would strand them. The per-worker component stays bounded and deterministic for the same reason it
+    always was — a long --worker-id or login name must still produce a stable, recomputable path.
+
+    Linux keeps the in-tree location beside the worker's other state. Either way the path must be a pure
+    function of wid (no $HOME), so a loop child recomputes the same one its parent isolated to."""
     if sys.platform != "darwin":
         return HERE / "state" / wid / "home"
     base = _base
@@ -1124,46 +1128,6 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
     return root / f"{wid[:keep]}-{digest}"
 
 
-def _seed_gh_token_for_isolation() -> None:
-    """macOS only: export $GH_TOKEN from the operator's gh login BEFORE isolate_home repoints $HOME.
-
-    gh stores its token in the login Keychain, which gh's keyring backend can resolve via
-    $HOME/Library/Keychains on an affected setup. Once isolate_home sets $HOME to the worker's short
-    isolated home, that lookup misses and the survey's `gh pr list` fails unauthenticated — the worker
-    aborts the round (Bryan's report). The GH_CONFIG_DIR redirect recovers gh's host LIST but not the
-    keychain-backed token. So while the real $HOME still reaches the Keychain, capture the token and
-    export it: gh and gh's git credential helper both honour $GH_TOKEN ahead of the keychain, so child
-    calls (the survey, host pushes, and the agent's own gh in host mode) stay authenticated under the
-    isolated home. macOS is single-account by nature, so one token is correct.
-
-    Scope/limits: github.com only (the sole host TauCeti uses; a GHES remote would need a separate
-    $GH_ENTERPRISE_TOKEN). Captured once, at isolation — a long `--loop` inherits it for the run, which
-    matches gh's own use of the static keychain token; if the operator rotates gh creds mid-loop,
-    restart the worker to re-seed. No-op off macOS (Linux keeps its token in the redirected
-    GH_CONFIG_DIR or a session keyring, neither $HOME-path-scoped), when the operator already exported a
-    token, or when capture fails (logged, then left for `gh auth login` / `--worker-id default` — no
-    worse than before this seed existed)."""
-    if sys.platform != "darwin":
-        return
-    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
-        return  # respect an operator-set token; don't shell out
-    try:
-        r = subprocess.run(
-            ["gh", "auth", "token", "--hostname", "github.com"], capture_output=True, text=True, timeout=20
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        log(f"could not capture a gh token for the isolated home ({e}); gh may fail under the isolated $HOME")
-        return
-    tok = (r.stdout or "").strip()
-    if r.returncode == 0 and tok:
-        os.environ["GH_TOKEN"] = tok
-    else:
-        log(
-            "could not capture a gh token for the isolated home (gh auth token failed); gh may fail "
-            "under the isolated $HOME on macOS — run `gh auth login` or pass --worker-id default"
-        )
-
-
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
     review / the --isolate-home flag). Symlinks the read-only Claude tool/config surface from the real
@@ -1174,44 +1138,30 @@ def isolate_home(wid: str) -> Path:
     there, so both the pacer and the spawned claude read the isolated creds even when the operator's real
     config dir is elsewhere. Returns the worker home and sets $HOME. Children inherit.
 
-    macOS caveat: this isolates Codex creds, but NOT Claude's. Claude Code keeps its creds in the login
-    Keychain — one per-login-user store, not $HOME/$CLAUDE_CONFIG_DIR-scoped — so the credential copy +
-    repointing is a no-op there: the spawned claude reads the shared Keychain regardless, and the pacer's
-    read-only Keychain fallback measures that same account. macOS is host-only/single-account by nature.
-    On macOS the home also sits at a short path (see _worker_iso_home) and its colima/incus state is
-    symlinked to the operator's, so bubble reuses the one host VM instead of building a throwaway per-worker
-    one (and the sockets under it stay within UNIX_PATH_MAX)."""
+    macOS does NOT move $HOME. Both Claude Code and gh keep their credentials in the login Keychain,
+    which `security` resolves through $HOME, so repointing it made both unreachable: the pacer found no
+    Claude creds and parked every non-default worker in a 300s sleep for ever (#135, Jeremy Kahn), and
+    gh lost its token (Bryan's report) until a $GH_TOKEN seed was bolted on to compensate. Nothing was
+    bought in exchange. The Keychain is ONE per-login-user store, so the credential copy never isolated
+    Claude on macOS in the first place — which is why mirror_creds() returns early there and the pacer
+    reads the Keychain ahead of any file. So on macOS isolate the two things that genuinely are
+    per-worker and are addressed by environment variable, $CLAUDE_CONFIG_DIR and $CODEX_HOME, and leave
+    $HOME alone. Workers share the one Claude account there, which is what was already happening.
+
+    Returns the worker home. Children inherit the exported variables (and, off macOS, $HOME)."""
     import shutil
 
     home = _worker_iso_home(wid)
-    if Path(os.environ.get("HOME", "")) == home:
-        return home  # already isolated (a loop child inherits the parent's $HOME) — don't re-copy or warn
+    iso_claude, iso_codex = home / ".claude", home / ".codex"
+    # Idempotence: a loop child inherits its parent's isolation and must not re-copy or re-warn. Off
+    # macOS that shows up as $HOME already being the worker home; on macOS $HOME is deliberately left
+    # alone, so the config redirect is the signal instead.
+    if Path(os.environ.get("HOME", "")) == home or os.environ.get("CLAUDE_CONFIG_DIR") == str(iso_claude):
+        return home
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
-    iso_claude = home / ".claude"
     iso_claude.mkdir(parents=True, exist_ok=True)
-    (home / ".codex").mkdir(parents=True, exist_ok=True)
-    if sys.platform == "darwin":
-        # Point the isolated home's colima/incus state at the operator's so bubble's `colima status`
-        # (which reads $HOME/.colima) finds the host's already-running VM and skips building a throwaway
-        # per-worker one — and the short home keeps the resulting socket paths within UNIX_PATH_MAX. The
-        # shared host VM is the same one the 'default' worker uses, so this adds no new colima ownership.
-        for rel in (".colima", Path(".config") / "incus"):
-            link, target = home / rel, real / rel
-            if link.is_symlink() and not link.exists():
-                try:
-                    link.unlink()  # stale dangling link (target since removed) — drop it before re-linking
-                except OSError:
-                    pass
-            # Only link when the operator actually has state to share; otherwise leave it absent so bubble
-            # creates a real dir here (a self-contained per-worker VM at this short path), never a dangling
-            # symlink. Don't clobber an existing real dir or a good link.
-            if target.exists() and not link.exists() and not link.is_symlink():
-                try:
-                    link.parent.mkdir(parents=True, exist_ok=True)
-                    link.symlink_to(target)
-                except OSError:
-                    pass
+    iso_codex.mkdir(parents=True, exist_ok=True)
     for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
         src, dst = real_claude / item, iso_claude / item
         if _safe_exists(src) and not dst.exists():
@@ -1236,7 +1186,7 @@ def isolate_home(wid: str) -> Path:
             )
     else:
         marker.write_text(str(real_claude))
-    real_codex, iso_codex = real / ".codex", home / ".codex"
+    real_codex = real / ".codex"
     src, dst = real_codex / "auth.json", iso_codex / "auth.json"
     if _safe_exists(src) and not dst.exists():
         shutil.copy2(src, dst)
@@ -1249,23 +1199,27 @@ def isolate_home(wid: str) -> Path:
             codex_marker.write_text(str(real_codex))
         except OSError:
             pass
+    # Both credential dirs are addressed by environment variable, and both CLIs honour the same ones the
+    # worker's own claude_dir()/codex_dir() read, so the pacer and the spawned agent always agree. These
+    # are the WHOLE isolation on macOS, and they ride alongside the $HOME move elsewhere.
+    os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
+    os.environ["CODEX_HOME"] = str(iso_codex)
+    if sys.platform == "darwin":
+        # Leave $HOME at the operator's, so `security` keeps resolving the login Keychain for the pacer,
+        # for the spawned claude, and for gh. See the docstring for why moving it cost three separate
+        # workarounds and isolated nothing.
+        log(f"isolated config for worker '{wid}': CLAUDE_CONFIG_DIR={iso_claude}, CODEX_HOME={iso_codex}")
+        return home
     # Keep host-side gh and git working under the isolated $HOME: the survey's `gh pr list` and host
     # pushes run in this $HOME, but their config (unlike Claude/Codex tokens) doesn't refresh-race, so
     # point them back at the operator's real config rather than an empty isolated one. Respect a value
     # the operator already exported. Children inherit these, so the early-return path above is covered.
-    # (On macOS this redirect recovers gh's host list but not its keychain-backed token — that needs the
-    # $GH_TOKEN seed just below, before $HOME moves.)
     gh_cfg = real / ".config" / "gh"
     if gh_cfg.is_dir():
         os.environ.setdefault("GH_CONFIG_DIR", str(gh_cfg))
     git_cfg = real / ".gitconfig"
     if git_cfg.exists():
         os.environ.setdefault("GIT_CONFIG_GLOBAL", str(git_cfg))
-    # Capture gh's keychain-backed token while the real $HOME still reaches the login Keychain (macOS),
-    # so child gh/git calls authenticate via $GH_TOKEN once $HOME is repointed below. Must precede the
-    # $HOME assignment — afterwards the Keychain lookup misses.
-    _seed_gh_token_for_isolation()
     os.environ["HOME"] = str(home)
-    os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)  # so claude_dir() + the spawned claude agree
     log(f"isolated HOME={home} (worker '{wid}')")
     return home

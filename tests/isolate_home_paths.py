@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Isolated-$HOME path constraints (macOS colima sockets vs UNIX_PATH_MAX).
+"""Isolated-home path constraints (macOS path length; stability across re-isolations).
 
-bubble runs the sandbox in a colima VM whose lima/incus unix sockets nest under $HOME. On macOS the
-worker's isolated $HOME must therefore be SHORT: the old location beneath the installed package
-(site-packages) pushed those socket paths past UNIX_PATH_MAX (104) and colima refused to start
-("instance name … too long"), wasting the round. This pins _worker_iso_home's macOS path (short, under
-the real login home) and the Linux path (unchanged, in-tree beside the worker's other state).
+bubble runs the sandbox in a colima VM whose lima/incus unix sockets nest under $HOME. While the worker
+moved $HOME on macOS, its isolated home therefore had to be SHORT: the old location beneath the
+installed package (site-packages) pushed those socket paths past UNIX_PATH_MAX (104) and colima refused
+to start ("instance name … too long"), wasting the round. isolate_home no longer moves $HOME on macOS,
+so those sockets nest under the operator's real home and that bound no longer binds. The path is kept
+exactly as it was regardless: existing workers hold their codex credential copy and their creds-source
+markers there, and it must stay a pure function of wid so a loop child recomputes its parent's path.
+These assertions pin that shape (short, bounded, deterministic, under the real login home) and the
+Linux path (unchanged, in-tree beside the worker's other state).
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """

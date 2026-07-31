@@ -681,6 +681,15 @@ def _claude_keychain_creds_interactive() -> dict | None:
     return None
 
 
+def codex_dir(home: Path) -> Path:
+    """Where Codex keeps its config + credentials. $CODEX_HOME wins (the same var codex itself honors);
+    else the conventional <home>/.codex. Isolation repoints $CODEX_HOME at the per-worker copy, and on
+    macOS that redirect IS the isolation: $HOME stays at the operator's so the login Keychain remains
+    reachable, so <home>/.codex would otherwise resolve to the operator's own credential."""
+    d = os.environ.get("CODEX_HOME")
+    return Path(d) if d else home / ".codex"
+
+
 def claude_dir(home: Path) -> Path:
     """Where Claude Code keeps its config + credentials. $CLAUDE_CONFIG_DIR wins (the same var Claude
     Code itself honors for a non-default config location, e.g. switching personal/work accounts); else
@@ -808,11 +817,11 @@ def mirror_creds(cfg: Config) -> None:
             tok_key="accessToken",
             rt_key="refreshToken",
         )
-    src_codex = _read_marker(cfg.home / ".codex" / ".tauceti-creds-source")
+    src_codex = _read_marker(codex_dir(cfg.home) / ".tauceti-creds-source")
     if src_codex:  # absent on homes seeded before this marker existed
         _mirror_creds_file(
             Path(src_codex) / "auth.json",
-            cfg.home / ".codex" / "auth.json",
+            codex_dir(cfg.home) / "auth.json",
             block_key="tokens",
             tok_key="access_token",
             rt_key="refresh_token",
@@ -875,7 +884,7 @@ class Quota:
 
     # --- Codex -------------------------------------------------------------
     def _codex_creds(self) -> dict | None:
-        return _read_json_file(self.cfg.home / ".codex" / "auth.json")
+        return _read_json_file(codex_dir(self.cfg.home) / "auth.json")
 
     def _codex_account_id(self, auth: dict) -> str | None:
         tok = auth.get("tokens") or {}
