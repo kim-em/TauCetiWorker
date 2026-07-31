@@ -29,6 +29,7 @@ from .agents import (
     run_agent_host,
     run_in_bubble,
     run_to_logfile,
+    take_last_agent_infra_failure,
 )
 from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
@@ -37,6 +38,7 @@ from .constants import (
     CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
     EX_NOPROGRESS,
+    MAX_INFRA_REFUNDS,
     MAX_OPEN_PRS,
     PROGRESS_REF,
     OPENROUTER_MODELS,
@@ -50,6 +52,13 @@ from .github import GitHub, GitHubError, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
+from .review_diagnostics import (
+    clear_review_failure,
+    public_review_failure,
+    read_review_failure,
+    record_review_failure,
+    recover_review_failures,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
@@ -159,11 +168,17 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # human must intervene; surfacing them loudly is the alternative to stranding them in silence.
     for pr in sv.review_stuck:
         n_err = w.counters.read(f"review-err-{pr}")
+        head = next((item.head_oid for item in sv.open_prs if item.number == pr), "")
+        retained = read_review_failure(w.cfg.state, pr)
+        if not retained:
+            retained = recover_review_failures(w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=pr, head=head)
+        diagnostic = public_review_failure(retained)
         warn_red(
             f"PR #{pr}: review has ERRORED {n_err}x without posting a verdict — the worker cannot "
-            f"review it. Needs a human. https://github.com/{TAUCETI}/pull/{pr}"
+            f"review it. Needs infrastructure repair. https://github.com/{TAUCETI}/pull/{pr}"
         )
-        w.gh.ensure_stuck_issue(pr, f"its review has errored {n_err} times without posting a verdict")
+        reason = f"its review has errored {n_err} times without posting a verdict"
+        w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
     # Spread concurrent workers across different PRs: shuffle each CONTENDED stage's candidates so workers
     # starting together don't all pick the lowest-numbered PR and probe the same target in lockstep
@@ -415,6 +430,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # combine with one later engine error to trip the escalation cap a round after a verdict was
             # in fact posted, contradicting the "errored Nx without posting a verdict" message.
             w.counters.write(errkey, 0)
+            clear_review_failure(w.cfg.state, pr)
             # The engine archived this round's records to <store>/outbox but did NOT push (--no-sync).
             # Publish them to TauCetiData with the host's creds. Loud on failure: records stuck in the
             # outbox mean the merge gate can't see this round, so don't report the round as a success.
@@ -448,6 +464,17 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             if not runtime_snapshot().get("failure_reason"):
                 report_failure(f"review #{pr} exited with status {rc}", code=rc)
             w.counters.incr(errkey)
+            failure = runtime_snapshot()
+            record_review_failure(
+                w.cfg.state,
+                worker=w.cfg.wid,
+                pr=pr,
+                head=head,
+                provider=reviewers,
+                code=rc,
+                reason=str(failure.get("failure_reason") or ""),
+                log_file=None if bubble else logf,
+            )
         return rc
     finally:
         # Drop the claim: on success the watermark now prevents a re-fire; on failure releasing it lets
@@ -518,11 +545,63 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     return p.returncode
 
 
+def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
+    """A provider outage must not spend a PR's attempt budget. Hand back every counter this round
+    charged, then raise NoProgress so the loop's escalating back-off retries later.
+
+    The budgets exist to stop re-running an agent on work it cannot change. A 529 is not that: the
+    agent never ran. Charging it anyway retires PRs for reasons that have nothing to do with them —
+    TauCetiProject/TauCeti#1434 was flagged "needs a human" after three consecutive fix rounds died
+    to `API Error: 529 Overloaded`, having never attempted the fix once. This is the same rule the
+    host-agent-binary preflight above already applies: a failure every PR would have hit is charged
+    to none of them.
+
+    The counters are charged UP FRONT on purpose (an un-checkout-able PR must not loop), so a refund
+    rather than a late charge is what keeps both properties. MAX_INFRA_REFUNDS bounds it in case a
+    persistent PR-specific failure ever matches the transient patterns.
+
+    That bound is keyed on the PR, NOT the head. Some of the counters refunded here are per-PR and
+    lifetime (`ci-pr-`, `bump-pr-`, `rebase-pr-`), so a head-keyed allowance would reset on every
+    push while still handing those back, and a persistent false positive could evade the lifetime
+    backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
+    per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
+    """
+    reason = take_last_agent_infra_failure()
+    if not reason:
+        return
+    refunds = w.counters.incr(f"infra-{label}-{c.pr}")
+    if refunds > MAX_INFRA_REFUNDS:
+        warn_red(
+            f"  {label} #{c.pr}: {reason}, but this head has already been refunded "
+            f"{MAX_INFRA_REFUNDS} times — charging the attempt. If the provider really is down this "
+            f"will resolve on its own; if not, the failure is being misread as transient."
+        )
+        return
+    for key in charged:
+        w.counters.write(key, max(0, w.counters.read(key) - 1))
+    log(
+        f"  {label} #{c.pr}: {reason} — the agent never ran, so this attempt is not charged "
+        f"(refund {refunds}/{MAX_INFRA_REFUNDS}); backing off and retrying later"
+    )
+    raise NoProgress(f"{label} #{c.pr}: {reason} — not charged to the PR, will retry after back-off")
+
+
 def _do_fixlike(
-    w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool, *, prompt_file: str, label: str
+    w: Worker,
+    sv: Survey,
+    c: Candidate,
+    opts: RoundOpts,
+    bubble: bool,
+    *,
+    prompt_file: str,
+    label: str,
+    charged: tuple[str, ...] = (),
 ) -> int | None:
     """Shared shape for fix / fix-ci / rebase: take the branch claim, then run the agent against the PR
-    branch — in bubble (it checks out the PR inside the container) or on the host checkout."""
+    branch — in bubble (it checks out the PR inside the container) or on the host checkout.
+
+    `charged` names the per-PR counters the caller already spent, so a provider outage can hand them
+    back (see _refund_infra_failure)."""
     pr, head = c.pr, c.head
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
@@ -563,34 +642,40 @@ def _do_fixlike(
         rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
+    else:
+        _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
 
 
 def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    w.counters.incr(f"fix-{pr}-{head[:12]}")  # count up front (an un-checkout-able PR mustn't loop)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix")
+    key = f"fix-{pr}-{head[:12]}"
+    w.counters.incr(key)  # count up front (an un-checkout-able PR mustn't loop)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix", charged=(key,))
 
 
 def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    w.counters.incr(f"ci-{pr}-{head[:12]}")
-    w.counters.incr(f"ci-pr-{pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci")
+    keys = (f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}")
+    for key in keys:
+        w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci", charged=keys)
 
 
 def do_rebase(w, sv, c, opts, bubble) -> int | None:
-    w.counters.incr(f"rebase-pr-{c.pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase")
+    key = f"rebase-pr-{c.pr}"
+    w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 
 
 def do_bump(w, sv, c, opts, bubble) -> int | None:
     """Adapt a red bump-mathlib PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
-    w.counters.incr(f"bump-{pr}-{head[:12]}")  # count up front so an un-checkout-able PR can't loop
-    w.counters.incr(f"bump-pr-{pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump")
+    keys = (f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}")  # count up front so an un-checkout-able PR can't loop
+    for key in keys:
+        w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump", charged=keys)
 
 
 def do_progress(w, sv, c, opts, bubble) -> int | None:

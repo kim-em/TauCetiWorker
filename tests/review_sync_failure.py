@@ -12,6 +12,7 @@ network and no real store. Exit 0 = every case agrees; 1 = a mismatch.
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -61,7 +62,12 @@ class FakeGH:
     pass
 
 
+_tmp = tempfile.TemporaryDirectory()
+
+
 class FakeCfg:
+    wid = "test"
+    state = Path(_tmp.name) / "state"
     store_dir = Path("/tmp/does-not-matter/store")
     logdir = Path("/tmp/does-not-matter/logs")
 
@@ -144,6 +150,7 @@ try:
 finally:
     for k, v in _saved.items():
         setattr(wu, k, v)
+    _tmp.cleanup()
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

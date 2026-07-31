@@ -281,11 +281,28 @@ class GitHub:
             return None
         return json.loads(p.stdout or "{}")
 
-    def ensure_stuck_issue(self, pr: int, reason: str) -> None:
+    @staticmethod
+    def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
+        detail = (
+            f"\n\nLatest allow-listed worker diagnostics:\n\n{diagnostic}"
+            if diagnostic
+            else "\n\nNo public worker diagnostic was retained."
+        )
+        return (
+            f"The autonomous worker cannot make progress on #{pr}: {reason}\n"
+            f"{detail}\n\n"
+            f"It can be neither merged (not all-green) nor auto-retired (its review rounds "
+            f"are not advancing). This issue calls for an infrastructure repair, not a one-off "
+            f"manual review. The worker re-checks each round and will close this issue's PR-side "
+            f"concern once #{pr} merges or is closed.\n\n"
+            f"<!--tauceti-review-stuck:{pr}-->"
+        )
+
+    def ensure_stuck_issue(self, pr: int, reason: str, diagnostic: str = "") -> None:
         """Ensure a tracking issue exists for a PR the automation can't make progress on (a permanent
-        record so a human notices). Deduped by an exact title: one open issue per stuck PR across the
-        whole fleet. Best-effort — a failure to create one is non-fatal (the per-round warning still
-        fires); never raises."""
+        record so a human notices). An existing issue is updated when a later worker has a better
+        diagnostic. Deduped by an exact title: one open issue per stuck PR across the whole fleet.
+        Best-effort — a GitHub failure is non-fatal (the per-round warning still fires); never raises."""
         title = f"Review stuck: PR #{pr}"
         try:
             p = self._gh(
@@ -299,20 +316,38 @@ class GitHub:
                     "--search",
                     f'in:title "{title}"',
                     "--json",
-                    "number,title",
-                    "--jq",
-                    f'[.[] | select(.title == "{title}")] | length',
+                    "number,title,body",
                 ]
             )
-            if p.returncode == 0 and (p.stdout or "0").strip() not in ("", "0"):
-                return  # already tracked
-            body = (
-                f"The autonomous worker cannot make progress on #{pr}: {reason}\n\n"
-                f"It can be neither merged (not all-green) nor auto-retired (its review rounds "
-                f"are not advancing), so it needs a human to look. The worker re-checks each round "
-                f"and will close this issue's PR-side concern once #{pr} merges or is closed.\n\n"
-                f"<!--tauceti-review-stuck:{pr}-->"
-            )
+            body = self._stuck_issue_body(pr, reason, diagnostic)
+            matches = []
+            if p.returncode == 0:
+                matches = [
+                    issue
+                    for issue in json.loads(p.stdout or "[]")
+                    if isinstance(issue, dict) and issue.get("title") == title
+                ]
+            if matches:
+                issue = matches[0]
+                existing_body = issue.get("body") if isinstance(issue.get("body"), str) else ""
+                # The issue is fleet-wide but retained diagnostics are per-worker. Once any worker
+                # has supplied an allow-listed diagnostic, do not let peers continually overwrite
+                # it with their own attempt or a generic bubble failure. We still upgrade an older
+                # issue that has no public diagnostic at all.
+                has_public_diagnostic = "Latest allow-listed worker diagnostics:" in existing_body
+                if existing_body != body and not has_public_diagnostic:
+                    self._gh(
+                        [
+                            "issue",
+                            "edit",
+                            str(issue["number"]),
+                            "--repo",
+                            self.repo,
+                            "--body",
+                            body,
+                        ]
+                    )
+                return
             self._gh(["issue", "create", "--repo", self.repo, "--title", title, "--body", body])
         except Exception:
             pass

@@ -410,11 +410,98 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
     return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{profile.provider}")
 
 
+# Provider statuses that mean "the service could not serve this request right now", as opposed to
+# "this request was wrong". An explicit allowlist, not a 5xx range: an unrecognised status stays
+# charged, which is the behaviour that existed before this classifier, so the cost of omitting one is
+# a single attempt rather than a retry loop. 401/403/404 are
+# deliberately absent: a real auth or entitlement failure must stay charged and stay loud, or a
+# misconfigured worker would retry for ever having reviewed nothing (TauCetiReview#105 is exactly
+# that failure, and it burned two PRs' worth of scoreboards before a human noticed).
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+
+# Claude Code in -p mode reports a provider failure as `API Error: <status> <text>` and, when the
+# call never produced a turn, that single line is the WHOLE log — observed verbatim as
+# "Failed to authenticate. API Error: 401 Invalid authentication credentials". Jeremy Kahn's report
+# (kim-em/TauCetiWorker, the #1434 casualty) shows the same shape carrying 529 Overloaded. The colon
+# is required: both observed samples have it, and making it optional would match prose like
+# "API Error529" or an agent quoting a status number.
+_API_ERROR_RE = re.compile(r"API Error:\s*(\d{3})\b", re.I)
+
+# A refund asserts "the agent never ran", so only a log with nothing in it BUT the failure qualifies.
+# The log is a combined stdout+stderr transcript: agent prose, tool output, test output, and under
+# bubble the pre-agent build. Scanning that for a status number refunds a genuine task failure whose
+# transcript merely quotes one — a flaky `lake exe cache get` that the agent recovered from, a test
+# asserting on an error string, the agent reading a log. Requiring the whole transcript to be this
+# short is what distinguishes "the call never happened" from "the call happened and something later
+# went wrong", and it is the claim the refund actually makes.
+_INFRA_MAX_LINES = 6
+
+# Transport failures that never reach a status line at all. Kept deliberately short and literal:
+# over-matching here refunds a real task failure, and the whole point of the budget is that a PR the
+# agent genuinely cannot fix stops consuming rounds. Anything not listed simply stays charged, which
+# is the behaviour that existed before this classifier.
+_TRANSPORT_RE = re.compile(
+    r"\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EAI_AGAIN)\b"
+    r"|\bsocket hang up\b"
+    r"|\bConnection (?:error|reset by peer)\b"
+    r"|\bTLS handshake timeout\b",
+    re.I,
+)
+
+
+def classify_agent_failure(text: str) -> str | None:
+    """Name the INFRASTRUCTURE reason an agent run failed, or None when the failure is the agent's own.
+
+    "Infrastructure" means: this round would have failed identically no matter which PR it was pointed
+    at, and no work was lost that retrying cannot redo. Such a failure must not be charged to a PR's
+    attempt budget — the same principle the host-agent-binary preflight already applies in
+    work_units.py, where a machine-wide fault raises NoProgress instead of marching PRs one by one to
+    the escalation cap.
+
+    Returns a short human-readable reason ("provider returned 529") for logging, or None.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines or len(lines) > _INFRA_MAX_LINES:
+        return None  # the agent produced a transcript, so it ran; whatever failed is its own
+    hay = "\n".join(lines)
+    # The LAST status is the terminal one. Taking the first would refund a run that saw a 529, retried
+    # past it, and then died of a 401 — and would charge the reverse. Only the outcome counts.
+    status = None
+    for m in _API_ERROR_RE.finditer(hay):
+        status = int(m.group(1))
+    if status is not None:
+        # A status we DID parse and that is not transient is a definite task-side answer (a bad
+        # request, a dead credential). Stop here rather than falling through to the transport
+        # patterns, which could otherwise rescue a 401 that happens to mention a socket.
+        return f"provider returned {status}" if status in _TRANSIENT_STATUSES else None
+    if _TRANSPORT_RE.search(hay):
+        return "could not reach the provider"
+    return None
+
+
+# The classification of the most recent agent subprocess this round, or None. A round runs exactly one
+# work agent (run_round dispatches a single work unit), so a module-level record is unambiguous here,
+# and it keeps run_agent_proc's `-> int` contract intact for its several callers. Written on every
+# non-zero exit, including the bubble path, which funnels through the same function.
+_LAST_AGENT_FAILURE: str | None = None
+
+
+def take_last_agent_infra_failure() -> str | None:
+    """The infrastructure reason the last agent subprocess failed, or None (agent's own failure, no
+    agent run yet, or --stream, which keeps no log to classify). Reads AND CLEARS: a refund is granted
+    against one observed failure, so a second caller must not be able to spend the same one twice."""
+    global _LAST_AGENT_FAILURE
+    reason, _LAST_AGENT_FAILURE = _LAST_AGENT_FAILURE, None
+    return reason
+
+
 def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None) -> int:
     """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
     by default we redirect it to a timestamped file under logdir and print only the path, so the round
     output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
     On a non-zero exit we always tail the log so failures aren't silent."""
+    global _LAST_AGENT_FAILURE
+    _LAST_AGENT_FAILURE = None
     cwds = str(cwd) if cwd is not None else None
     # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
     # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
@@ -444,6 +531,10 @@ def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd:
         reason = f"{label.removeprefix('agent-')} agent exited with status {rc}"
         if summary:
             reason += f": {summary}"
+        # Classify over the tail we already read, not the whole log: a provider failure is the last
+        # thing the CLI writes, and an earlier retry it recovered from must not be mistaken for the
+        # outcome. The caller decides what to do with this; recording it here is free.
+        _LAST_AGENT_FAILURE = classify_agent_failure("\n".join(tail))
         report_failure(reason, code=rc, log_file=logf)
     return rc
 
