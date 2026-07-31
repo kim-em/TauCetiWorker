@@ -21,6 +21,7 @@ from .agents import (
     fetch_ref,
     fill_prompt,
     host_agent_argv,
+    last_agent_infra_failure,
     prepare_checkout,
     resolve_authoring_profile,
     resolve_codex_model_access,
@@ -34,6 +35,7 @@ from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
     CONTEST_CLAIM_TTL,
+    MAX_INFRA_REFUNDS,
     MAX_OPEN_PRS,
     OPENROUTER_MODELS,
     REVIEW,
@@ -523,11 +525,57 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     return p.returncode
 
 
+def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
+    """A provider outage must not spend a PR's attempt budget. Hand back every counter this round
+    charged, then raise NoProgress so the loop's escalating back-off retries later.
+
+    The budgets exist to stop re-running an agent on work it cannot change. A 529 is not that: the
+    agent never ran. Charging it anyway retires PRs for reasons that have nothing to do with them —
+    TauCetiProject/TauCeti#1434 was flagged "needs a human" after three consecutive fix rounds died
+    to `API Error: 529 Overloaded`, having never attempted the fix once. This is the same rule the
+    host-agent-binary preflight above already applies: a failure every PR would have hit is charged
+    to none of them.
+
+    The counters are charged UP FRONT on purpose (an un-checkout-able PR must not loop), so a refund
+    rather than a late charge is what keeps both properties. MAX_INFRA_REFUNDS bounds it in case a
+    persistent PR-specific failure ever matches the transient patterns.
+    """
+    reason = last_agent_infra_failure()
+    if not reason:
+        return
+    refunds = w.counters.incr(f"infra-{label}-{c.pr}-{c.head[:12]}")
+    if refunds > MAX_INFRA_REFUNDS:
+        warn_red(
+            f"  {label} #{c.pr}: {reason}, but this head has already been refunded "
+            f"{MAX_INFRA_REFUNDS} times — charging the attempt. If the provider really is down this "
+            f"will resolve on its own; if not, the failure is being misread as transient."
+        )
+        return
+    for key in charged:
+        w.counters.write(key, max(0, w.counters.read(key) - 1))
+    log(
+        f"  {label} #{c.pr}: {reason} — the agent never ran, so this attempt is not charged "
+        f"(refund {refunds}/{MAX_INFRA_REFUNDS}); backing off and retrying later"
+    )
+    raise NoProgress(f"{label} #{c.pr}: {reason} — not charged to the PR, will retry after back-off")
+
+
 def _do_fixlike(
-    w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool, *, prompt_file: str, label: str
+    w: Worker,
+    sv: Survey,
+    c: Candidate,
+    opts: RoundOpts,
+    bubble: bool,
+    *,
+    prompt_file: str,
+    label: str,
+    charged: tuple[str, ...] = (),
 ) -> int | None:
     """Shared shape for fix / fix-ci / rebase: take the branch claim, then run the agent against the PR
-    branch — in bubble (it checks out the PR inside the container) or on the host checkout."""
+    branch — in bubble (it checks out the PR inside the container) or on the host checkout.
+
+    `charged` names the per-PR counters the caller already spent, so a provider outage can hand them
+    back (see _refund_infra_failure)."""
     pr, head = c.pr, c.head
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
@@ -568,34 +616,40 @@ def _do_fixlike(
         rc = run_agent_host(co, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
     if rc == 0:
         w.rs.bust(pr)
+    else:
+        _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
 
 
 def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    w.counters.incr(f"fix-{pr}-{head[:12]}")  # count up front (an un-checkout-able PR mustn't loop)
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix")
+    key = f"fix-{pr}-{head[:12]}"
+    w.counters.incr(key)  # count up front (an un-checkout-able PR mustn't loop)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix", charged=(key,))
 
 
 def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
-    w.counters.incr(f"ci-{pr}-{head[:12]}")
-    w.counters.incr(f"ci-pr-{pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci")
+    keys = (f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}")
+    for key in keys:
+        w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci", charged=keys)
 
 
 def do_rebase(w, sv, c, opts, bubble) -> int | None:
-    w.counters.incr(f"rebase-pr-{c.pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase")
+    key = f"rebase-pr-{c.pr}"
+    w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 
 
 def do_bump(w, sv, c, opts, bubble) -> int | None:
     """Adapt a red bump-mathlib PR (the bot bumped mathlib; TauCeti/ needs to catch up). Same
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
-    w.counters.incr(f"bump-{pr}-{head[:12]}")  # count up front so an un-checkout-able PR can't loop
-    w.counters.incr(f"bump-pr-{pr}")
-    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump")
+    keys = (f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}")  # count up front so an un-checkout-able PR can't loop
+    for key in keys:
+        w.counters.incr(key)
+    return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump", charged=keys)
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:

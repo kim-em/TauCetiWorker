@@ -22,6 +22,10 @@ MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
 # still blocking). The worker no longer caps its own review rounds — it keeps reviewing on every new
 # head until the PR merges or CI closes it — so every PR reaches a terminal state.
+MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an attempt back before
+# the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
+# retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
+# matched the transient patterns, an uncapped refund would retry it until a human noticed.
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without posting a verdict
 
 # (the engine can't produce a review at all), stop retrying and ESCALATE —
