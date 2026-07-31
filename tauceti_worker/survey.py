@@ -390,8 +390,11 @@ def fix_disposition(
 def progress_argv(*args: str) -> list[str]:
     """The TauCetiProgress CLI, fetched on demand like the review engine and the bubble CLI."""
     return [
-        "uvx", "--from", f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}",
-        "tauceti-progress", *args,
+        "uvx",
+        "--from",
+        f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}",
+        "tauceti-progress",
+        *args,
     ]
 
 

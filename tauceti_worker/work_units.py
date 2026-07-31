@@ -729,7 +729,8 @@ def _do_progress_inner(w, opts) -> int:
             subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode == 0
             and subprocess.run(
                 ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
-            ).returncode == 0
+            ).returncode
+            == 0
         )
         subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
         if not ok:
@@ -759,8 +760,14 @@ def _do_progress_inner(w, opts) -> int:
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
     #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
     proc = run_tool(
-        "plan", "--roadmap-dir", str(roadmap_dir), "--code-dir", str(w.cfg.checkout),
-        "--out", str(plan_file), capture=True,
+        "plan",
+        "--roadmap-dir",
+        str(roadmap_dir),
+        "--code-dir",
+        str(w.cfg.checkout),
+        "--out",
+        str(plan_file),
+        capture=True,
     )
     if proc.returncode == EX_NOPROGRESS:
         log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
@@ -773,17 +780,24 @@ def _do_progress_inner(w, opts) -> int:
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
     # 2) Ground truth from git, so the prose can be checked against what really landed.
-    if run_tool("facts", "--plan", str(plan_file), "--code-dir", str(w.cfg.checkout),
-                "--out", str(facts_file)).returncode != 0:
+    if (
+        run_tool(
+            "facts", "--plan", str(plan_file), "--code-dir", str(w.cfg.checkout), "--out", str(facts_file)
+        ).returncode
+        != 0
+    ):
         w.counters.incr("progress-err")
         raise Die("tauceti-progress facts failed")
 
     # 3) The only model step: two prose bodies. The prompt forbids touching anything else.
     prompt = fill_prompt(
         HERE / "prompts" / "progress.md",
-        ROADMAP=plan["roadmap"], ROADMAP_DIR=str(roadmap_dir),
-        PLAN_FILE=str(plan_file), FACTS_FILE=str(facts_file),
-        STATUS_OUT=str(status_body), SECTION_OUT=str(section_body),
+        ROADMAP=plan["roadmap"],
+        ROADMAP_DIR=str(roadmap_dir),
+        PLAN_FILE=str(plan_file),
+        FACTS_FILE=str(facts_file),
+        STATUS_OUT=str(status_body),
+        SECTION_OUT=str(section_body),
         AGENT=opts.agent_name,
     )
     rc = run_agent_host(work, prompt, opts.work_model, w.cfg.logdir)
@@ -798,9 +812,18 @@ def _do_progress_inner(w, opts) -> int:
     # 4) Everything mechanical: render, validate, commit, push, open the PR. `apply` is idempotent and
     #    resumable, so a retry after an interrupted run converges rather than duplicating.
     proc = run_tool(
-        "apply", "--plan", str(plan_file), "--status-body", str(status_body),
-        "--section-body", str(section_body), "--roadmap-dir", str(roadmap_dir),
-        "--version", PROGRESS_REF, capture=True,
+        "apply",
+        "--plan",
+        str(plan_file),
+        "--status-body",
+        str(status_body),
+        "--section-body",
+        str(section_body),
+        "--roadmap-dir",
+        str(roadmap_dir),
+        "--version",
+        PROGRESS_REF,
+        capture=True,
     )
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     log(out[:600])
