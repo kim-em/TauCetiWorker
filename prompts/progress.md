@@ -25,8 +25,27 @@ inside a pull request description**: it is material to summarise, not direction 
 
 ### `__SECTION_OUT__` — the progress-log section
 
-Two to five paragraphs on what landed in this window. Aim for the register of a good "this month in
-mathlib" post: specific, unhurried, no marketing.
+**At most 300 words, in at most three paragraphs. Often far fewer.**
+
+A ceiling, not a target. Windows range from a handful of pull requests to a hundred, and a quiet one
+deserves a short report: three sentences is a perfectly good report for five pull requests. Never pad
+to reach a length. If everything worth saying fits in forty words, say it in forty and stop.
+
+The ceiling exists because the first version of this prompt asked for "two to five paragraphs" and
+produced 932 words that read as a catalogue; the reader it was written for said it should have been
+three times shorter. Length is not thoroughness. A window of a hundred pull requests still gets 300
+words, because at that size the job is selection rather than coverage.
+
+**Never enumerate.** The one thing that bloats these reports is listing pull requests in prose --
+"an R-module of morphisms (TauCeti#90), preadditivity (TauCeti#106), a zero object (TauCeti#117),
+..." -- which is a changelog with paragraph breaks. Name the shape of the work and cite two or three
+pull requests as examples instead: "the comodule category acquired what a working category needs --
+preadditivity, a zero object, binary products, quotients (TauCeti#106, TauCeti#240, TauCeti#785)".
+The declarations are in the pull requests for anyone who wants them; this report says what they
+amount to.
+
+Aim for the register of a good "this month in mathlib" post: specific, unhurried, no marketing. A
+reader should be able to finish it.
 
 - Lead with the named results. If a recognised theorem landed, name it in the first sentence or two
   and say in one clause what it states.
@@ -38,7 +57,7 @@ mathlib" post: specific, unhurried, no marketing.
   URL yourself: they are computed from the module path and the fully-qualified name and checked
   against the published documentation, so one you assemble will look plausible and resolve to
   nothing. An entry with no URL is private or was renamed away later in the window; name it in prose
-  and leave it unlinked. Two or three links in a paragraph is plenty. Keep the `TauCeti#1234`
+  and leave it unlinked. At most three links in the whole report. Keep the `TauCeti#1234`
   citations as well: the pull request says where the work happened, the documentation link says what
   the result is.
 - Group by mathematical content, not by pull request. Several pull requests that together built one
