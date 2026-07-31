@@ -32,6 +32,15 @@ mathlib" post: specific, unhurried, no marketing.
   and say in one clause what it states.
 - Cite pull requests inline as `TauCeti#1234`, right after what they delivered. Never a markdown
   link, never a bare URL.
+- **Link named results to their documentation.** Every declaration in `__FACTS_FILE__` that has a
+  published page carries its URL in angle brackets at the end of its entry. When you name a theorem
+  or definition a reader might want to look up, link it with that URL copied exactly. Never build a
+  URL yourself: they are computed from the module path and the fully-qualified name and checked
+  against the published documentation, so one you assemble will look plausible and resolve to
+  nothing. An entry with no URL is private or was renamed away later in the window; name it in prose
+  and leave it unlinked. Two or three links in a paragraph is plenty. Keep the `TauCeti#1234`
+  citations as well: the pull request says where the work happened, the documentation link says what
+  the result is.
 - Group by mathematical content, not by pull request. Several pull requests that together built one
   theorem are one story.
 - Be honest about proportion. Much of any window is infrastructure and consolidation; say so in a
@@ -46,8 +55,9 @@ each time, so write a description of where things stand now. Use exactly two `##
 
 - `## Where this roadmap stands` — walk the roadmap's own structure, using its own names for its
   layers or lanes, and for each say plainly whether it is done, partly done, or untouched, naming the
-  declarations that realise it. Be concrete about partial completion: "Layer 3 is done except for the
-  non-compact case" is useful, "Layer 3 is progressing well" is not.
+  declarations that realise it, linked to their documentation where the facts file gives a URL. Be
+  concrete about partial completion: "Layer 3 is done except for the non-compact case" is useful,
+  "Layer 3 is progressing well" is not.
 - `## The frontier` — the nearest unfinished targets, and anything blocked and on what. A contributor
   reads this to find work, so name specific targets. If a target looks unreachable as stated, or
   already obsolete because Mathlib now provides it, say so.
