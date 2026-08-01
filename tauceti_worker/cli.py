@@ -5,7 +5,7 @@ Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the wo
 
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
-of work, chosen in priority order: rebase → fix-ci → fix → review → bump → roadmap.
+of work, chosen in priority order: rebase → bump → progress → fix-ci → fix → review → roadmap.
 The `bump` step adapts a red bump-mathlib PR (the review bot opens those; the worker
 never authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI,
 not the worker.
@@ -71,11 +71,11 @@ from .worker_manager import WorkersError, add_workers_parser, cmd_managed_runner
 WORK_EPILOG = """\
 the cascade (priority order; a round does the first that applies):
   rebase    bring our open PRs up to date with their base branch
+  bump      adapt a red bump-mathlib PR (the worker never authors one)
+  progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h)
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
   review    review an open PR (runs the tauceti-review engine)
-  bump      adapt a red bump-mathlib PR (the worker never authors one)
-  progress  write a roadmap's STATUS.md / PROGRESS.md report (at most one a day, whole fleet)
   roadmap   open a new PR for a roadmap item
 
   With no --only a round walks the whole cascade; --only pins it to a subset,

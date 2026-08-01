@@ -137,7 +137,7 @@ re-queries GitHub. It reacts to single keypresses (no Enter):
 | `↑` / `↓` (or `k` / `j`) | move the cursor between kinds |
 | `→` / `←` | expand / collapse the selected kind — list its PRs with titles (or, on `roadmap`, the areas) |
 | `Enter` | run one round of the selected kind |
-| `1`–`6` | run one round of that numbered kind directly |
+| `1`–`7` | run one round of that numbered kind directly |
 | `l` / `L` | add a persistent worker for the auto cascade / selected kind |
 | `o` / `x` | pick the single roadmap area (`--roadmap-only`) / edit the skipped areas (`--roadmap-skip`) |
 | `m` / `s` | cycle the agent / toggle the sandbox (host ↔ bubble) |
@@ -168,10 +168,11 @@ A round does exactly one unit of work: the first of these that applies.
 | Step | What it does |
 |------|--------------|
 | **Rebase** | Resolve one of our conflicting PRs — a genuine content conflict under `TauCeti/` after a sibling merged first (the root `TauCeti.lean` is auto-synced on `main`, so it no longer collides). |
+| **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
+| **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
 | **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so `awaiting-author` work cannot be starved by unrelated reviews. |
-| **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
 
 Merging green PRs, closing stuck ones, and de-duplicating are the repo's CI, not
@@ -193,9 +194,10 @@ tauceti work --loop --only review     # only review open PRs
 tauceti work --loop --only roadmap    # only open new roadmap PRs
 tauceti work --loop --only fix,fix-ci # only tend to our own PRs
 tauceti work --loop --only bump       # only adapt broken bump-mathlib PRs
+tauceti work --loop --only progress   # only write due roadmap progress reports
 ```
 
-The tasks are `rebase`, `review`, `fix-ci`, `fix`, `bump`, `roadmap`.
+The tasks are `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`.
 
 Roadmap rounds steer toward one area (a subdirectory of the
 [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap)). Pin it with
@@ -454,7 +456,7 @@ is in `tauceti work -h`.
 | Flag | What it does |
 | --- | --- |
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
-| `--only TASKS` | Restrict the round to a comma list of `rebase,review,fix-ci,fix,bump,roadmap` (default: the whole cascade). |
+| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap` (default: the whole cascade). |
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax` — see the agent table above. |
 | `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
 | `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex or Claude provider. |
@@ -504,6 +506,7 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
+| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits surface immediately and are waited out by the loop preflight. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |

@@ -402,10 +402,11 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     """Is a roadmap progress report due? `(due, reason)`.
 
     Cost discipline matters here, because this runs on EVERY round and every ~90s behind the
-    dashboard, whereas a report is wanted about once a day. So this is the cheap half of the decision:
-    one `gh api` call for the roadmap repo's recent commit subjects, no clone, no PR query — and the
-    VERDICT is cached (not the raw response), so it is not re-derived while a round is in flight. The
-    expensive half (the roadmap checkout, the per-area label queries, the model) happens in the round.
+    dashboard, whereas a report is wanted about every eight hours. So this is the cheap half of the
+    decision: one `gh api` call for the roadmap repo's recent commit subjects, no clone, no PR query
+    — and the VERDICT is cached (not the raw response), so it is not re-derived while a round is in
+    flight. The expensive half (the roadmap checkout, the per-area label queries, the model) happens
+    in the round.
 
     Never raises. The cascade is first-actionable-wins and a stage that raises aborts the whole round,
     so a broken `uvx`, a GitHub hiccup or a bad exit here must read as "not due" and let the round fall

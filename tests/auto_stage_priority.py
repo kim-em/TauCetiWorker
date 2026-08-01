@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Unrestricted work tends the worker's own PRs before general reviews."""
+"""The unrestricted work predictor and runtime follow the documented priority order."""
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,10 +25,14 @@ sv.needs_fix.actionable.append(candidate)
 
 checks = [
     check("fix beats unrelated review", tc._next_auto_stage(sv), "fix"),
-    # `progress` is last: rate-limited to one report a day, so it cannot crowd out queue tending, and
-    # ahead of roadmap authoring (handled separately after these) so a busy queue cannot defer it.
-    check("single shared auto order", tc.AUTO_STAGES, ("rebase", "fix-ci", "fix", "review", "bump", "progress")),
+    check(
+        "single shared auto order",
+        tc.AUTO_STAGES,
+        ("rebase", "bump", "progress", "fix-ci", "fix", "review"),
+    ),
 ]
+if "TAUCETI_PROGRESS_GAP" not in os.environ:
+    checks.append(check("default progress attempt gap is eight hours", tc.PROGRESS_ATTEMPT_GAP, 8 * 3600))
 
 # Drive the real cascade as well as its status predictor. A future edit must not let their shared
 # priority drift while leaving this display-only helper green.
@@ -43,12 +49,70 @@ finally:
     tc.work_units.dispatch = saved_dispatch
 checks.append(check("runtime cascade agrees with predictor", seen, ["fix"]))
 
-# A due progress report must never preempt queue tending: it is cosmetic next to a red PR or a
-# waiting review, and it is rate-limited anyway, so anything actionable wins.
+# A due progress report must preempt the unbounded PR queues so they cannot starve the eight-hour
+# cadence.
 busy = tc.Survey(worker_id="test")
 busy.progress.actionable.append(tc.Candidate(0, "", "due"))
 busy.reviewable.actionable.append(candidate)
-checks.append(check("review beats a due progress report", tc._next_auto_stage(busy), "review"))
+busy.red_ci.actionable.append(candidate)
+checks.append(check("due progress beats fix-ci and review", tc._next_auto_stage(busy), "progress"))
+
+saved_survey = tc.work_units.survey
+saved_dispatch = tc.work_units.dispatch
+seen = []
+tc.work_units.survey = lambda *_a, **_k: busy
+tc.work_units.dispatch = lambda stage, *_a, **_k: seen.append(stage) or 0
+try:
+    tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("runtime selects due progress before fix-ci and review", seen, ["progress"]))
+
+# A stale cached due verdict is represented by progress returning None after its fresh plan re-check;
+# the same round must continue to the next actionable stage instead of backing off.
+seen = []
+tc.work_units.survey = lambda *_a, **_k: busy
+tc.work_units.dispatch = lambda stage, *_a, **_k: seen.append(stage) or (None if stage == "progress" else 0)
+try:
+    tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("stale progress verdict falls through to fix-ci", seen, ["progress", "fix-ci"]))
+
+# The real progress implementation maps a fresh plan's not-due result onto that fallthrough signal.
+saved_prepare_checkout = tc.work_units.prepare_checkout
+saved_run = tc.work_units.subprocess.run
+writes = []
+
+
+def fake_run(argv, *_a, **_k):
+    if "plan" in argv:
+        return SimpleNamespace(returncode=tc.EX_NOPROGRESS, stdout="", stderr="not due")
+    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    progress_worker = SimpleNamespace(
+        cfg=SimpleNamespace(state=Path(tmp), checkout=Path(tmp) / "code"),
+        counters=SimpleNamespace(write=lambda name, value: writes.append((name, value))),
+    )
+    tc.work_units.prepare_checkout = lambda _cfg: True
+    tc.work_units.subprocess.run = fake_run
+    try:
+        progress_result = tc.work_units._do_progress_inner(progress_worker, None)
+    finally:
+        tc.work_units.prepare_checkout = saved_prepare_checkout
+        tc.work_units.subprocess.run = saved_run
+checks.append(check("fresh not-due plan returns the fallthrough signal", progress_result, None))
+checks.append(check("fresh plan re-check records the attempt", writes[0][0], "progress-attempt-ts"))
+
+# Bumps and rebases remain ahead of reporting.
+busy.bump.actionable.append(candidate)
+checks.append(check("bump beats a due progress report", tc._next_auto_stage(busy), "bump"))
+busy.rebaseable.actionable.append(candidate)
+checks.append(check("rebase remains first", tc._next_auto_stage(busy), "rebase"))
 
 # But with the queue empty it must be chosen ahead of roadmap authoring, or the open-ended fallback
 # (which always has work) would defer it for ever.

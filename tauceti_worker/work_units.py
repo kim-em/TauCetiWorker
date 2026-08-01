@@ -188,10 +188,9 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     for stage in AUTO_STAGES:
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
 
-    # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate whose branch
-    # is claimed by another worker is skipped to the next candidate in the same stage (COOP dedup).
-    # fix-ci before fix: a red PR can't be reviewed or review-fixed until it builds. bump adapts a
-    # bump-mathlib PR (opened by the review bot) that mathlib moved out from under.
+    # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
+    # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
+    # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
     for stage in AUTO_STAGES:
         if not want(opts.only, stage):
             continue
@@ -715,7 +714,7 @@ def do_progress(w, sv, c, opts, bubble) -> int | None:
             subprocess.run([CLAIM_SH, "release", "progress"], capture_output=True)
 
 
-def _do_progress_inner(w, opts) -> int:
+def _do_progress_inner(w, opts) -> int | None:
     # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
     # round, for ever.
@@ -773,7 +772,7 @@ def _do_progress_inner(w, opts) -> int:
     if proc.returncode == EX_NOPROGRESS:
         log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
         bust_progress_cache(w.cfg)
-        raise NoProgress("progress: no roadmap qualifies right now")
+        return None
     if proc.returncode != 0:
         w.counters.incr("progress-err")
         raise Die(f"tauceti-progress plan failed: {(proc.stderr or proc.stdout or '').strip()[:400]}")

@@ -36,7 +36,7 @@ PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgre
 PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "0da572fb3ef51afa1f9fe90492cc489a078423ce")
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
-PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "86400"))  # min seconds between attempts
+PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
 
 # (the engine can't produce a review at all), stop retrying and ESCALATE —
 # a loud per-round warning + a tracking issue — since a PR that can never be
@@ -178,17 +178,12 @@ ALLOWED_TASKS = ["rebase", "review", "fix-ci", "fix", "bump", "progress", "roadm
 
 WORK_TASKS = list(ALLOWED_TASKS)
 
-# Priority for an unrestricted round. Maintenance on the worker's own PRs comes
-# before fleet-wide review work, so an awaiting-author head cannot be starved by
-# a steady supply of unrelated reviewable PRs. Roadmap is the final fallback and
-# is handled separately after these PR-backed stages.
-#
-# `progress` is last of these, immediately before roadmap authoring. It is rate-limited to one landed
-# report a day (and one ATTEMPT a day), so it cannot crowd out queue tending; and putting it ahead of
-# open-ended roadmap authoring — the fallback that always has work — is what stops a busy queue
-# deferring it for ever. Placing it FIRST would be wrong: the cadence check keys on the last *landed*
-# report, so a stuck or rejected report would leave it due indefinitely and burn every round.
-AUTO_STAGES = ("rebase", "fix-ci", "fix", "review", "bump", "progress")
+# Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
+# honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains
+# ahead of fleet-wide reviews so awaiting-author work cannot be starved by unrelated reviews. Roadmap
+# is the final fallback and is handled separately after these stages. The durable attempt breaker
+# keeps a stuck or rejected progress report from burning every round.
+AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
 
 # The "#" shown in the survey table IS the key you press in the TUI to run one round of that kind.
 # ALLOWED_TASKS deliberately stays the stable display/key order; AUTO_STAGES is the unrestricted
