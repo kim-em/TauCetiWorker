@@ -46,7 +46,11 @@ def group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
         return True
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # ESRCH is an empty group. EPERM is Darwin's answer when the only members left are unreaped
+        # zombies, which is what a just-killed leader is until its parent wait()s it. Neither is
+        # something the sweep still has to clear, so both answer "not alive" here. Spelled out rather
+        # than importing round.GROUP_UNREACHABLE, so this predicate still works when the fix is not.
         return False
 
 
@@ -158,6 +162,47 @@ elif group_alive(pgid4):
         pass
 else:
     ok("run_round_subprocess swept the leaked group on normal return")
+
+print("== 5. an EPERM from killpg is 'nothing left to do', not an error ==")
+# Darwin refuses a signal to a group whose only members are unreaped zombies (EPERM) where Linux
+# delivers it. reap_round_group SIGTERMs the group and then probes it, so on macOS the leader it just
+# killed WAS that zombie and the probe raised straight out of the sweep, abandoning the stragglers the
+# sweep exists to clear. Simulate the platform's answer rather than the platform, so this runs anywhere.
+real_killpg = os.killpg
+
+for stage, raise_on in (("the initial SIGTERM", 0), ("the liveness probe", 1)):
+    calls = {"n": 0}
+
+    def fake_killpg(pgid, sig, _limit=raise_on, _calls=calls):
+        n = _calls["n"]
+        _calls["n"] += 1
+        if n == _limit:
+            raise PermissionError(1, "Operation not permitted")
+        return None  # pretend the signal landed; never touch a real process group
+
+    os.killpg = fake_killpg
+    try:
+        tc.reap_round_group(999999, term_grace=0.2)
+        ok(f"EPERM on {stage} is handled, not raised")
+    except PermissionError:
+        no(f"EPERM on {stage} escaped reap_round_group")
+    finally:
+        os.killpg = real_killpg
+
+
+# ...and the predicate the sweep's callers use agrees.
+def eperm_killpg(pgid, sig):
+    raise PermissionError(1, "Operation not permitted")
+
+
+os.killpg = eperm_killpg
+try:
+    if group_alive(999999):
+        no("group_alive called an unreachable group alive")
+    else:
+        ok("group_alive treats EPERM as not alive")
+finally:
+    os.killpg = real_killpg
 
 # Clean the per-worker state this test seeded.
 shutil.rmtree(REPO / "state" / WID, ignore_errors=True)

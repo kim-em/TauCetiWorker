@@ -88,6 +88,19 @@ def spawn_round(argv_tail: list[str]) -> subprocess.Popen:
     return subprocess.Popen(cmd, start_new_session=True, env=self_env())
 
 
+# Both errors killpg can raise here mean the same thing to every caller below: nothing further can be
+# done to this group. ProcessLookupError (ESRCH) is the group being empty. PermissionError (EPERM) is
+# Darwin's answer when the group's only remaining members are unreaped zombies — a zombie has no
+# credentials left to check the send against, so the kernel refuses the signal rather than reporting the
+# process missing, where Linux delivers it harmlessly. A zombie is not something a sweep needs to kill,
+# and a signal that cannot be delivered will not start being deliverable, so both are "stop here".
+#
+# Treating EPERM as an error instead is what broke on macOS: reap_round_group SIGTERMs the group and then
+# probes it, and in the window before the parent wait()s, the leader it just killed IS that zombie, so the
+# probe raised out of the sweep and the stragglers it exists to clear survived.
+GROUP_UNREACHABLE = (ProcessLookupError, PermissionError)
+
+
 def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
     """SIGTERM the round's process group, give it term_grace to clean up, then SIGKILL — the
     `timeout --kill-after=30s` teardown, but reaching the whole group (agent + build daemons)."""
@@ -97,14 +110,14 @@ def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
         return
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except GROUP_UNREACHABLE:
         return
     try:
         p.wait(term_grace)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+        except GROUP_UNREACHABLE:
             pass
         p.wait()
 
@@ -120,18 +133,18 @@ def reap_round_group(pgid: int, term_grace: float = 2.0) -> None:
     the group is already empty (the clean, common case) or already torn down by kill_round_group."""
     try:
         os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
+    except GROUP_UNREACHABLE:
         return  # group empty — round left nothing behind
     deadline = time.monotonic() + term_grace
     while time.monotonic() < deadline:
         try:
             os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return  # stragglers died on SIGTERM
+        except GROUP_UNREACHABLE:
+            return  # stragglers died on SIGTERM (or are zombies awaiting a wait(); see above)
         time.sleep(0.05)
     try:
         os.killpg(pgid, signal.SIGKILL)  # the busy-loop ignores SIGTERM's grace; SIGKILL it
-    except ProcessLookupError:
+    except GROUP_UNREACHABLE:
         pass
 
 
