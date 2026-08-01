@@ -88,17 +88,29 @@ def spawn_round(argv_tail: list[str]) -> subprocess.Popen:
     return subprocess.Popen(cmd, start_new_session=True, env=self_env())
 
 
-# Both errors killpg can raise here mean the same thing to every caller below: nothing further can be
-# done to this group. ProcessLookupError (ESRCH) is the group being empty. PermissionError (EPERM) is
-# Darwin's answer when the group's only remaining members are unreaped zombies — a zombie has no
-# credentials left to check the send against, so the kernel refuses the signal rather than reporting the
-# process missing, where Linux delivers it harmlessly. A zombie is not something a sweep needs to kill,
-# and a signal that cannot be delivered will not start being deliverable, so both are "stop here".
-#
-# Treating EPERM as an error instead is what broke on macOS: reap_round_group SIGTERMs the group and then
-# probes it, and in the window before the parent wait()s, the leader it just killed IS that zombie, so the
-# probe raised out of the sweep and the stragglers it exists to clear survived.
-GROUP_UNREACHABLE = (ProcessLookupError, PermissionError)
+def signal_group(pgid: int, sig: int) -> str:
+    """Send `sig` to process group `pgid`. Returns "sent", "gone", or "denied"; never raises.
+
+    "gone" is ESRCH: no such process group, so there is nothing to clean up.
+
+    "denied" is EPERM: the group exists but killpg found no member it could signal. On Darwin that
+    is what a group reports once its survivors are all zombies — XNU's killpg1 skips SZOMB members
+    while iterating an explicit process group and then returns EPERM having signalled none — which
+    is the state a just-killed leader is in until its parent wait()s it, and is why the round sweep
+    blew up on macOS. It is NOT only that. A live member whose real or saved uid no longer matches
+    ours (an agent running `sudo -u other`), a MAC policy denial, or the accepted pgid-reuse race
+    landing on somebody else's group all report the same thing, and killpg cannot tell them apart.
+
+    So "denied" must not be read as "clean". Callers stop, because a signal that could not be
+    delivered will not be delivered by repeating it, but they say so rather than claiming success.
+    """
+    try:
+        os.killpg(pgid, sig)
+        return "sent"
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "denied"
 
 
 def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
@@ -108,17 +120,22 @@ def kill_round_group(p: subprocess.Popen, term_grace: int = 30) -> None:
         pgid = os.getpgid(p.pid)
     except ProcessLookupError:
         return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except GROUP_UNREACHABLE:
+    sent = signal_group(pgid, signal.SIGTERM)
+    if sent == "gone":
+        return
+    if sent == "denied":
+        # Nothing in the group can be signalled, so neither the grace wait nor SIGKILL will achieve
+        # anything, and p.wait() below would block for as long as the leader happens to live.
+        log(f"WARNING: round group {pgid} refused SIGTERM; leaving teardown to the operator")
         return
     try:
         p.wait(term_grace)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except GROUP_UNREACHABLE:
-            pass
+        if signal_group(pgid, signal.SIGKILL) == "denied" and p.poll() is None:
+            # The leader is still running and we could not signal its group. Nothing here can force
+            # it down, and p.wait() below would block forever, so report and leave it to the operator.
+            log(f"WARNING: round {p.pid} is still alive but its process group refused SIGKILL; not waiting")
+            return
         p.wait()
 
 
@@ -131,21 +148,23 @@ def reap_round_group(pgid: int, term_grace: float = 2.0) -> None:
     (spawn_round's start_new_session ⇒ the group id equals the leader pid), so signalling `pgid` reaches
     only the round's descendants — never the loop driver or the user's shell. Idempotent: a no-op when
     the group is already empty (the clean, common case) or already torn down by kill_round_group."""
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except GROUP_UNREACHABLE:
+    sent = signal_group(pgid, signal.SIGTERM)
+    if sent == "gone":
         return  # group empty — round left nothing behind
+    if sent == "denied":
+        log(f"round group {pgid}: nothing signalable left to sweep (likely already-exited stragglers)")
+        return
     deadline = time.monotonic() + term_grace
     while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except GROUP_UNREACHABLE:
-            return  # stragglers died on SIGTERM (or are zombies awaiting a wait(); see above)
+        probe = signal_group(pgid, 0)
+        if probe == "gone":
+            return  # stragglers died on SIGTERM
+        if probe == "denied":
+            log(f"round group {pgid}: survivors are no longer signalable; leaving them")
+            return
         time.sleep(0.05)
-    try:
-        os.killpg(pgid, signal.SIGKILL)  # the busy-loop ignores SIGTERM's grace; SIGKILL it
-    except GROUP_UNREACHABLE:
-        pass
+    if signal_group(pgid, signal.SIGKILL) == "denied":
+        log(f"WARNING: round group {pgid} ignored SIGTERM and refused SIGKILL; stragglers may survive")
 
 
 class Claims:

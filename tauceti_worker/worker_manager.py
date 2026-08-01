@@ -30,6 +30,7 @@ from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
 from .paths import HERE, entry_cmd, self_argv, self_env
+from .round import signal_group
 from .runtime_status import STATUS_ENV, read_json, update_status
 
 CONFIG_VERSION = 1
@@ -620,20 +621,14 @@ def cmd_managed_runner(args) -> int:
                     last_heartbeat = time.monotonic()
             if stopping and child.poll() is None:
                 update_status(state, state="stopping", activity_at=time.time())
-                try:
-                    os.killpg(child.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                signal_group(child.pid, signal.SIGTERM)
                 deadline = time.monotonic() + 20
                 while child.poll() is None and time.monotonic() < deadline:
                     ready, _, _ = select.select([server], [], [], 0.2)
                     if ready:
                         _serve_one(server, request)
                 if child.poll() is None:
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    signal_group(child.pid, signal.SIGKILL)
                     child.wait()
             rc = child.wait()
             final = "stopped" if stopping else ("exited" if rc == 0 else "failed")
@@ -656,10 +651,7 @@ def cmd_managed_runner(args) -> int:
             except FileNotFoundError:
                 pass
             if child is not None and child.poll() is None:
-                try:
-                    os.killpg(child.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                signal_group(child.pid, signal.SIGTERM)
             for fd in (parent_pipe_read, parent_pipe_write):
                 if fd is not None:
                     try:
