@@ -582,7 +582,7 @@ def _shq(s: str) -> str:
 # crosses the boundary. The in-container agent invocation is a frozen contract (see agent_inner_cmd).
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
-BUBBLE_MIN_VERSION = "0.7.29"
+BUBBLE_MIN_VERSION = "0.7.30"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
