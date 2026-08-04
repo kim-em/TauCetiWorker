@@ -1331,14 +1331,15 @@ def _service_environment() -> dict[str, str]:
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "PYTHONPATH": env["PYTHONPATH"],
     }
+    runtime_bundle = ensure_ssl_cert_file({})
     configured = os.environ.get("SSL_CERT_FILE")
-    if configured:
+    advertised = os.environ.get("NIX_SSL_CERT_FILE")
+    if configured and configured not in (runtime_bundle, advertised):
         # Explicit operator configuration wins, including an unusual or currently absent path.
         service_env["SSL_CERT_FILE"] = configured
-    elif ensure_ssl_cert_file({}) is None:
+    elif runtime_bundle is None:
         # The unit may outlive a Nix store path. Preserve it as a candidate, not as the final
         # SSL_CERT_FILE, so cli_main revalidates it and can fall back or warn after collection.
-        advertised = os.environ.get("NIX_SSL_CERT_FILE")
         if advertised:
             try:
                 if Path(advertised).expanduser().is_file():

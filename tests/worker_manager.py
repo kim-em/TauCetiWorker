@@ -260,9 +260,14 @@ worker3 — backing off
             assert clean_env["SSL_CERT_FILE"] == str(ca_bundle)
             saved_ssl_cert = os.environ.pop("SSL_CERT_FILE", None)
             try:
+                # cli_main discovers the bundle before dispatching `workers service install`;
+                # the generator must not mistake its own value for an operator override.
+                os.environ["SSL_CERT_FILE"] = str(ca_bundle)
                 unit = wm._systemd_unit(config)
             finally:
-                if saved_ssl_cert is not None:
+                if saved_ssl_cert is None:
+                    os.environ.pop("SSL_CERT_FILE", None)
+                else:
                     os.environ["SSL_CERT_FILE"] = saved_ssl_cert
             assert 'Environment="PATH=' in unit and 'Environment="PYTHONPATH=' in unit
             # A bundle discoverable at runtime is deliberately not frozen into a persistent unit.
