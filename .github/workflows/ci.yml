@@ -24,6 +24,7 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          cache-suffix: test
       - name: Run the test suite
         run: ./tests/run-all
 
@@ -34,6 +35,7 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          cache-suffix: lint
       # Pin ruff so a new release's rules/formatter can't turn CI red without a code change here.
       - name: ruff check
         run: uvx ruff@0.15.18 check .
@@ -53,6 +55,7 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          cache-suffix: build
       - name: Build the wheel
         run: uv build
       # uv build proves the artifact builds; this proves the force-include mapping (prompts/ and
