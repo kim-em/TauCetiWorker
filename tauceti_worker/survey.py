@@ -387,10 +387,19 @@ def fix_disposition(
     return ("actionable", "")
 
 
-def progress_argv(*args: str) -> list[str]:
-    """The TauCetiProgress CLI, fetched on demand like the review engine and the bubble CLI."""
+def progress_argv(state: Path, *args: str) -> list[str]:
+    """The TauCetiProgress CLI, cached separately for each immutable source revision.
+
+    uv's shared ``uvx`` tool environment is keyed by the unchanged package name/version rather than
+    reliably by the Git revision passed through ``--from``. Reusing it after a pin bump can therefore
+    execute an older checkout. A per-ref cache preserves normal reuse within a release while making
+    the revision part of the cache identity.
+    """
+    cache = state / "cache" / "uvx" / "tauceti-progress" / PROGRESS_REF
     return [
         "uvx",
+        "--cache-dir",
+        str(cache),
         "--from",
         f"git+https://github.com/{PROGRESS}@{PROGRESS_REF}",
         "tauceti-progress",
@@ -434,7 +443,7 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         )
 
     try:
-        proc = subprocess.run(progress_argv("due"), capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(progress_argv(cfg.state, "due"), capture_output=True, text=True, timeout=300)
         # The verdict is on stdout. stderr carries uvx's build chatter ("Updating ...", "Building
         # ..."), which is not part of the reason and would otherwise fill the dashboard cell.
         out = (proc.stdout or "").strip().splitlines()

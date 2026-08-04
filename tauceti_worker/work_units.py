@@ -755,7 +755,7 @@ def _do_progress_inner(w, opts) -> int | None:
 
     def run_tool(*args: str, capture: bool = False):
         log(f"  $ tauceti-progress {args[0]} …")
-        return subprocess.run(progress_argv(*args), capture_output=capture, text=True, timeout=1800)
+        return subprocess.run(progress_argv(w.cfg.state, *args), capture_output=capture, text=True, timeout=1800)
 
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
     #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
