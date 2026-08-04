@@ -1003,6 +1003,11 @@ class Quota:
         """None if this worker's Codex credential is the account the operator asked for; otherwise the
         message to fail with. Actionable by construction: every branch ends in a command to run, because
         the operator hitting this cannot see which account they are on by any other means."""
+        # Sync from the operator's real credential FIRST. Under an isolated home we otherwise read a
+        # mirror that run_round only refreshes later, so an operator who has just switched accounts
+        # would be told to switch to the account they are already on — the worst possible false alarm
+        # for a check whose entire value is being believed.
+        mirror_creds(self.cfg)
         acct = self.codex_account()
         src = self._codex_creds_source()
 

@@ -182,6 +182,23 @@ try:
     msg = q().codex_account_problem("other@example.com")
     check_in("isolated home -> names the real credential source", str(real), msg)
     check("isolated home -> does NOT name the mirror", str(codex / "auth.json") in msg, False)
+
+    # The stale-mirror false alarm: the operator switches their real ~/.codex to the account they want,
+    # but the isolated worker still holds the OLD mirrored copy (run_round only re-mirrors later). If the
+    # check read the mirror, it would tell them to switch to the account they had just switched to —
+    # which would teach them to distrust the check. It must sync from the source before deciding.
+    (real / "auth.json").write_text(json.dumps(auth_json(email="switched-to@example.com", acct="acct-new")))
+    write(auth_json(email="stale@example.com", acct="acct-old"))
+    check(
+        "stale mirror + freshly switched source -> no false alarm",
+        q().codex_account_problem("switched-to@example.com"),
+        None,
+    )
+    check(
+        "stale mirror -> the OLD account is not accepted either",
+        q().codex_account_problem("stale@example.com") is None,
+        False,
+    )
     (codex / ".tauceti-creds-source").unlink()
 
     # --- the gate ----------------------------------------------------------------------------------
