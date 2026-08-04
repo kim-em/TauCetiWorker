@@ -6,6 +6,7 @@ viewers: a tmux session created here tails durable logs and can disappear withou
 
 from __future__ import annotations
 
+import argparse
 import base64
 import contextlib
 import dataclasses
@@ -55,6 +56,36 @@ _WORKER_KEYS = {
     "isolate_home",
     "restart",
 }
+
+WORKERS_EPILOG = """\
+quickstart:
+  tauceti workers add                    add an enabled workerN and start the manager
+  tauceti workers add reviewer --only review
+                                         add a focused named worker
+  tauceti workers                        inspect desired and actual state
+  tauceti workers logs --follow worker1  follow its durable log
+
+hand-edited config:
+  tauceti workers edit                   create or edit workers.toml
+  tauceti workers apply --check          validate without reconciling
+  tauceti workers apply                  reconcile and start the manager if needed
+
+long-running service:
+  tauceti workers service install        install the native user service
+  tauceti workers service status         inspect the native user service
+  tauceti workers manager-stop           stop the detached manager and its workers
+
+configuration (first that is set wins):
+  tauceti workers --config PATH apply    an explicit file, before the action
+  TAUCETI_WORKERS_CONFIG                 exact default config path
+  TAUCETI_CONFIG_HOME                    directory holding workers.toml
+  XDG_CONFIG_HOME                        root holding tauceti/workers.toml
+  platform default                       macOS Application Support, else ~/.config/tauceti
+
+  tauceti workers import workers.conf    import the legacy line-oriented format once
+
+See docs/workers.md for the workers.toml schema and the full action reference.
+"""
 
 
 class WorkersError(Exception):
@@ -1515,13 +1546,22 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
 
 
 def add_workers_parser(subparsers) -> None:
-    workers = subparsers.add_parser("workers", help="configure, supervise, and monitor persistent workers")
+    workers = subparsers.add_parser(
+        "workers",
+        help="configure, supervise, and monitor persistent workers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Configure, supervise, and inspect persistent workers declared in workers.toml.\n"
+        "They are declarative and outlive the terminal that created them: a manager reconciles\n"
+        "the file, starting, stopping, and restarting workers to match it. With no action, show\n"
+        "desired and actual worker state.",
+        epilog=WORKERS_EPILOG,
+    )
     workers.add_argument("--config", type=Path, default=default_workers_config(), help="desired worker TOML file")
     workers.set_defaults(json=False, watch=False)
     actions = workers.add_subparsers(dest="workers_action")
     status = actions.add_parser("status", help="show desired and actual worker state")
-    status.add_argument("--json", action="store_true")
-    status.add_argument("--watch", action="store_true")
+    status.add_argument("--json", action="store_true", help="emit the state as JSON")
+    status.add_argument("--watch", action="store_true", help="refresh every two seconds until interrupted")
     apply = actions.add_parser("apply", help="validate and reconcile the configuration")
     apply.add_argument("--check", action="store_true", help="validate only")
     descriptions = {
@@ -1535,35 +1575,35 @@ def add_workers_parser(subparsers) -> None:
         item.add_argument("worker_id")
     add = actions.add_parser("add", help="add an enabled persistent worker definition")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
-    add.add_argument("--agent", choices=AGENTS, default="auto")
-    add.add_argument("--only", default="", help="comma-separated work phases")
-    add.add_argument("--sandbox", choices=("host", "bubble"), default="host")
-    add.add_argument("--ignore-quota", action="store_true")
-    add.add_argument("--roadmap-only")
-    add.add_argument("--roadmap-skip", default="")
-    add.add_argument("--source")
-    add.add_argument("--author-model")
-    add.add_argument("--author-effort")
-    add.add_argument("--pace")
-    add.add_argument("--stream", action="store_true")
-    add.add_argument("--isolate-home", action="store_true")
+    add.add_argument("--agent", choices=AGENTS, default="auto", help="which agent runs its rounds")
+    add.add_argument("--only", default="", help="comma-separated work phases (default: the whole cascade)")
+    add.add_argument("--sandbox", choices=("host", "bubble"), default="host", help="where its rounds run")
+    add.add_argument("--ignore-quota", action="store_true", help="skip the pacer; needs an explicit --agent")
+    add.add_argument("--roadmap-only", help="the single roadmap area for its roadmap rounds")
+    add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
+    add.add_argument("--source", help="supplementary repository to author from; needs --roadmap-only")
+    add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
+    add.add_argument("--author-effort", help="authoring reasoning effort; needs an explicit --agent")
+    add.add_argument("--pace", help="pacing curve as time%%:budget%% points, e.g. 0:10,50:70,90:90")
+    add.add_argument("--stream", action="store_true", help="keep the agent transcript in the console log")
+    add.add_argument("--isolate-home", action="store_true", help="force credential isolation for the default id")
     logs = actions.add_parser("logs", help="show a worker's durable console log")
     logs.add_argument("worker_id")
-    logs.add_argument("--follow", "-f", action="store_true")
-    logs.add_argument("--lines", type=int, default=100)
+    logs.add_argument("--follow", "-f", action="store_true", help="keep printing, across worker restarts")
+    logs.add_argument("--lines", type=int, default=100, help="how many trailing lines to show first")
     tmux = actions.add_parser("tmux", help="open an optional tmux workspace that tails worker logs")
-    tmux.add_argument("--no-attach", action="store_true")
+    tmux.add_argument("--no-attach", action="store_true", help="build the session but stay in this shell")
     manager = actions.add_parser("manager", help="run the portable desired-state reconciler")
-    manager.add_argument("--interval", type=float, default=DEFAULT_INTERVAL)
+    manager.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="seconds between reconciliations")
     stop = actions.add_parser("manager-stop", help="stop the detached manager and, by default, its workers")
-    stop.add_argument("--leave-workers", action="store_true")
+    stop.add_argument("--leave-workers", action="store_true", help="stop only the manager, leaving workers running")
     service = actions.add_parser("service", help="manage the systemd user service or macOS LaunchAgent")
     service.add_argument("service_action", choices=("install", "uninstall", "start", "stop", "restart", "status"))
     edit = actions.add_parser("edit", help="open workers.toml in $VISUAL or $EDITOR")
-    edit.add_argument("--editor")
+    edit.add_argument("--editor", help="editor command to use instead of $VISUAL or $EDITOR")
     imp = actions.add_parser("import", help="import legacy workers.conf commands")
     imp.add_argument("legacy", type=Path)
-    imp.add_argument("--force", action="store_true")
+    imp.add_argument("--force", action="store_true", help="overwrite an existing workers.toml")
 
 
 def cmd_workers(args) -> int:

@@ -1,0 +1,135 @@
+# `tauceti work` reference
+
+`tauceti work` does one round and exits; `--loop` runs the driver. The same flag
+list is in `tauceti work -h`. For persistent workers, see
+[the workers documentation](workers.md).
+
+## Flags
+
+| Flag | What it does |
+| --- | --- |
+| `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
+| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap` (default: the whole cascade). |
+| `--skip TASKS` | Drop a comma list of tasks from the cascade. Combines with `--only` by subtraction. |
+| `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax`. |
+| `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
+| `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex or Claude provider. |
+| `--account EMAIL_OR_ID` | Require the Codex credential to be this account (email, or the workspace UUID `tauceti doctor` prints) and refuse to run otherwise. Checks only; never switches. Needs an explicit `--agent codex`. |
+| `--bubble` | Run the agent inside the bubble sandbox instead of directly on the host (the default). |
+| `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
+| `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
+| `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
+| `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. It is copied into worker state and mounted read-only in bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
+| `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
+| `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
+| `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
+| `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
+| `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): allow ≤ budget% used by elapsed%, interpolated; time 0/100 default to 0/100. Default is `used% ≤ elapsed%`. |
+| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux, `$CLAUDE_CONFIG_DIR` + `$CODEX_HOME` on macOS). |
+| `--isolate-home` | Force that per-worker isolation even for the `default` id (a distinct id already implies it). |
+| `--dry-run` | Survey and print the picker's decision; act on nothing. |
+
+## Roadmap backpressure
+
+The open-PR backpressure limit follows the roadmap scope you select. A pinned
+area counts only your open PRs identified for that area; an all-areas or
+automatic run counts roadmap PRs in every non-skipped area. Drafts, non-roadmap
+PRs, and PRs for roadmaps outside the selected scope do not consume its authoring
+limit. An open roadmap PR whose area is temporarily unknown counts conservatively
+in every scope until its area label resolves.
+
+## Claims on the intentions board
+
+Within an area, roadmap workers respect finer-grained claims registered by other
+contributors on the [intentions board](https://github.com/leanprover-community/intentions):
+an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that
+someone has claimed is treated as theirs, and the worker is told not to author
+it. "You" is your own `gh auth` identity. If you run workers under several
+accounts, or coordinate with someone whose intentions you are fulfilling, list
+those logins with `--roadmap-extra-identities` so the worker does not avoid your
+own side's claims. This is cooperative and fail-open;
+`--ignore-claims` or `TAUCETI_RESPECT_CLAIMS=false` opts out.
+
+## Codex model selection
+
+The committed Codex authoring profile defaults to `gpt-5.6-sol`. Before the real
+authoring task, the worker makes a tiny read-only Sol access probe and caches the
+result for one hour, for that worker and ChatGPT account. Only a structured
+400/403/404 model-access rejection counts as an entitlement miss, and it takes
+two consecutive ones to select `gpt-5.6-terra`; rate limits, server errors,
+context errors, malformed output, and ordinary failures pause the round without
+downgrading. Both probes are read-only, and the real authoring prompt is still
+executed exactly once.
+
+An explicit `--author-model`, `TAUCETI_AUTHORING_CODEX_MODEL`, or legacy
+`TAUCETI_CODEX_MODEL` is a pin: it bypasses both the probe and the fallback.
+
+A generic authoring override is rejected with `--agent auto`, because the model
+or effort may not apply to whichever provider quota selection picks.
+
+## Codex accounts
+
+`--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
+belong to a particular account, and exits the round before spending anything if
+it does not. It checks; it never switches. This is Codex-only because its
+credential carries the account identity, where `codex login status` prints only
+"Logged in using ChatGPT". `tauceti doctor` shows which account the current
+credential is for.
+
+To change accounts outright, `codex logout && codex login`. Two things to know:
+the browser flow has no account picker, so it completes as whichever ChatGPT
+account your browser is already signed into, and `codex logout` revokes the old
+session rather than merely forgetting it locally.
+
+To run TauCeti on one account while your interactive `codex` keeps another, give
+it a private credential directory instead of logging out:
+
+```bash
+CODEX_HOME=~/.codex-tauceti codex login
+CODEX_HOME=~/.codex-tauceti tauceti work --agent codex --account you@example.com
+```
+
+## Environment variables
+
+Flags win over these. Most are tuning knobs with sane defaults.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
+| `TAUCETI_ACCOUNT` | _(unset)_ | Default for `--account`. |
+| `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
+| `TAUCETI_WORKER_ID` | `default` | Default for `--worker-id`. |
+| `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
+| `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
+| `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
+| `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
+| `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
+| `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
+| `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
+| `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback. |
+| `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin. Unset preserves the review engine's own default and fallback. |
+| `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`. |
+| `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
+| `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
+| `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |
+| `TAUCETI_BUBBLE` | `bubble` (else `uvx` for dry-run probes only) | Override the Bubble executable. |
+| `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
+| `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
+| `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
+| `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
+| `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
+| `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
+| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
+| `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
+| `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). |
+| `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
+
+Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,
+`TAUCETI_WORKERS_STATE_DIR`, `TAUCETI_RUNTIME_DIR`) are documented in
+[the workers documentation](workers.md).

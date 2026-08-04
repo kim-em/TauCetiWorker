@@ -96,7 +96,7 @@ multiple workers (share a host, coordinate through GitHub; a distinct id isolate
   tauceti work --loop --worker-id alice --only review
   tauceti work --loop --worker-id bob   --only roadmap
 
-environment (flags win; see README.md for the full list):
+environment (flags win; see docs/reference.md for the full list):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
@@ -370,7 +370,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run 'tauceti work -h' for the work units, examples, multi-worker setup, and\n"
-        "environment variables. See README.md for the full reference.",
+        "environment variables, and 'tauceti workers -h' for persistent workers.\n"
+        "README.md is the guide; docs/reference.md is the full flag reference.",
     )
     sub = p.add_subparsers(dest="cmd")
 
