@@ -153,8 +153,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         metavar="EMAIL_OR_ID",
         help="require the agent's credential to be this account (email, or the workspace UUID "
         "`tauceti doctor` prints), and refuse to run otherwise. TauCeti never switches accounts; "
-        "this only checks, and the error says how to switch. Codex only, and needs an explicit "
-        "--agent codex (or $TAUCETI_ACCOUNT)",
+        "this only checks, and the error says how to switch. Codex only, so it needs an explicit "
+        "--agent codex (or $TAUCETI_AGENT=codex). Defaults to $TAUCETI_ACCOUNT",
     )
     p.add_argument(
         "--author-model",

@@ -1100,6 +1100,14 @@ def run_in_bubble(
     # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that
     # never call the pacer). No-op when not isolated or on macOS.
     mirror_creds(cfg)
+    # That re-mirror is the LAST thing to touch the credential before bubble seeds the container, so it
+    # can hand the container an account rotated in since the round's earlier --account checks. Re-check
+    # against what bubble is about to receive; this is the final gate before the container spends.
+    account = getattr(opts, "account", None)
+    if account and cred_model == "codex":
+        problem = Quota(cfg).codex_account_problem(account)
+        if problem:
+            raise Die(f"bubble: {problem}")
     # On macOS, Claude Code keeps creds in the Keychain, not a file. Stage a current snapshot privately
     # and override only Bubble's subprocess env (done after the echo path so a dry-run never prompts the
     # Keychain). Register cleanup before launch for signals; the normal finally removes it promptly too.

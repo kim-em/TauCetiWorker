@@ -5,12 +5,17 @@ using ChatGPT" (no email), and the model cannot introspect its own account — s
 out of $CODEX_HOME/auth.json, which is the file `codex` itself authenticates with.
 
 The properties that matter, and why each is a property rather than an implementation detail:
-  - identity comes from BOTH JWTs, and disagreement between them is reported, not resolved (a
-    half-written credential must not be silently labelled as one account or the other);
+  - identity is CORRELATED per token, never unioned field-by-field: an account id from one token beside
+    an email from another names an account that need not exist, and --account would pass for it;
+  - tokens that disagree are reported, not resolved (a half-written credential must not be confidently
+    labelled as one account or the other);
   - an API-key credential has no account identity at all, and says so instead of reporting a mismatch;
+  - a credential codex would not even use — $CODEX_API_KEY / $CODEX_ACCESS_TOKEN outrank auth.json —
+    is refused rather than certified, because a pass must mean the checked account is the paying one;
+  - malformed shapes fail closed instead of raising: this runs in a doctor row and a preflight;
   - a mismatch NEVER switches accounts — it fails with instructions, which is the whole contract;
   - the message points at the operator's REAL ~/.codex under an isolated home, not at the mirror the
-    worker reads (re-authenticating into the mirror would be undone by the next round's re-mirror).
+    worker reads, and names $CODEX_HOME in the commands so a copy-paste cannot revoke another account.
 
 Exit 0 = every case agrees; 1 = a mismatch.
 """
@@ -200,6 +205,77 @@ try:
         False,
     )
     (codex / ".tauceti-creds-source").unlink()
+
+    # --- identity must be CORRELATED, not unioned field-by-field -----------------------------------
+    # An account id from one token beside an email from another describes an account that need not
+    # exist. Here the access token (what actually spends) is acct-A with no email, and the id token
+    # carries an email but no account id: nothing ties that address to acct-A, so it must not be
+    # accepted as acct-A's, or --account would pass for an account the credential does not spend under.
+    uncorrelated = {
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "account_id": "acct-A",
+            "access_token": jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-A"}}),
+            "id_token": jwt({"email": "b@example.com"}),
+        },
+    }
+    write(uncorrelated)
+    a = q().codex_account()
+    check("uncorrelated email is not adopted", a.email, None)
+    check("the spending account id is still reported", a.account_id, "acct-A")
+    check(
+        "--account with the uncorrelated email is REFUSED",
+        q().codex_account_problem("b@example.com") is None,
+        False,
+    )
+    check("--account with the real account id still passes", q().codex_account_problem("acct-A"), None)
+
+    # An email IS adopted from a token whose own account id agrees with the authoritative one.
+    write(auth_json(email="kim@example.com", acct="acct-kim"))
+    check("corroborated email is adopted", q().codex_account().email, "kim@example.com")
+
+    # --- malformed credential shapes fail closed, never crash --------------------------------------
+    # Valid JSON of the wrong shape is what a half-written file or a future codex schema looks like.
+    # A traceback out of a doctor row or a preflight check would be worse than "unknown account".
+    for label, blob in [
+        ("top-level list", "[]"),
+        ("tokens is a list", '{"tokens": []}'),
+        ("numeric access_token", '{"tokens": {"access_token": 123}}'),
+        ("null tokens", '{"tokens": null}'),
+        (
+            "claim namespace is a string",
+            '{"tokens": {"access_token": "%s"}}' % jwt({"https://api.openai.com/auth": "x"}),
+        ),
+    ]:
+        (codex / "auth.json").write_text(blob)
+        try:
+            acct = q().codex_account()
+            problem = q().codex_account_problem("kim@example.com")
+            ok = acct is not None and not acct.describes_an_account and problem is not None
+            check(f"malformed ({label}) -> fails closed, no crash", ok, True)
+        except Exception as e:
+            check(f"malformed ({label}) -> fails closed, no crash", f"CRASH {type(e).__name__}: {e}", True)
+
+    # Unreadable-but-present must not be reported as "no credential": the remedy differs, and logging
+    # in over a corrupt file could destroy a live session.
+    (codex / "auth.json").write_text("{not json")
+    check_in(
+        "corrupt credential is distinguished from absent",
+        "could not be read",
+        q().codex_account_problem("kim@example.com"),
+    )
+
+    # --- an environment credential outranks the file we check --------------------------------------
+    # codex reads CODEX_API_KEY / CODEX_ACCESS_TOKEN ahead of auth.json, and TauCeti's launcher clears
+    # only OPENAI_API_KEY. Certifying the file while one of these is set would be a false pass.
+    write(auth_json(email="kim@example.com", acct="acct-kim"))
+    for var in ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
+        os.environ[var] = "sk-something"
+        try:
+            check_in(f"${var} set -> refuses to certify", var, q().codex_account_problem("kim@example.com"))
+        finally:
+            os.environ.pop(var, None)
+    check("with the env clear, the same credential passes", q().codex_account_problem("kim@example.com"), None)
 
     # --- the gate ----------------------------------------------------------------------------------
     gate = tc.work_units.raise_on_account_mismatch
