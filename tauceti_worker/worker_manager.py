@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
-from .paths import HERE, entry_cmd, self_argv, self_env
+from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .round import signal_group
 from .runtime_status import STATUS_ENV, read_json, update_status
 
@@ -1331,8 +1331,20 @@ def _service_environment() -> dict[str, str]:
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "PYTHONPATH": env["PYTHONPATH"],
     }
-    if env.get("SSL_CERT_FILE"):
-        service_env["SSL_CERT_FILE"] = env["SSL_CERT_FILE"]
+    configured = os.environ.get("SSL_CERT_FILE")
+    if configured:
+        # Explicit operator configuration wins, including an unusual or currently absent path.
+        service_env["SSL_CERT_FILE"] = configured
+    elif ensure_ssl_cert_file({}) is None:
+        # The unit may outlive a Nix store path. Preserve it as a candidate, not as the final
+        # SSL_CERT_FILE, so cli_main revalidates it and can fall back or warn after collection.
+        advertised = os.environ.get("NIX_SSL_CERT_FILE")
+        if advertised:
+            try:
+                if Path(advertised).expanduser().is_file():
+                    service_env["NIX_SSL_CERT_FILE"] = advertised
+            except (OSError, RuntimeError):
+                pass
     return service_env
 
 

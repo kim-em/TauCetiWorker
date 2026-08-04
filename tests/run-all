@@ -62,6 +62,7 @@ RUN_STDLIB=(
   scoreboard_trust.py
   source_argument.py
   spread_candidates.py
+  ssl_cert_file.py
   status_labels.py
   worker_manager.py
 )

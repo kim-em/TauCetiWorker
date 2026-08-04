@@ -87,9 +87,11 @@ reboot, install the native user service:
 ```
 
 This installs a systemd user service on Linux/NixOS or a LaunchAgent on macOS.
-The generated service preserves an explicit `SSL_CERT_FILE` or discovers the host's system CA
+At startup the worker preserves an explicit `SSL_CERT_FILE` or discovers the host's system CA
 bundle, including NixOS's `/etc/ssl/certs/ca-certificates.crt`, so subscription quota checks keep
-working when uv's standalone Python uses a different OpenSSL default.
+working when uv's standalone Python uses a different OpenSSL default. If installation must carry a
+shell-provided Nix bundle into the service, it remains a revalidated candidate rather than a pinned
+trust path, so garbage collection cannot silently disable fallback discovery.
 The reconciler and worker control sockets are portable Unix code; no Linux
 `/proc` interface is required. On Linux systems that stop the user manager after
 the last logout, `loginctl enable-linger "$USER"` keeps user services running

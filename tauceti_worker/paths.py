@@ -11,8 +11,8 @@ the repo root, one level up.
 from __future__ import annotations
 
 import os
-import ssl
 import sys
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 
 _pkg = Path(__file__).resolve().parent  # …/tauceti_worker
@@ -34,12 +34,16 @@ _COMMON_CA_BUNDLES = (
 )
 
 
-def _ssl_cert_candidates(env: dict) -> tuple[str | None, ...]:
-    defaults = ssl.get_default_verify_paths()
-    return (env.get("NIX_SSL_CERT_FILE"), defaults.cafile, defaults.openssl_cafile, *_COMMON_CA_BUNDLES)
+def _ssl_cert_candidates(env: Mapping[str, str]) -> tuple[str | None, ...]:
+    # get_default_verify_paths().cafile is shadowed by the process's SSL_CERT_FILE, which may
+    # differ from *env*. openssl_cafile is the interpreter's environment-independent default.
+    import ssl
+
+    openssl_default = ssl.get_default_verify_paths().openssl_cafile
+    return (env.get("NIX_SSL_CERT_FILE"), openssl_default, *_COMMON_CA_BUNDLES)
 
 
-def ensure_ssl_cert_file(env: dict | None = None) -> str | None:
+def ensure_ssl_cert_file(env: MutableMapping[str, str] | None = None) -> str | None:
     """Put a usable system CA bundle in *env* when its Python has no working default.
 
     Preserve an explicit ``SSL_CERT_FILE`` even when it is unusual: operator configuration wins.
@@ -53,12 +57,12 @@ def ensure_ssl_cert_file(env: dict | None = None) -> str | None:
     for raw in _ssl_cert_candidates(base):
         if not raw:
             continue
-        candidate = Path(raw).expanduser()
         try:
+            candidate = Path(raw).expanduser()
             if candidate.is_file():
                 base["SSL_CERT_FILE"] = str(candidate)
                 return str(candidate)
-        except OSError:
+        except (OSError, RuntimeError):
             continue
     return None
 
@@ -70,7 +74,7 @@ def self_argv(*tail) -> list[str]:
     return [sys.executable, "-m", "tauceti_worker", *(str(a) for a in tail)]
 
 
-def self_env(env: dict | None = None) -> dict:
+def self_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Environment for a self_argv child: ensure the package is importable. In a source checkout
     HERE is the repo root (which contains tauceti_worker/), so putting it on PYTHONPATH lets the
     child `python -m tauceti_worker`; in a wheel the package is already importable and this is a

@@ -265,8 +265,22 @@ worker3 — backing off
                 if saved_ssl_cert is not None:
                     os.environ["SSL_CERT_FILE"] = saved_ssl_cert
             assert 'Environment="PATH=' in unit and 'Environment="PYTHONPATH=' in unit
-            assert f'Environment="SSL_CERT_FILE={ca_bundle}"' in unit
+            # A bundle discoverable at runtime is deliberately not frozen into a persistent unit.
+            assert "SSL_CERT_FILE" not in unit and "NIX_SSL_CERT_FILE" not in unit
             assert "ExecStart=" in unit and str(config.resolve()) in unit
+
+            worker_paths._ssl_cert_candidates = lambda env: (env.get("NIX_SSL_CERT_FILE"),)
+            saved_nix_cert = os.environ.get("NIX_SSL_CERT_FILE")
+            os.environ["NIX_SSL_CERT_FILE"] = str(ca_bundle)
+            try:
+                unit = wm._systemd_unit(config)
+            finally:
+                if saved_nix_cert is None:
+                    os.environ.pop("NIX_SSL_CERT_FILE", None)
+                else:
+                    os.environ["NIX_SSL_CERT_FILE"] = saved_nix_cert
+            assert f'Environment="NIX_SSL_CERT_FILE={ca_bundle}"' in unit
+            assert 'Environment="SSL_CERT_FILE=' not in unit
         finally:
             worker_paths._ssl_cert_candidates = saved_candidates
 

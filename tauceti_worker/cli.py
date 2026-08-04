@@ -748,8 +748,10 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
 def cli_main() -> int:
     """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
     # A service has no login shell to provide NIX_SSL_CERT_FILE, and uv's standalone CPython may not
-    # know the host's CA-bundle path. Repair the environment before quota telemetry or child launches.
-    ensure_ssl_cert_file()
+    # know the host's CA-bundle path. Repair the process environment before quota telemetry and child
+    # launches; this also gives other TLS-using subprocesses the same host trust store.
+    if ensure_ssl_cert_file() is None:
+        log("no system CA bundle found; set SSL_CERT_FILE if TLS verification fails")
     _ensure_scripts_executable()
     try:
         return main() or 0
