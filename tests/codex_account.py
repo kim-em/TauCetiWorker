@@ -277,6 +277,33 @@ try:
             os.environ.pop(var, None)
     check("with the env clear, the same credential passes", q().codex_account_problem("kim@example.com"), None)
 
+    # --- a non-file credential store means codex does not read auth.json at all --------------------
+    # Verified against codex 0.146.0: with cli_auth_credentials_store = "ephemeral", `codex login
+    # status` reports "Not logged in" while a perfectly good auth.json sits on disk; with "keyring" it
+    # reads the keyring and does not fall back to the file. A file left over from before the switch
+    # would therefore let TauCeti certify an account codex has stopped using — a fail-OPEN, which is the
+    # one direction this check must never fail. Unset resolves to `file` (codex doctor reports
+    # "auth storage mode = File"), which is why the default path needs no config at all.
+    write(auth_json(email="kim@example.com", acct="acct-kim"))
+    check("no config.toml -> verifiable", q().codex_account_problem("kim@example.com"), None)
+    for mode, verifiable in [("file", True), ("keyring", False), ("ephemeral", False), ("auto", False)]:
+        (codex / "config.toml").write_text(f'cli_auth_credentials_store = "{mode}"\n')
+        problem = q().codex_account_problem("kim@example.com")
+        check(f'store "{mode}" -> {"verifiable" if verifiable else "REFUSED"}', problem is None, verifiable)
+        if not verifiable:
+            check_in(f'store "{mode}" names the setting', "cli_auth_credentials_store", problem)
+            check_in(f'store "{mode}" gives the one-line fix', 'cli_auth_credentials_store = "file"', problem)
+
+    # A future variant must fail closed, not be silently trusted as if it were `file`.
+    (codex / "config.toml").write_text('cli_auth_credentials_store = "some-future-store"\n')
+    check("unknown store -> REFUSED", q().codex_account_problem("kim@example.com") is None, False)
+
+    # A malformed config is codex's problem to reject at startup; do not manufacture an --account
+    # failure from it, or every TOML typo becomes a confusing account error.
+    (codex / "config.toml").write_text("this is not valid toml [[[\n")
+    check("malformed config.toml -> not an account failure", q().codex_account_problem("kim@example.com"), None)
+    (codex / "config.toml").unlink()
+
     # --- the gate ----------------------------------------------------------------------------------
     gate = tc.work_units.raise_on_account_mismatch
     write(auth_json(email="kim@example.com", acct="acct-kim"))

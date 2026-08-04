@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -893,6 +894,16 @@ class _TokenIdentity:
         return not (self.account_id or self.email or self.plan)
 
 
+# Why each non-file credential store makes --account unverifiable. Phrased as the reason codex will not
+# be reading auth.json, since that is the fact the operator has to act on.
+_STORE_WHY = {
+    "keyring": "it keeps the credential in the platform keyring instead",
+    "ephemeral": "it holds the credential only in memory, and persists nothing",
+    "auto": "it prefers the platform keyring whenever one is available, so which store is authoritative "
+    "depends on the machine the agent runs on",
+}
+
+
 def _para(text: str) -> str:
     """Wrap one paragraph for a terminal. These messages interpolate email addresses of wildly varying
     length, so hand-wrapped source lines go ragged for the operators who most need to read them.
@@ -1050,6 +1061,38 @@ class Quota:
             conflict=conflict or email_conflict,
         )
 
+    def _codex_credentials_store(self) -> str | None:
+        """The configured Codex credential store when it is one --account CANNOT be verified against,
+        else None (verifiable: unset or `file`).
+
+        codex 0.146.0 takes `cli_auth_credentials_store` in config.toml, one of file/keyring/auto/
+        ephemeral. Unset resolves to `file` — confirmed against `codex doctor --json`, which reports
+        `auth storage mode = File` for an empty CODEX_HOME — which is why the default case needs no
+        special handling and why this returns None far more often than not.
+
+        `auto` is refused with the other two: it prefers a platform keyring when one is available, so
+        whether auth.json is authoritative depends on the runtime keyring of the machine the agent lands
+        on, which we cannot determine here. An unrecognised value is refused too, so a future variant
+        fails closed rather than being silently trusted.
+
+        LIMITATION: this reads the config.toml in the effective $CODEX_HOME, which is the layer that
+        matters here (isolate_home does not copy one into a worker's isolated dir, so isolated workers
+        get codex's defaults). A project-level or managed config layer setting this key would not be
+        seen."""
+        cfg_path = codex_dir(self.cfg.home) / "config.toml"
+        try:
+            with open(cfg_path, "rb") as fh:
+                data = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError):
+            # Unreadable or malformed config: codex would refuse to start on it, so the round fails on
+            # its own terms rather than here. Do not manufacture an --account failure from it.
+            return None
+        value = data.get("cli_auth_credentials_store") if isinstance(data, dict) else None
+        if not isinstance(value, str):
+            return None
+        norm = value.strip().lower()
+        return None if norm in ("", "file") else norm
+
     def _codex_creds_source(self) -> Path:
         """The credential location the OPERATOR must edit to change this worker's Codex account. Under an
         isolated home that is NOT the file we read: we read a mirror, and isolate_home leaves a marker
@@ -1083,6 +1126,26 @@ class Quota:
                     f"identify and did not check. Unset ${var} and re-run, so the account named by the "
                     f"credential file is the account that actually pays."
                 )
+        # auth.json is only the credential codex uses while its store mode is `file`. Under `keyring` or
+        # `ephemeral` codex ignores the file completely — but a file left over from before the switch
+        # stays on disk, so reading it would confidently certify an account codex is not using. That
+        # fails OPEN, which is the one direction this check must never fail.
+        store = self._codex_credentials_store()
+        if store is not None:
+            return (
+                _para(
+                    f"--account {requested} cannot be verified: {codex_dir(self.cfg.home)}/config.toml "
+                    f'sets cli_auth_credentials_store = "{store}", so codex does not read '
+                    f"{src}/auth.json — {_STORE_WHY.get(store, 'TauCeti cannot tell which account it would use')}. "
+                    f"Any account TauCeti read from that file could be one codex has already stopped using."
+                )
+                + "\n\n"
+                + _para(
+                    'Set cli_auth_credentials_store = "file" (codex\'s default) if you want --account '
+                    "to be verifiable, or drop --account and accept that the paying account is "
+                    "unchecked."
+                )
+            )
         # Every command we print names the credential store it acts on, ALWAYS — even when that is the
         # default ~/.codex. A bare `codex logout` targets whatever store the reader's shell resolves to,
         # so an operator running under a custom or per-worker $CODEX_HOME who copy-pastes it would revoke
