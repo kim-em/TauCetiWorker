@@ -42,6 +42,7 @@ RUN_STDLIB=(
   ledger_blocking.py
   loop_sigterm.py
   mirror_creds.py
+  mirror_creds_macos.py
   oauth_refresh_loop.py
   pace_curve.py
   preflight_review_lake.py

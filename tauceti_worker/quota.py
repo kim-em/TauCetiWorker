@@ -803,22 +803,28 @@ def mirror_creds(cfg: Config) -> None:
     ~/.claude/.credentials.json and ~/.codex/auth.json (they own the single-use refresh token); the worker
     only READS those and mirrors any changed access token into its isolated home, refresh token stripped
     (including across an operator account switch, whose new token may carry an earlier expiry).
-    No-op when not isolated (no seed marker ⇒ the worker reads the live file directly) or on macOS (the
-    Keychain is the store; the keychain-first pacer and _stage_claude_creds_for_bubble handle it). Safe to
-    call every pacer cycle and before every bubble launch: in steady state it is two small reads + a string
-    compare and no write."""
-    if sys.platform == "darwin":
-        return
-    iso_claude = claude_dir(cfg.home)
-    src_claude = _read_marker(iso_claude / ".tauceti-creds-source")
-    if src_claude:
-        _mirror_creds_file(
-            Path(src_claude) / ".credentials.json",
-            iso_claude / ".credentials.json",
-            block_key="claudeAiOauth",
-            tok_key="accessToken",
-            rt_key="refreshToken",
-        )
+    No-op when not isolated (no seed marker ⇒ the worker reads the live file directly). Safe to call every
+    pacer cycle and before every bubble launch: in steady state it is two small reads + a string compare
+    and no write.
+
+    macOS skips the CLAUDE half only. There the login Keychain is the store, so there is no source file
+    to mirror and the keychain-first pacer and _stage_claude_creds_for_bubble handle it instead. Codex
+    keeps a FILE on every platform, including macOS, and isolate_home writes its source marker there too
+    — so returning early for the whole function left an isolated macOS worker pinned to whatever account
+    was seeded, forever: never re-synced after an operator account switch, and still holding the real
+    refresh token the once-only seed copied verbatim, which is exactly what this function exists to
+    strip."""
+    if sys.platform != "darwin":
+        iso_claude = claude_dir(cfg.home)
+        src_claude = _read_marker(iso_claude / ".tauceti-creds-source")
+        if src_claude:
+            _mirror_creds_file(
+                Path(src_claude) / ".credentials.json",
+                iso_claude / ".credentials.json",
+                block_key="claudeAiOauth",
+                tok_key="accessToken",
+                rt_key="refreshToken",
+            )
     src_codex = _read_marker(codex_dir(cfg.home) / ".tauceti-creds-source")
     if src_codex:  # absent on homes seeded before this marker existed
         _mirror_creds_file(
@@ -1064,7 +1070,6 @@ class Quota:
         mirror_creds(self.cfg)
         acct = self.codex_account()
         src = self._codex_creds_source()
-        iso = codex_dir(self.cfg.home)
 
         # codex consults CODEX_API_KEY / CODEX_ACCESS_TOKEN BEFORE its persisted credential store, and
         # TauCeti's agent launcher clears only OPENAI_API_KEY. Either variable would therefore let the
@@ -1078,19 +1083,6 @@ class Quota:
                     f"identify and did not check. Unset ${var} and re-run, so the account named by the "
                     f"credential file is the account that actually pays."
                 )
-        # macOS + an isolated home is the one combination where the file we check is NOT the file the
-        # round spends: mirror_creds() returns early on Darwin, so the once-copied mirror never re-syncs
-        # and can name an account the operator has since switched away from. Refuse rather than certify
-        # a file we know may be stale.
-        if sys.platform == "darwin" and iso != src:
-            return _para(
-                f"--account {requested} cannot be verified for this worker: on macOS an isolated "
-                f"worker's Codex credential ({iso}/auth.json) is copied once from {src} and never "
-                f"re-synced, so TauCeti cannot tell whether it still names the account you asked for. "
-                f"Run this worker without an isolated home (the 'default' --worker-id, no "
-                f"--isolate-home), or point $CODEX_HOME at the credential directly."
-            )
-
         # Every command we print names the credential store it acts on, ALWAYS — even when that is the
         # default ~/.codex. A bare `codex logout` targets whatever store the reader's shell resolves to,
         # so an operator running under a custom or per-worker $CODEX_HOME who copy-pastes it would revoke

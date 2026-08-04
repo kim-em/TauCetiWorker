@@ -466,7 +466,10 @@ before the next round if the worker was hard-killed; your `$CLAUDE_CONFIG_DIR` (
 reads the Keychain directly and never rotates the shared login token.
 Host rounds, by contrast, share the one per-login-user Keychain, so `--isolate-home`
 can't give a host worker its own Claude account there; host-mode multi-worker
-isolation on macOS applies to Codex only. That is also why `$HOME` is left alone on
+isolation on macOS applies to Codex only, and each worker's Codex credential is kept in
+step with your real `~/.codex` there just as it is on Linux, so an account switch is
+picked up rather than leaving the worker on whatever it was first seeded with. That is
+also why `$HOME` is left alone on
 macOS: repointing it could never isolate the Keychain, and it made the Keychain
 unreadable, so every non-default worker found no Claude credentials and slept.
 
