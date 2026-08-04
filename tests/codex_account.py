@@ -184,36 +184,39 @@ try:
     check("isolated home -> does NOT name the mirror", str(codex / "auth.json") in msg, False)
     (codex / ".tauceti-creds-source").unlink()
 
-    # --- the round-level gate ----------------------------------------------------------------------
-    def opts(account=None, work_model="codex"):
-        return tc.RoundOpts(
-            only=["review"],
-            agent=work_model,
-            work_model=work_model,
-            sandbox_host=True,
-            dry_run=False,
-            account=account,
-        )
-
+    # --- the gate ----------------------------------------------------------------------------------
+    gate = tc.work_units.raise_on_account_mismatch
     write(auth_json(email="kim@example.com", acct="acct-kim"))
-    tc.work_units.raise_on_account_mismatch(Cfg, opts("kim@example.com"), "test")  # must not raise
+    gate(Cfg, "kim@example.com", "codex", "test")  # must not raise
     print("[OK ] matching account: the gate passes")
 
     raised = ""
     try:
-        tc.work_units.raise_on_account_mismatch(Cfg, opts("other@example.com"), "preflight")
+        gate(Cfg, "other@example.com", "codex", "preflight")
     except tc.Die as e:
         raised = str(e)
     check("wrong account -> Die (exit, not a retry loop)", raised.startswith("preflight:"), True)
     check_in("the Die carries the actionable message", "codex login", raised)
 
     # No --account is the default and must stay entirely inert.
-    tc.work_units.raise_on_account_mismatch(Cfg, opts(None), "test")
+    gate(Cfg, None, "codex", "test")
     print("[OK ] no --account: the gate is inert")
 
     # --account is Codex-only; a non-codex round must not be failed by a check it cannot perform.
-    tc.work_units.raise_on_account_mismatch(Cfg, opts("other@example.com", work_model="claude"), "test")
+    gate(Cfg, "other@example.com", "claude", "test")
     print("[OK ] non-codex round: the codex credential check does not apply")
+
+    # --- the loop driver must FORWARD --account to the child that actually spends -------------------
+    # The loop builds its child argv explicitly rather than inheriting it, so an omission here is a
+    # check that silently does not run for the whole loop — the mode most people use.
+    import inspect
+
+    loop_src = inspect.getsource(tc.loop.cmd_loop)
+    check("cmd_loop forwards --account to the round child", '"--account", account' in loop_src, True)
+
+    # And the flag must survive an argv round-trip, so the child parses back what the parent sent.
+    ns = tc.cli.build_parser().parse_args(["_round", "--agent", "codex", "--account", "kim@example.com"])
+    check("the round subcommand accepts --account", getattr(ns, "account", None), "kim@example.com")
 finally:
     if _saved_env is not None:
         os.environ["CODEX_HOME"] = _saved_env

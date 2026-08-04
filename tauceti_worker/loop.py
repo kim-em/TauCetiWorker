@@ -200,6 +200,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     tail += ["--author-effort", profile.effort]
                 if profile.fallback_model:
                     tail += ["--resolved-author-fallback-model", profile.fallback_model]
+            # --account must travel to the child: the child is what actually spends, and this argv is
+            # built explicitly rather than inherited, so a flag omitted here is a check that silently
+            # does not happen for the entire loop.
+            account = getattr(args, "account", None)
+            if account:
+                tail += ["--account", account]
             if bubble:
                 tail.append("--bubble")
             source = getattr(args, "source", None)

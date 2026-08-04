@@ -580,6 +580,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # path; the _round children it spawns inherit TAUCETI_LOG_FILE and append to the SAME file.
     set_log_file(cfg.logdir)
     if getattr(args, "loop", False) and not one_round:
+        # The loop driver never builds a RoundOpts, so the round-level check below is not on this path;
+        # its children get theirs. Check here too, so a wrong --account costs one command rather than a
+        # full survey, and so the operator sees the message before the loop's own output buries it.
+        raise_on_account_mismatch(cfg, getattr(args, "account", None), agent, "account")
         return cmd_loop(args, cfg, only=only, agent=agent)
     dry = getattr(args, "dry_run", False)
     ignore_quota = getattr(args, "ignore_quota", False)
@@ -633,7 +637,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
         # so it is the one run that most needs to answer "am I on the right account?". The check is a
         # file read, so it costs a dry run nothing.
-        raise_on_account_mismatch(cfg, opts, "account")
+        raise_on_account_mismatch(cfg, opts.account, opts.work_model, "account")
         if not dry:
             preflight(cfg, opts)
         return run_round(w, opts)  # NoProgress/Die propagate to main()'s handler
