@@ -35,11 +35,13 @@ if "TAUCETI_PROGRESS_GAP" not in os.environ:
     checks.append(check("default progress attempt gap is eight hours", tc.PROGRESS_ATTEMPT_GAP, 8 * 3600))
 
 progress_cmd = tc.progress_argv(Path("/worker-state"), "due")
-checks.append(check(
-    "progress tool cache is keyed by its immutable ref",
-    progress_cmd[1:3],
-    ["--cache-dir", f"/worker-state/cache/uvx/tauceti-progress/{tc.PROGRESS_REF}"],
-))
+checks.append(
+    check(
+        "progress tool cache is keyed by its immutable ref",
+        progress_cmd[1:3],
+        ["--cache-dir", f"/worker-state/cache/uvx/tauceti-progress/{tc.PROGRESS_REF}"],
+    )
+)
 checks.append(check("progress tool still receives its command", progress_cmd[-1], "due"))
 
 # Drive the real cascade as well as its status predictor. A future edit must not let their shared
