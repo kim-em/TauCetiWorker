@@ -31,6 +31,7 @@ os.environ["TAUCETI_MANAGER_TEST_COMMAND"] = shlex.join(
     [sys.executable, "-c", "import os; os.read(int(os.environ['TAUCETI_PARENT_PIPE_FD']), 1)"]
 )
 
+import tauceti_worker.paths as worker_paths
 import tauceti_worker.worker_manager as wm
 from tauceti_worker.cli import build_parser
 from tauceti_worker.runtime_status import report_failure, report_runtime
@@ -250,9 +251,24 @@ worker3 — backing off
 
     if sys.platform != "darwin":
         assert wm._service_path() == root / "config" / "systemd" / "user" / "tauceti-workers.service"
-        unit = wm._systemd_unit(config)
-        assert 'Environment="PATH=' in unit and 'Environment="PYTHONPATH=' in unit
-        assert "ExecStart=" in unit and str(config.resolve()) in unit
+        ca_bundle = root / "ca-bundle.pem"
+        ca_bundle.write_text("test CA bundle")
+        saved_candidates = worker_paths._ssl_cert_candidates
+        worker_paths._ssl_cert_candidates = lambda _env: (str(ca_bundle),)
+        try:
+            clean_env = worker_paths.self_env({})
+            assert clean_env["SSL_CERT_FILE"] == str(ca_bundle)
+            saved_ssl_cert = os.environ.pop("SSL_CERT_FILE", None)
+            try:
+                unit = wm._systemd_unit(config)
+            finally:
+                if saved_ssl_cert is not None:
+                    os.environ["SSL_CERT_FILE"] = saved_ssl_cert
+            assert 'Environment="PATH=' in unit and 'Environment="PYTHONPATH=' in unit
+            assert f'Environment="SSL_CERT_FILE={ca_bundle}"' in unit
+            assert "ExecStart=" in unit and str(config.resolve()) in unit
+        finally:
+            worker_paths._ssl_cert_candidates = saved_candidates
 
     manager = start_manager(config)
     wait_for(lambda: wm.manager_request("ping"))

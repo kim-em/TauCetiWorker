@@ -1325,11 +1325,25 @@ def _systemd_quote(value: str) -> str:
     return json.dumps(value.replace("%", "%%"))
 
 
+def _service_environment() -> dict[str, str]:
+    env = self_env()
+    service_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PYTHONPATH": env["PYTHONPATH"],
+    }
+    if env.get("SSL_CERT_FILE"):
+        service_env["SSL_CERT_FILE"] = env["SSL_CERT_FILE"]
+    return service_env
+
+
 def _systemd_unit(config: Path) -> str:
     command = " ".join(_systemd_quote(part) for part in _service_command(config))
     # Assignment values are not shell syntax: quotes become literal in WorkingDirectory=. Escape the
     # small set systemd treats specially while keeping the path absolute after parsing.
     working_directory = str(HERE).replace("\\", "\\\\").replace(" ", "\\x20").replace("%", "%%")
+    environment = "\n".join(
+        f"Environment={_systemd_quote(name + '=' + value)}" for name, value in _service_environment().items()
+    )
     return f"""[Unit]
 Description=Keep configured Tau Ceti workers running
 
@@ -1337,8 +1351,7 @@ Description=Keep configured Tau Ceti workers running
 Type=simple
 WorkingDirectory={working_directory}
 ExecStart={command}
-Environment={_systemd_quote("PATH=" + os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))}
-Environment={_systemd_quote("PYTHONPATH=" + self_env()["PYTHONPATH"])}
+{environment}
 Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
@@ -1378,10 +1391,7 @@ def service_action(action: str, config: Path) -> int:
                 "WorkingDirectory": str(HERE),
                 "RunAtLoad": True,
                 "KeepAlive": True,
-                "EnvironmentVariables": {
-                    "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-                    "PYTHONPATH": self_env()["PYTHONPATH"],
-                },
+                "EnvironmentVariables": _service_environment(),
                 "StandardOutPath": str(workers_state_dir() / "manager.log"),
                 "StandardErrorPath": str(workers_state_dir() / "manager.log"),
             }

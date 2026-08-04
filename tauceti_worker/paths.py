@@ -11,6 +11,7 @@ the repo root, one level up.
 from __future__ import annotations
 
 import os
+import ssl
 import sys
 from pathlib import Path
 
@@ -19,6 +20,47 @@ HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
 
 # The branch-lease helper the agents run on PATH inside a round. Overridable for tests.
 CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "scripts" / "claim.sh")
+
+# CPython builds do not agree on the default CA-bundle path. In particular, uv's standalone
+# CPython uses OpenSSL's /etc/ssl/cert.pem default on NixOS, while NixOS exposes the system bundle
+# at /etc/ssl/certs/ca-certificates.crt. A worker service has no login shell to supply
+# SSL_CERT_FILE, so quota telemetry otherwise fails closed before the worker can select any work.
+_COMMON_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian, Ubuntu, NixOS
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, RHEL
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/ca-bundle.pem",  # openSUSE
+    "/etc/ssl/cert.pem",  # macOS, Alpine
+)
+
+
+def _ssl_cert_candidates(env: dict) -> tuple[str | None, ...]:
+    defaults = ssl.get_default_verify_paths()
+    return (env.get("NIX_SSL_CERT_FILE"), defaults.cafile, defaults.openssl_cafile, *_COMMON_CA_BUNDLES)
+
+
+def ensure_ssl_cert_file(env: dict | None = None) -> str | None:
+    """Put a usable system CA bundle in *env* when its Python has no working default.
+
+    Preserve an explicit ``SSL_CERT_FILE`` even when it is unusual: operator configuration wins.
+    Otherwise prefer Nix's advertised bundle, the interpreter's existing default, then common
+    system locations. Return the selected path, or ``None`` when no usable bundle can be found.
+    """
+    base = os.environ if env is None else env
+    configured = base.get("SSL_CERT_FILE")
+    if configured:
+        return configured
+    for raw in _ssl_cert_candidates(base):
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        try:
+            if candidate.is_file():
+                base["SSL_CERT_FILE"] = str(candidate)
+                return str(candidate)
+        except OSError:
+            continue
+    return None
 
 
 def self_argv(*tail) -> list[str]:
@@ -36,6 +78,7 @@ def self_env(env: dict | None = None) -> dict:
     base = dict(os.environ if env is None else env)
     existing = base.get("PYTHONPATH")
     base["PYTHONPATH"] = os.pathsep.join([str(HERE)] + ([existing] if existing else []))
+    ensure_ssl_cert_file(base)
     return base
 
 

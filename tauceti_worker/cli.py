@@ -54,7 +54,7 @@ from .config import (
 from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, OPENROUTER_MODELS, TAUCETI, WORK_TASKS
 from .github import GitHub
 from .loop import cmd_loop, resolve_work_model
-from .paths import HERE
+from .paths import HERE, ensure_ssl_cert_file
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
@@ -747,6 +747,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
 
 def cli_main() -> int:
     """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
+    # A service has no login shell to provide NIX_SSL_CERT_FILE, and uv's standalone CPython may not
+    # know the host's CA-bundle path. Repair the environment before quota telemetry or child launches.
+    ensure_ssl_cert_file()
     _ensure_scripts_executable()
     try:
         return main() or 0
