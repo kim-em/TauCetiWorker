@@ -1334,18 +1334,21 @@ def _service_environment() -> dict[str, str]:
     runtime_bundle = ensure_ssl_cert_file({})
     configured = os.environ.get("SSL_CERT_FILE")
     advertised = os.environ.get("NIX_SSL_CERT_FILE")
-    if configured and configured not in (runtime_bundle, advertised):
+    advertised_path = None
+    if advertised:
+        try:
+            candidate = Path(advertised).expanduser()
+            if candidate.is_file():
+                advertised_path = str(candidate)
+        except (OSError, RuntimeError):
+            pass
+    if configured and configured not in (runtime_bundle, advertised_path):
         # Explicit operator configuration wins, including an unusual or currently absent path.
         service_env["SSL_CERT_FILE"] = configured
-    elif runtime_bundle is None:
+    elif advertised_path:
         # The unit may outlive a Nix store path. Preserve it as a candidate, not as the final
         # SSL_CERT_FILE, so cli_main revalidates it and can fall back or warn after collection.
-        if advertised:
-            try:
-                if Path(advertised).expanduser().is_file():
-                    service_env["NIX_SSL_CERT_FILE"] = advertised
-            except (OSError, RuntimeError):
-                pass
+        service_env["NIX_SSL_CERT_FILE"] = advertised_path
     return service_env
 
 
