@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -829,6 +830,63 @@ def mirror_creds(cfg: Config) -> None:
         )
 
 
+def _jwt_claims(token: str | None) -> dict:
+    """Best-effort decode of a JWT's payload. These tokens are read for IDENTITY ONLY — never to make
+    an authorization decision — so an unparseable one degrades to "unknown account" rather than raising:
+    the signature is not checked, and a forged token would only mislabel a credential the forger already
+    holds. Returns {} for anything that is not a decodable JWT payload object."""
+    if not token or token.count(".") != 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _para(text: str) -> str:
+    """Wrap one paragraph for a terminal. These messages interpolate email addresses of wildly varying
+    length, so hand-wrapped source lines go ragged for the operators who most need to read them.
+
+    Never split a long word: the long words here are paths and email addresses, and both must survive
+    intact to be copied, pasted, or compared. Default textwrap would break them at their hyphens
+    (`kevin-other@…`, `/home/kim/.codex-tauceti`), so an over-width line is the lesser evil."""
+    return textwrap.fill(" ".join(text.split()), width=88, break_long_words=False, break_on_hyphens=False)
+
+
+@dataclass(frozen=True)
+class CodexAccount:
+    """Which ChatGPT account a Codex credential will spend under.
+
+    `conflict` means the credential's own identity claims disagree with each other, which is what a
+    half-written auth.json looks like (an external swapper interrupted between fields, say). We report
+    it rather than picking a winner: a mismatch we describe wrongly is worse than one we decline to
+    resolve, since the whole point of --account is to be believed."""
+
+    auth_mode: str | None
+    account_id: str | None
+    email: str | None
+    plan: str | None
+    conflict: bool = False
+
+    @property
+    def describes_an_account(self) -> bool:
+        """False for an API-key credential, which carries no ChatGPT account identity at all."""
+        return bool(self.account_id or self.email)
+
+    def matches(self, requested: str) -> bool:
+        """--account accepts either the email or the workspace UUID; both are what the operator can
+        actually see (the email in ChatGPT's UI, the UUID in `tauceti doctor`)."""
+        want = requested.strip().lower()
+        return bool(want) and want in {v.lower() for v in (self.email, self.account_id) if v}
+
+    def describe(self) -> str:
+        who = self.email or self.account_id or f"an unidentified {self.auth_mode or 'unknown'} credential"
+        return f"{who} (plan: {self.plan})" if self.plan else who
+
+
 class Quota:
     """The pacer. Every read here is pure: it may fetch usage and cache it, but it never spends quota.
     Breaking a post-reset deadlock costs a real request, so it lives behind one explicit method —
@@ -890,16 +948,133 @@ class Quota:
         tok = auth.get("tokens") or {}
         if tok.get("account_id"):
             return tok["account_id"]
-        idt = tok.get("id_token")
-        if idt and idt.count(".") == 2:
-            try:
-                payload = idt.split(".")[1]
-                payload += "=" * (-len(payload) % 4)
-                claims = json.loads(base64.urlsafe_b64decode(payload))
-                return claims.get("chatgpt_account_id") or claims.get("account_id")
-            except Exception:
-                return None
-        return None
+        claims = _jwt_claims(tok.get("id_token"))
+        return claims.get("chatgpt_account_id") or claims.get("account_id") or None
+
+    def codex_account(self) -> CodexAccount | None:
+        """Identity of the Codex account this worker's credential spends under, or None with no
+        credential file at all.
+
+        Read from $CODEX_HOME/auth.json, because that is the file `codex` itself reads — `codex login
+        status` prints only "Logged in using ChatGPT" and no email, and the model cannot introspect its
+        own account, so the credential is the single honest source. Both tokens carry the identity; we
+        take the union and flag disagreement rather than trusting one. The access token is listed first
+        for each field: it is the credential the request actually goes out under, and a refresh rotates
+        it, so where the two could ever drift it is the one that describes the spend."""
+        auth = self._codex_creds()
+        if auth is None:
+            return None
+        tok = auth.get("tokens") or {}
+        acc = _jwt_claims(tok.get("access_token"))
+        idt = _jwt_claims(tok.get("id_token"))
+        acc_auth = acc.get("https://api.openai.com/auth") or {}
+        idt_auth = idt.get("https://api.openai.com/auth") or {}
+        acc_profile = acc.get("https://api.openai.com/profile") or {}
+
+        def _one(*values) -> tuple[str | None, bool]:
+            """(the value, whether the sources disagreed). Case-insensitive: an email differing only in
+            case is the same account, and reporting that as a conflict would be a false alarm."""
+            seen = [v.strip() for v in values if isinstance(v, str) and v.strip()]
+            return (seen[0] if seen else None, len({v.lower() for v in seen}) > 1)
+
+        account_id, id_conflict = _one(
+            acc_auth.get("chatgpt_account_id"), tok.get("account_id"), idt_auth.get("chatgpt_account_id")
+        )
+        email, email_conflict = _one(acc_profile.get("email"), idt.get("email"))
+        plan, _ = _one(acc_auth.get("chatgpt_plan_type"), idt_auth.get("chatgpt_plan_type"))
+        return CodexAccount(
+            auth_mode=auth.get("auth_mode"),
+            account_id=account_id,
+            email=email,
+            plan=plan,
+            conflict=id_conflict or email_conflict,
+        )
+
+    def _codex_creds_source(self) -> Path:
+        """The credential location the OPERATOR must edit to change this worker's Codex account. Under an
+        isolated home that is NOT the file we read: we read a mirror, and isolate_home leaves a marker
+        naming the real one. Telling an isolated worker's operator to re-login into the mirror would send
+        them to a file mirror_creds() overwrites from the original on the next round."""
+        d = codex_dir(self.cfg.home)
+        src = _read_marker(d / ".tauceti-creds-source")
+        return Path(src) if src else d
+
+    def codex_account_problem(self, requested: str) -> str | None:
+        """None if this worker's Codex credential is the account the operator asked for; otherwise the
+        message to fail with. Actionable by construction: every branch ends in a command to run, because
+        the operator hitting this cannot see which account they are on by any other means."""
+        acct = self.codex_account()
+        src = self._codex_creds_source()
+
+        def switch_with(lead: str) -> str:
+            """The switch instructions under a branch-appropriate lead-in — "switch" is the wrong verb
+            when there is no credential yet, or when the one present is an API key."""
+            return (
+                _para(lead)
+                + "\n\n"
+                + "    codex logout\n"
+                + f"    codex login       # sign in as {requested}\n\n"
+                + _para(
+                    f"Codex has no account picker — it completes as whichever ChatGPT account your "
+                    f"browser is already signed into. If that is not {requested}, sign out of "
+                    f"chatgpt.com first, or paste the URL codex prints into a private window."
+                )
+                + "\n\n"
+                + _para("Then re-run TauCeti; this check will confirm it took.")
+            )
+
+        isolated = (
+            _para("To keep both accounts on this machine you can use an isolated $CODEX_HOME, like this:")
+            + "\n\n"
+            + f"    CODEX_HOME=~/.codex-tauceti codex login       # sign in as {requested}\n"
+            + f"    CODEX_HOME=~/.codex-tauceti tauceti work --agent codex --account {requested}"
+        )
+        if acct is None:
+            return (
+                _para(f"--account {requested}, but there is no Codex credential at {src}.")
+                + "\n\n"
+                + switch_with("To authenticate this machine's Codex:")
+            )
+        if not acct.describes_an_account:
+            # An API-key credential is a valid way to run codex, but it carries no ChatGPT account
+            # identity, so --account cannot be honoured either way. Say that, rather than reporting a
+            # mismatch against an account that does not exist.
+            kind = "an API key" if acct.auth_mode == "apikey" else f"a {acct.auth_mode or 'unrecognised'} credential"
+            return (
+                _para(
+                    f"--account {requested}, but {src}/auth.json holds {kind}, which carries no ChatGPT "
+                    f"account identity — --account cannot be verified against it."
+                )
+                + "\n\n"
+                + switch_with("To run under a named ChatGPT account instead:")
+            )
+        if acct.conflict:
+            return (
+                _para(
+                    f"--account {requested}, but the identity claims in {src}/auth.json disagree with "
+                    f"each other, so TauCeti cannot say which account it would spend under. That is what "
+                    f"a half-written credential looks like — if something was rotating it, let that "
+                    f"finish before re-running."
+                )
+                + "\n\n"
+                + switch_with("Otherwise, re-authenticate:")
+            )
+        if acct.matches(requested):
+            return None
+        return (
+            _para(
+                f"--account {requested}, but {src}/auth.json is authenticated as {acct.describe()}. "
+                f"TauCeti will not switch accounts for you."
+            )
+            + "\n\n"
+            + switch_with("To switch this machine's Codex account:")
+            + "\n\n"
+            + _para(
+                f"Note `codex logout` revokes {acct.email or acct.account_id}'s session, so you will "
+                f"have to sign in again to use it."
+            )
+            + f"\n\n{isolated}"
+        )
 
     def codex_account_fingerprint(self) -> str | None:
         """Stable, non-secret cache identity for the Codex account currently used by this worker."""

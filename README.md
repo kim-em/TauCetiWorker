@@ -278,6 +278,32 @@ without downgrading. The real authoring prompt is always executed exactly once.
 An explicit `--author-model`, `TAUCETI_AUTHORING_CODEX_MODEL`, or legacy
 `TAUCETI_CODEX_MODEL` is a pin and bypasses the probe and fallback.
 
+### Which account: `--account`
+
+TauCeti spends whatever account the agent CLIs are already logged into. If you have
+several ChatGPT accounts and care which one pays, `--account` makes that explicit:
+
+```bash
+tauceti doctor                 # shows which Codex account the credential is for
+tauceti work --agent codex --account you@example.com
+```
+
+The flag is a check, never a switch. If the credential is for a different account,
+the round exits before spending anything and tells you how to change it. Codex only:
+its credential carries the account identity, and `codex login status` will not print
+it (it says just "Logged in using ChatGPT"), so this is the only way to see it.
+
+To change accounts, `codex logout && codex login`. Note that codex's browser flow has
+no account picker, so it completes as whichever ChatGPT account your browser is
+already signed into, and that `codex logout` revokes the old session rather than
+merely forgetting it locally. To run TauCeti on one account while your interactive
+`codex` keeps another, give it a private credential directory instead:
+
+```bash
+CODEX_HOME=~/.codex-tauceti codex login        # sign in as the TauCeti account
+CODEX_HOME=~/.codex-tauceti tauceti work --agent codex --account you@example.com
+```
+
 ### Where it runs: the host, or `--bubble`
 
 Every round runs its agent directly on the host by default. It's fast, but the
@@ -473,6 +499,7 @@ is in `tauceti work -h`.
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
+| `--account EMAIL_OR_ID` | Require the Codex credential to be this account (email, or the workspace UUID `tauceti doctor` prints) and refuse to run otherwise. Checks only; never switches. Needs an explicit `--agent codex`. |
 | `--ignore-quota` | Skip the pacer (needs an explicit `--agent codex\|claude`). |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): allow ≤ budget% used by elapsed%, interpolated; time 0/100 default to 0/100. Default is `used% ≤ elapsed%`. |
@@ -492,10 +519,12 @@ Flags win over these. Most are tuning knobs with sane defaults; you rarely set t
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own, for `--roadmap-extra-identities`. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
+| `TAUCETI_ACCOUNT` | _(unset)_ | Default for `--account`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% ≤ elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
+| `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds (the default; bubble rounds run `claude` inside the container); split as a shell word list, the usual flags appended. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. Explicit model/effort override those fields while unrelated host configuration remains available; an explicit model disables automatic fallback. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |

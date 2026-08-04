@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""--account asserts WHICH ChatGPT account a Codex round will spend under, and stops the round when it
+is the wrong one. Nothing else can answer that question: `codex login status` prints only "Logged in
+using ChatGPT" (no email), and the model cannot introspect its own account — so the identity is read
+out of $CODEX_HOME/auth.json, which is the file `codex` itself authenticates with.
+
+The properties that matter, and why each is a property rather than an implementation detail:
+  - identity comes from BOTH JWTs, and disagreement between them is reported, not resolved (a
+    half-written credential must not be silently labelled as one account or the other);
+  - an API-key credential has no account identity at all, and says so instead of reporting a mismatch;
+  - a mismatch NEVER switches accounts — it fails with instructions, which is the whole contract;
+  - the message points at the operator's REAL ~/.codex under an isolated home, not at the mirror the
+    worker reads (re-authenticating into the mirror would be undone by the next round's re-mirror).
+
+Exit 0 = every case agrees; 1 = a mismatch.
+"""
+
+import base64
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
+
+fails = 0
+
+
+def check(name, got, want):
+    global fails
+    ok = got == want
+    fails += not ok
+    print(f"[{'OK ' if ok else 'XX '}] {name}: got {got!r} want {want!r}")
+
+
+def check_in(name, needle, haystack):
+    global fails
+    ok = needle in (haystack or "")
+    fails += not ok
+    print(f"[{'OK ' if ok else 'XX '}] {name}: {'found' if ok else 'MISSING'} {needle!r}")
+
+
+def jwt(claims: dict) -> str:
+    """A JWT with a real payload and junk header/signature — the reader must never verify a signature
+    (it reads identity, not authorization), so unsigned fixtures are the honest test input."""
+    body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"header.{body}.signature"
+
+
+def auth_json(*, email="a@example.com", acct="acct-1", plan="pro", id_email=None, id_acct=None):
+    """A ChatGPT-mode auth.json in codex's real shape. id_* override the id_token's claims so the two
+    tokens can be made to disagree."""
+    return {
+        "OPENAI_API_KEY": None,
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "account_id": acct,
+            "access_token": jwt(
+                {
+                    "https://api.openai.com/auth": {"chatgpt_account_id": acct, "chatgpt_plan_type": plan},
+                    "https://api.openai.com/profile": {"email": email},
+                }
+            ),
+            "id_token": jwt(
+                {
+                    "email": id_email or email,
+                    "https://api.openai.com/auth": {"chatgpt_account_id": id_acct or acct},
+                }
+            ),
+            "refresh_token": "rt",
+        },
+    }
+
+
+tmp = tempfile.mkdtemp(prefix="tauceti-account-")
+home = Path(tmp) / "home"
+codex = home / ".codex"
+codex.mkdir(parents=True)
+_saved_env = os.environ.get("CODEX_HOME")
+os.environ.pop("CODEX_HOME", None)  # codex_dir() must resolve <home>/.codex, not the runner's own
+
+
+class Cfg:
+    home = home
+    quota_cache = Path(tmp) / "quota-cache"  # never written here (no usage fetch), but Quota reads it
+
+
+def write(auth):
+    (codex / "auth.json").write_text(json.dumps(auth))
+
+
+def q():
+    return tc.Quota(Cfg)
+
+
+try:
+    # --- reading the identity ---------------------------------------------------------------------
+    write(auth_json(email="kim@example.com", acct="acct-kim", plan="pro"))
+    a = q().codex_account()
+    check("email from the access token", a.email, "kim@example.com")
+    check("account id", a.account_id, "acct-kim")
+    check("plan", a.plan, "pro")
+    check("no conflict when the tokens agree", a.conflict, False)
+    check("describes an account", a.describes_an_account, True)
+    check("describe() is operator-readable", a.describe(), "kim@example.com (plan: pro)")
+
+    # Matching accepts either identifier, and is case-insensitive: an operator typing their own email
+    # in a different case has not asked for a different account.
+    check("matches the email", a.matches("kim@example.com"), True)
+    check("matches the email, any case", a.matches("Kim@Example.COM"), True)
+    check("matches the account id", a.matches("acct-kim"), True)
+    check("does not match another account", a.matches("other@example.com"), False)
+    check("empty string matches nothing", a.matches("  "), False)
+
+    # The id_token alone must be enough: codex refreshes tokens, and a credential written by some other
+    # tool need not carry the same fields.
+    only_id = auth_json(email="kim@example.com", acct="acct-kim")
+    del only_id["tokens"]["access_token"]
+    del only_id["tokens"]["account_id"]
+    write(only_id)
+    check("email from the id token alone", q().codex_account().email, "kim@example.com")
+
+    # --- disagreement is reported, not resolved ----------------------------------------------------
+    write(auth_json(email="kim@example.com", id_email="someone-else@example.com"))
+    check("conflicting emails -> conflict", q().codex_account().conflict, True)
+    write(auth_json(acct="acct-kim", id_acct="acct-other"))
+    check("conflicting account ids -> conflict", q().codex_account().conflict, True)
+    write(auth_json(email="kim@example.com", id_email="KIM@EXAMPLE.COM"))
+    check("case-only email difference is NOT a conflict", q().codex_account().conflict, False)
+
+    # A truncated/garbage token degrades to "unknown", never raises: the pacer and the dashboard read
+    # this on every refresh, and a crash there would take down paths that have nothing to do with it.
+    broken = auth_json()
+    broken["tokens"]["access_token"] = "not-a-jwt"
+    broken["tokens"]["id_token"] = "also.not.valid"
+    write(broken)
+    a = q().codex_account()
+    check("unparseable tokens do not raise", a.email, None)
+    check("unparseable tokens still yield the account id", a.account_id, "acct-1")
+
+    # --- the enforcement contract ------------------------------------------------------------------
+    write(auth_json(email="kim@example.com", acct="acct-kim", plan="pro"))
+    check("requested account present -> no problem", q().codex_account_problem("kim@example.com"), None)
+    check("matched by id -> no problem", q().codex_account_problem("acct-kim"), None)
+
+    msg = q().codex_account_problem("other@example.com")
+    check("wrong account -> a problem", msg is None, False)
+    check_in("names the requested account", "other@example.com", msg)
+    check_in("names the account actually authenticated", "kim@example.com", msg)
+    check_in("states that TauCeti will not switch", "will not switch accounts", msg)
+    check_in("gives the switch command", "codex login", msg)
+    # The account picker is the step that actually fails for someone with several ChatGPT accounts:
+    # codex's OAuth flow sends no prompt=select_account, so it completes as whoever the browser is.
+    check_in("warns there is no account picker", "no account picker", msg)
+    check_in("warns that logout revokes the other session", "revokes", msg)
+    check_in("offers an isolated CODEX_HOME", "CODEX_HOME=", msg)
+
+    # An API key is a legitimate way to run codex, but carries no ChatGPT account identity. Reporting a
+    # MISMATCH there would name an account that does not exist; say what is actually wrong instead.
+    write({"OPENAI_API_KEY": "sk-test", "auth_mode": "apikey", "tokens": {}})
+    a = q().codex_account()
+    check("api key -> describes no account", a.describes_an_account, False)
+    msg = q().codex_account_problem("kim@example.com")
+    check_in("api key -> explains there is no identity to check", "no ChatGPT account identity", msg)
+    check_in("api key -> still says how to get one", "codex login", msg)
+
+    # No credential at all.
+    (codex / "auth.json").unlink()
+    check("no credential -> codex_account() is None", q().codex_account(), None)
+    check_in("no credential -> says so", "no Codex credential", q().codex_account_problem("kim@example.com"))
+
+    # --- the message must point at the OPERATOR's file, not the worker's mirror --------------------
+    # Under an isolated home the worker reads a copy; mirror_creds() overwrites it from the original
+    # every round, so re-authenticating into the copy would be silently undone.
+    real = Path(tmp) / "real-home" / ".codex"
+    real.mkdir(parents=True)
+    write(auth_json(email="kim@example.com"))
+    (codex / ".tauceti-creds-source").write_text(str(real))
+    msg = q().codex_account_problem("other@example.com")
+    check_in("isolated home -> names the real credential source", str(real), msg)
+    check("isolated home -> does NOT name the mirror", str(codex / "auth.json") in msg, False)
+    (codex / ".tauceti-creds-source").unlink()
+
+    # --- the round-level gate ----------------------------------------------------------------------
+    def opts(account=None, work_model="codex"):
+        return tc.RoundOpts(
+            only=["review"],
+            agent=work_model,
+            work_model=work_model,
+            sandbox_host=True,
+            dry_run=False,
+            account=account,
+        )
+
+    write(auth_json(email="kim@example.com", acct="acct-kim"))
+    tc.work_units.raise_on_account_mismatch(Cfg, opts("kim@example.com"), "test")  # must not raise
+    print("[OK ] matching account: the gate passes")
+
+    raised = ""
+    try:
+        tc.work_units.raise_on_account_mismatch(Cfg, opts("other@example.com"), "preflight")
+    except tc.Die as e:
+        raised = str(e)
+    check("wrong account -> Die (exit, not a retry loop)", raised.startswith("preflight:"), True)
+    check_in("the Die carries the actionable message", "codex login", raised)
+
+    # No --account is the default and must stay entirely inert.
+    tc.work_units.raise_on_account_mismatch(Cfg, opts(None), "test")
+    print("[OK ] no --account: the gate is inert")
+
+    # --account is Codex-only; a non-codex round must not be failed by a check it cannot perform.
+    tc.work_units.raise_on_account_mismatch(Cfg, opts("other@example.com", work_model="claude"), "test")
+    print("[OK ] non-codex round: the codex credential check does not apply")
+finally:
+    if _saved_env is not None:
+        os.environ["CODEX_HOME"] = _saved_env
+
+print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
+sys.exit(1 if fails else 0)

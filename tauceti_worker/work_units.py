@@ -96,6 +96,8 @@ class RoundOpts:
     # small claude request to open it — at its LAUNCH STAGE (dispatch), never before there is work.
     claude_bootstrap: bool = False
     authoring_profile: AuthoringProfile | None = None
+    # --account: the Codex account this round is REQUIRED to spend under. Checked, never switched to.
+    account: str | None = None
 
     @property
     def agent_name(self) -> str:
@@ -284,6 +286,22 @@ def _host_agent_binary(stage: str, model: str) -> str | None:
     return argv[0] if argv else None
 
 
+def raise_on_account_mismatch(cfg: Config, opts: RoundOpts, where: str) -> None:
+    """Enforce --account: the credential must already BE the requested account, or we stop.
+
+    Die, not NoProgress: a wrong account never heals on its own, so backing off would retry forever
+    with the instructions scrolled away. Exiting is what makes the message readable.
+
+    Checked twice, at round preflight and again at launch, because an external account rotator can move
+    auth.json mid-round — between the check and the spend it is meant to guard."""
+    account = getattr(opts, "account", None)
+    if not account or opts.work_model != "codex":
+        return
+    problem = Quota(cfg).codex_account_problem(account)
+    if problem:
+        raise Die(f"{where}: {problem}")
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Returns its rc, or None if the candidate was claimed by another worker
     (caller tries the next candidate). Dry-run logs the intent and returns 0."""
@@ -315,6 +333,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 f"the worker's PATH and the loop resumes on its own."
             )
             raise NoProgress(f"{stage}: `{binname}` not on PATH — agent '{opts.work_model}' can't run on the host")
+    # Re-check --account here, immediately before the first thing that can spend: the entitlement probe
+    # below already talks to the provider under this credential. run_round re-mirrors the operator's
+    # credentials at the top of every round, so a rotation since preflight is visible by now.
+    if getattr(opts, "account", None):
+        raise_on_account_mismatch(w.cfg, opts, stage)
     if needs_codex_probe:
         # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.

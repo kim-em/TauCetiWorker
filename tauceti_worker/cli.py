@@ -61,7 +61,7 @@ from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
-from .work_units import RoundOpts, Worker, _bubble, run_round, want
+from .work_units import RoundOpts, Worker, _bubble, raise_on_account_mismatch, run_round, want
 from .worker_manager import WorkersError, add_workers_parser, cmd_managed_runner, cmd_workers
 
 # ============================================================================
@@ -106,8 +106,11 @@ environment (flags win; see README.md for the full list):
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
+  TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
+  CODEX_HOME             Codex config/credential source; point it at a private directory to give
+                         TauCeti its own Codex account without disturbing your interactive one
 """
 
 
@@ -143,6 +146,15 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
         "or deepseek/minimax (pay-per-token OpenRouter, asked for by name) "
         "(default: $TAUCETI_AGENT or auto)",
+    )
+    p.add_argument(
+        "--account",
+        default=os.environ.get("TAUCETI_ACCOUNT"),
+        metavar="EMAIL_OR_ID",
+        help="require the agent's credential to be this account (email, or the workspace UUID "
+        "`tauceti doctor` prints), and refuse to run otherwise. TauCeti never switches accounts; "
+        "this only checks, and the error says how to switch. Codex only, and needs an explicit "
+        "--agent codex (or $TAUCETI_ACCOUNT)",
     )
     p.add_argument(
         "--author-model",
@@ -418,6 +430,21 @@ def main(argv: list[str] | None = None) -> int:
     if cmd in ("work", "_round"):
         only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
         agent = resolve_agent(args)
+        # --account names a CODEX account, so the round must be committed to Codex before it starts.
+        # Under `auto` the pacer may legitimately land on Claude, and there is no honest answer then:
+        # silently ignoring the flag would spend on an account the operator did not authorise, and
+        # failing at that point would look like TauCeti reneging on `auto`. Refuse up front instead.
+        if getattr(args, "account", None) and agent != "codex":
+            raise Die(
+                f"--account is a Codex account check, so it needs an explicit --agent codex; got "
+                f"--agent {agent}. "
+                + (
+                    "`auto` may pick Claude, which has no account to check against."
+                    if agent == "auto"
+                    else "TauCeti cannot check a Claude account: unlike Codex, Claude Code keeps no "
+                    "account identity in the credential this worker mirrors."
+                )
+            )
         return cmd_work(args, only=only, agent=agent, one_round=(cmd == "_round"))
     if cmd == "doctor":
         return cmd_doctor(args)
@@ -601,7 +628,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             # and passed the authorization down (--claude-bootstrap). Same launch-stage gate either way.
             claude_bootstrap=pending_init or getattr(args, "claude_bootstrap", False),
             authoring_profile=authoring_profile,
+            account=getattr(args, "account", None),
         )
+        # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
+        # so it is the one run that most needs to answer "am I on the right account?". The check is a
+        # file read, so it costs a dry run nothing.
+        raise_on_account_mismatch(cfg, opts, "account")
         if not dry:
             preflight(cfg, opts)
         return run_round(w, opts)  # NoProgress/Die propagate to main()'s handler
@@ -653,6 +685,18 @@ def cmd_doctor(args) -> int:
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
     codex_creds = codex_dir(cfg.home) / "auth.json"
     rows.append(("codex creds", _safe_exists(codex_creds), str(codex_creds)))
+    # Which Codex account those credentials spend under. `codex login status` will not tell you (it
+    # prints "Logged in using ChatGPT" and no email) and the model cannot introspect its own account,
+    # so for anyone juggling several ChatGPT accounts this row is the only way to see where the money
+    # is going. It is also where --account's expected value is read off.
+    acct = Quota(cfg).codex_account()
+    if acct is not None:
+        note = acct.describe()
+        if acct.conflict:
+            note += " — its identity claims disagree; the credential may be half-written"
+        elif acct.email and acct.account_id:
+            note += f", id {acct.account_id}"
+        rows.append(("codex account", acct.describes_an_account and not acct.conflict, note))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
     if _safe_exists(claude_creds) or sys.platform != "darwin":
         rows.append(("claude creds", _safe_exists(claude_creds), str(claude_creds)))
