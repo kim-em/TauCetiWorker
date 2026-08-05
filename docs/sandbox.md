@@ -1,18 +1,21 @@
 # Inside the sandbox
 
-`tauceti work --bubble` runs the agent inside a [bubble](https://github.com/kim-em/bubble)
-container instead of on the host. This page describes what that boundary
-actually enforces. The README covers when to use it.
+`tauceti work --bubble` runs code and review agents inside a
+[Bubble](https://github.com/kim-em/bubble) container instead of on the host.
+Progress-report rounds always run on the host. This page describes what the
+container boundary enforces; the README covers when to use it.
 
 ## What happens in the container
 
-In a bubble round the checkout, `lake build`, and every git and gh call happen
-inside the container:
+The outer worker surveys GitHub, selects a task, and coordinates claims from the
+host. Once it selects a Bubble-eligible task, the task checkout, the agent, and
+the agent's git and gh commands run inside the container. Code-writing rounds
+also run their cache downloads and advisory `lake build` there.
 
-- GitHub traffic goes through bubble's auth proxy, scoped to
-  `TauCetiProject/TauCeti`. A push or API call outside that repo is rejected by
-  the proxy, not just flagged by CI later. Your `gh` token never enters the
-  container.
+- GitHub traffic goes through Bubble's auth proxy. It permits access to
+  `TauCetiProject/TauCeti` and, for authoring and fixes, git push access to the
+  configured fork. Other repository access is rejected by the proxy. Your `gh`
+  token never enters the container.
 - Only the one credential the agent needs is seeded. The other models'
   credentials, and all of your host config (`CLAUDE.md`, skills), stay out.
 - Review runs the `tauceti-review` engine inside the container too, offline. The
@@ -38,11 +41,12 @@ discarded when the container is popped.
 ## Requirements
 
 Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime, and
-TauCetiWorker requires Bubble 0.7.29 or newer. Real sandbox rounds need a stable
-installed executable, because bubble owns a host-global auth daemon; for dry-run
-probes only, `tauceti` will fetch it with `uvx`. `tauceti doctor` reports what is
-missing. `TAUCETI_BUBBLE` overrides the executable and `TAUCETI_BUBBLE_HOME` the
-private bubble home.
+TauCetiWorker requires Bubble 0.7.30 or newer. Real sandbox rounds need a stable
+installed executable because Bubble owns a host-global auth daemon. For dry-run
+capability checks only, `tauceti` can fetch it with `uvx`. `tauceti doctor`
+reports whether the Bubble and Incus executables are present; the round preflight
+checks the Bubble version and capabilities. `TAUCETI_BUBBLE` overrides the
+executable, and `TAUCETI_BUBBLE_HOME` overrides the private Bubble home.
 
 ## OpenRouter agents
 
@@ -62,11 +66,11 @@ The directory is removed after the bubble exits, or before the next round if the
 worker was hard-killed. Your `$CLAUDE_CONFIG_DIR` (or `~/.claude`) is never
 created or overwritten.
 
-Worker versions before this private handoff may already have left a Keychain
-snapshot at `.claude/.credentials.json` under your configured Claude directory.
-This version does not delete that file, because it may be operator-owned. If
-host subscription reviews fail with a 401 while an interactive `claude` still
-works, move that old file aside once so the review can fall back to the live
-Keychain. A headless worker whose Keychain cannot be unlocked still needs a file
-fallback: point `CLAUDE_CONFIG_DIR` at a dedicated directory holding a current
+Worker versions before this private handoff may already have left a
+`.credentials.json` snapshot in your configured Claude directory. This version
+does not delete that file because it may be operator-owned. If host subscription
+reviews fail with a 401 while an interactive `claude` still works, move that old
+file aside once so the review can fall back to the live Keychain. A headless
+worker whose Keychain cannot be unlocked still needs a file fallback: point
+`CLAUDE_CONFIG_DIR` at a dedicated directory holding a current
 `.credentials.json` instead of moving away its only credential source.

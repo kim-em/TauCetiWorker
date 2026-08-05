@@ -42,7 +42,8 @@ tauceti workers apply         # reconcile, starting a manager if needed
 explicit follow-up. A later `enable`, `disable`, `add`, or `remove` normalizes
 the file again, so comments do not survive one.
 
-A minimal file, matching `workers.toml.example`:
+A small configuration might look like this. The repository also includes
+[`workers.toml.example`](../workers.toml.example).
 
 ```toml
 version = 1
@@ -60,7 +61,7 @@ ignore_quota = true
 ```
 
 You can edit `workers.toml` while the manager is running. It reloads the file
-each cycle. If your edit does not parse, the manager keeps the last good
+each cycle. If your edit does not validate, the manager keeps the last good
 generation, leaves running workers alone, and says so once:
 
 ```
@@ -89,32 +90,34 @@ clobbering each other.
 
 ## `workers.toml` reference
 
-The file has exactly two top-level keys: `version`, which must be `1`, and
-`workers`, an array of tables. Any other top-level key is an error, as is any
-unrecognized field inside a `[[workers]]` table. Duplicate ids are rejected.
+The file supports two top-level keys. `version` is required and must be `1`;
+`workers` is an optional array of tables and defaults to an empty array. Any
+other top-level key is an error, as is any unrecognized field inside a
+`[[workers]]` table. Duplicate ids are rejected.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `id` | string | required | `[a-z0-9-]+`, at most 40 characters; namespaces the worker's state, checkout, and logs |
+| `id` | string | required | `[a-z0-9-]+`, at most 40 characters; namespaces the worker's state, checkout, review store, and logs |
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `deepseek`, or `minimax` |
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`. Empty means the whole cascade |
-| `sandbox` | string | `"host"` | `host` or `bubble` |
-| `ignore_quota` | bool | `false` | Skip the pacer. Provider hard limits still apply |
+| `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
+| `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
-| `author_effort` | string | unset | Authoring reasoning effort. Requires an `agent` other than `auto` |
+| `author_effort` | string | unset | Authoring reasoning effort for Codex or Claude. Requires an explicit `agent` |
 | `pace` | string | unset | Pacing curve as `time%:budget%` points, for example `0:10,50:70,90:90` |
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
-| `isolate_home` | bool | `false` | Force per-worker credential isolation even for the id `default` |
-| `restart` | string | `"always"` | `always`, `on-failure` (only after a nonzero exit), or `never` |
+| `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
+| `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
 
-Changing any field changes the worker's fingerprint, and the manager restarts
-exactly the workers whose fingerprint moved.
+The manager fingerprints each definition. It stops a worker when `enabled`
+becomes false and restarts an enabled worker when any other field changes,
+without disturbing unchanged workers.
 
 ## `workers add` flags
 
@@ -127,15 +130,15 @@ entry with `enabled = true`.
 | `--agent AGENT` | `agent` |
 | `--only TASKS` | `only`, as a comma-separated list |
 | `--sandbox {host,bubble}` | `sandbox` |
-| `--ignore-quota` | `ignore_quota` |
+| `--ignore-quota` | `ignore_quota`; use with an explicit subscription agent |
 | `--roadmap-only AREA` | `roadmap_only` |
 | `--roadmap-skip AREAS` | `roadmap_skip`, as a comma-separated list |
-| `--source PATH_OR_URL` | `source` |
+| `--source PATH_OR_URL` | `source`; also requires `roadmap` in `--only` and a non-empty `--roadmap-only` |
 | `--author-model MODEL` | `author_model` |
-| `--author-effort EFFORT` | `author_effort` |
+| `--author-effort EFFORT` | `author_effort`; Codex or Claude only |
 | `--pace CURVE` | `pace` |
 | `--stream` | `stream` |
-| `--isolate-home` | `isolate_home` |
+| `--isolate-home` | `isolate_home`; useful when the id is `default` |
 
 `add` cannot set `roadmap_extra_identities`, `respect_claims`, or `restart`, and
 always writes `enabled = true`. Use `workers edit` for those.
@@ -146,33 +149,40 @@ always writes `enabled = true`. Use `workers edit` for those.
 | --- | --- |
 | _(none)_ | Same as `status` |
 | `status [--json] [--watch]` | Desired and actual state. Exits nonzero if the manager is offline or a wanted worker is not alive |
-| `apply [--check]` | Validate the whole file, then reconcile. `--check` validates only |
+| `apply [--check]` | Validate the TOML schema and manager-level rules, then reconcile. `--check` validates only |
 | `add [ID] [flags]` | Append an enabled definition and reconcile |
 | `enable ID` / `disable ID` | Persist desired running or stopped state |
-| `restart ID` | Restart one worker without changing desired state |
+| `restart ID` | Request a restart without changing desired state; a disabled worker stays stopped |
 | `remove ID` | Drop the definition and stop the worker |
 | `logs ID [--follow] [--lines N]` | The durable console log. `--follow` continues across worker restarts |
 | `tmux [--no-attach]` | Build the optional tmux viewing workspace |
 | `manager [--interval N]` | Run the reconciler in the foreground |
-| `manager-stop [--leave-workers]` | Stop the detached manager, and by default its workers |
+| `manager-stop [--leave-workers]` | Stop the detached manager. By default it also stops its workers |
 | `service ACTION` | `install`, `uninstall`, `start`, `stop`, `restart`, or `status` for the native user service |
-| `edit [--editor CMD]` | Open `workers.toml` in an editor |
-| `import LEGACY [--force]` | One-shot migration from the legacy `workers.conf` format |
+| `edit [--editor CMD]` | Create or open `workers.toml` in an editor; it does not apply the result |
+| `import LEGACY [--force]` | One-shot migration from the legacy `workers.conf` format; it does not start a manager |
 
-Every mutating action (`apply`, `add`, `enable`, `disable`, `remove`, `restart`)
-starts a manager if none is running, and returns only once that manager answers
-a ping.
+`apply` without `--check`, `add`, `enable`, `disable`, `remove`, and `restart`
+start a manager if none is running and return only after it accepts control
+requests. `edit`, `import`, and `apply --check` do not start one.
 
 ## The manager, and running past logout
 
-`workers apply` and friends start a detached manager owned by the current login
-session. For operation that survives logout and comes back after a reboot,
-install the native user service:
+`workers apply` and related actions start a detached manager owned by the current
+login session. To move an existing fleet to a native user service that survives
+logout and comes back after a reboot, leave its workers running while the service
+takes over the manager socket:
 
 ```bash
+tauceti workers manager-stop --leave-workers
 tauceti workers service install
 tauceti workers service status
 ```
+
+Omit `manager-stop` when no detached manager is running. One runtime directory
+can host only one manager and one active configuration at a time. A reconcile
+action that names a different `--config` file reports the conflict instead of
+switching it.
 
 That is a systemd user service on Linux and NixOS, or a LaunchAgent on macOS.
 Two platform caveats:
@@ -193,6 +203,27 @@ cannot silently disable fallback discovery.
 
 The reconciler and the worker control sockets are portable Unix code. No Linux
 `/proc` interface is required.
+
+## Worker ids and credential isolation
+
+Every worker id namespaces its state, checkout, review store, logs, and Bubble
+home. Workers coordinate through GitHub rather than sharing local mutable state,
+so several workers can use one host without sharing a checkout. Review markers,
+branch claims, and compare-and-swap push and PR helpers keep workers from
+overwriting one another when they select the same target.
+
+Every id other than `default` also enables credential isolation. On Linux and
+other non-macOS hosts, the worker gets a private `$HOME` containing private
+Claude and Codex credential copies. GitHub CLI and Git configuration remain
+shared so the worker still acts as the operator's `gh` account. `--isolate-home`
+applies the same isolation when the id is literally `default`.
+
+On macOS, `$HOME` stays unchanged because both Claude Code and GitHub CLI use the
+login Keychain. `tauceti` redirects `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME`, which
+isolates Codex, but host workers still share the login user's Claude account.
+Bubble rounds copy that shared Claude credential into a private transient
+directory without modifying the Keychain. See [the sandbox notes](sandbox.md)
+for that handoff.
 
 ## State on disk
 

@@ -36,21 +36,20 @@ Claude's session and weekly windows reset on separate clocks, so they are read
 independently and neither is inferred from the other. Each window's raw state is
 kept before any pacing is applied.
 
-The structured `limits` array is authoritative per window. The legacy flat keys
-are a fallback for a window that `limits` does not mention, not a second opinion
-that can overrule a broken one.
+The structured `limits` array is authoritative for each window. Legacy flat keys
+are used only when `limits` omits that window; they cannot override a structured
+entry.
 
-A window the response does not carry, or carries as garbage (an unreadable or
-implausible reset timestamp, a non-numeric usage), is a hard block that says what
-it saw:
+A missing window or invalid data, such as an unreadable reset timestamp or
+non-numeric usage, stops the provider and reports the specific problem:
 
 ```
 weekly limit missing from usage response
 session reset timestamp invalid
 ```
 
-rather than a generic "usage unknown". A quota constraint you cannot read is not
-the same as no constraint.
+rather than a generic "usage unknown". An unreadable constraint is not the same
+as no constraint.
 
 ## The window bootstrap
 
@@ -60,12 +59,12 @@ window, so `tauceti` makes one small `claude -p` turn to do it, drops the cached
 usage, and re-reads. The fresh telemetry, not the request, then decides whether a
 round runs.
 
-That spend is fenced in on every side:
+The bootstrap runs only under these conditions:
 
 - It happens at the launch stage of a round that has already found work, so a
   poll that finds nothing to run costs nothing.
-- It needs the *other* window to be active with real headroom. A weekly window
-  that is at budget, over pace, exhausted, missing, or unreadable forbids it.
+- Every other window must be active with real headroom. A window that is at
+  budget, over pace, exhausted, missing, or unreadable forbids the bootstrap.
 - It respects your pace curve. Under a curve whose budget stays at 0 for the
   first stretch of a window, say `--pace 0:0,90:0,100:95`, a fresh window may not
   be opened at all, and the status says so (`pace budget stays 0% through 90% of

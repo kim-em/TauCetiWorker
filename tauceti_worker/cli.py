@@ -88,21 +88,22 @@ examples:
   tauceti work --loop --skip roadmap    the whole cascade except authoring new PRs
   tauceti work --only roadmap --roadmap-only ReductiveGroups
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
-  tauceti work --agent claude --bubble  run Opus inside the bubble sandbox
+  tauceti work --only review --agent claude --bubble
+                                        review with Opus inside the Bubble sandbox
   tauceti work --dry-run                show what it WOULD do; act on nothing
 
-multiple workers (share a host, coordinate through GitHub; a distinct id isolates each):
+multiple workers (share a host and coordinate through GitHub; a distinct id namespaces each):
   tauceti work --loop                   auto-assigns worker1, worker2, ... per terminal
   tauceti work --loop --worker-id alice --only review
   tauceti work --loop --worker-id bob   --only roadmap
 
-environment (flags win; see docs/reference.md for the full list):
+environment (flags win; full reference linked below):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_QUOTA_CMD      default for --quota-cmd
-  TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% <= elapsed%); see --pace
+  TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% < elapsed%); see --pace
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
@@ -111,6 +112,9 @@ environment (flags win; see docs/reference.md for the full list):
                          (account switching, where the creds live in a file)
   CODEX_HOME             Codex config/credential source; point it at a private directory to give
                          TauCeti its own Codex account without disturbing your interactive one
+
+full reference:
+  https://github.com/kim-em/TauCetiWorker/blob/main/docs/reference.md
 """
 
 
@@ -176,9 +180,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--bubble",
         action="store_true",
-        help="run the agent inside the bubble sandbox — its own container, TauCeti-scoped "
-        "credentials, and no open network — instead of directly on the host. Slower to start, "
-        "but the agent never gets your full credentials or network (default: run on the host)",
+        help="run eligible code and review agents inside the Bubble sandbox, with scoped "
+        "credentials and network, instead of directly on the host. Progress reports remain "
+        "on the host (default: run on the host)",
     )
     p.add_argument(
         "--host",
@@ -274,7 +278,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="pacing curve as `time%%:budget%%` control points, e.g. `0:10,50:70,90:90`: cap used%% at "
         "budget%% once time%% of the window has elapsed, linearly interpolated between points. An "
         "unspecified time 0 defaults to budget 0 and time 100 to budget 100. Default (unset) is the "
-        "strict identity used%% <= elapsed%%. Overrides $TAUCETI_PACE for this run (inherited by loop "
+        "strict rule used%% < elapsed%%. Overrides $TAUCETI_PACE for this run (inherited by loop "
         "children)",
     )
     p.add_argument(
@@ -283,8 +287,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         metavar="ID",
         help="run an independent worker under this name: it namespaces the worker's state, "
-        "checkout, review store, and logs, and (for any id other than 'default') gives it "
-        "its own $HOME so credential refreshes don't race. With neither this flag nor "
+        "checkout, review store, and logs, and (for any id other than 'default') isolates "
+        "its credential directories; on non-macOS hosts that includes a private $HOME. "
+        "With neither this flag nor "
         "$TAUCETI_WORKER_ID, `work` auto-assigns the lowest free slot (worker1, worker2, "
         "...) so several terminals on one host coexist without hand-numbering",
     )
@@ -292,7 +297,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--isolate-home",
         dest="isolate_home",
         action="store_true",
-        help="force the per-worker $HOME even for the 'default' worker id (a distinct --worker-id already implies it)",
+        help="force credential isolation for the 'default' worker id (a distinct id already implies it)",
     )
     p.add_argument(
         "--dry-run", dest="dry_run", action="store_true", help="survey + print the picker's decision; act on nothing"
@@ -369,9 +374,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tauceti",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Run 'tauceti work -h' for the work units, examples, multi-worker setup, and\n"
-        "environment variables, and 'tauceti workers -h' for persistent workers.\n"
-        "README.md is the guide; docs/reference.md is the full flag reference.",
+        epilog="Run 'tauceti work -h' for work units and examples, or 'tauceti workers -h'\n"
+        "for persistent workers. Guide and reference:\n"
+        "  https://github.com/kim-em/TauCetiWorker",
     )
     sub = p.add_subparsers(dest="cmd")
 
@@ -381,7 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Do one unit of work and exit, or pass --loop to run the driver. A round picks the\n"
         "first applicable job from the cascade (or from --only), paces subscription agents\n"
-        "against your quota, and runs it on --agent directly on the host (or --bubble for the sandbox).",
+        "against your quota, and runs eligible code and review agents on the host or in Bubble.\n"
+        "Progress-report rounds always run on the host.",
         epilog=WORK_EPILOG,
     )
     add_work_flags(w)

@@ -19,17 +19,26 @@ enough.) Set `TAUCETI_FORK=<owner>/<repo>` to use an existing fork instead.
 
 ## Quickstart
 
-You need `gh` (logged in as the account the worker should act as), `git`, `uv`,
-and `jq`; an `elan`/`lake` toolchain on the host for the default host authoring;
-and the agents you want, meaning `codex` and/or `claude` logged in, or an exported
-`OPENROUTER_API_KEY` for `--agent deepseek|minimax`. `tauceti doctor` checks all
-of it. The `--bubble` sandbox needs more; see [the sandbox notes](docs/sandbox.md).
+You need `gh`, `git`, `uv`, and `jq`. Log `gh` in as the account the worker should
+act as, and log in to each subscription agent you want to use:
+
+```bash
+gh auth login
+codex login            # for --agent codex, or auto
+claude auth login      # for --agent claude, or auto
+```
+
+Code-writing phases on the host also need an `elan`/`lake` toolchain. The
+OpenRouter agents need an exported `OPENROUTER_API_KEY` instead, plus the `pi`
+runner for host rounds; Bubble includes `pi`. The `--bubble` sandbox has
+additional requirements; see [the sandbox notes](docs/sandbox.md).
 
 Install it as a tool, no clone needed:
 
 ```bash
 uv tool install git+https://github.com/kim-em/TauCetiWorker.git
 
+tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
 tauceti work --only review         # one round of a specific kind of work, then exit
@@ -64,12 +73,13 @@ keypresses, no Enter:
 In the Workers view, arrows select a worker, Space persists enabled/disabled
 desired state, Ctrl-R restarts it, and Enter follows its current logfile.
 
-Your agent, sandbox, and roadmap selections persist in a `dashboard.json` beside
-`workers.toml`, so the dashboard reopens where you left it. They are
-dashboard-only: a bare `tauceti work` never reads them, and an explicit
-`TAUCETI_ROADMAP_ONLY` / `TAUCETI_ROADMAP_SKIP` in the environment still wins.
-Over a pipe or with no TTY the dashboard prints a one-shot snapshot instead; use
-`tauceti status` in scripts.
+Your agent, sandbox, and roadmap selections persist in `dashboard.json` under
+the TauCeti config directory, so the dashboard reopens where you left it. They
+are dashboard-only: a bare `tauceti work` never reads them, and an explicit
+`TAUCETI_ROADMAP_ONLY` or `TAUCETI_ROADMAP_SKIP` in the environment still wins.
+Clone-based and installed invocations share this user-level file. Over a pipe or
+with no TTY the dashboard prints a one-shot snapshot instead. Use `tauceti
+status` in scripts.
 
 ## What a round does
 
@@ -80,7 +90,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Rebase** | Resolve one of our conflicting PRs — a genuine content conflict under `TauCeti/` after a sibling merged first (the root `TauCeti.lean` is auto-synced on `main`, so it no longer collides). |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Progress** | When the global eight-hour cadence is due, update one roadmap's generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
-| **Fix CI** | Green one of our PRs whose `build` check is red. It can't be reviewed until it builds, so this comes before Fix. |
+| **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so `awaiting-author` work cannot be starved by unrelated reviews. |
 | **Roadmap** | Otherwise, open a new PR advancing a [roadmap](https://github.com/TauCetiProject/TauCetiRoadmap) target. |
@@ -172,14 +182,15 @@ Every round runs its agent directly on the host by default. It's fast, but the
 agent has your full credentials and network, so keep it for trusted or local
 runs.
 
-`--bubble` runs the agent, the checkout, and every git and gh call inside a
-repo-scoped [bubble](https://github.com/kim-em/bubble) container instead: your
-`gh` token never enters it, only the one credential the agent needs is seeded,
-and none of your host config crosses the boundary. That matters most for review,
-where the agent reads untrusted PRs. It needs an
-[Incus](https://linuxcontainers.org/incus/) runtime; `tauceti doctor` says so if
-you don't have one. See [the sandbox notes](docs/sandbox.md) for what the
-boundary enforces.
+For code and review phases, `--bubble` runs the selected agent and its checkout
+inside a repo-scoped [bubble](https://github.com/kim-em/bubble) container. The
+agent's git and gh traffic goes through Bubble's proxy, your `gh` token never
+enters the container, only the selected agent credential is seeded, and none of
+your host config crosses the boundary. The outer worker still surveys GitHub and
+coordinates the round from the host. Progress-report rounds are the exception:
+they always run on the host. Bubble needs an
+[Incus](https://linuxcontainers.org/incus/) runtime. See
+[the sandbox notes](docs/sandbox.md) for the exact boundary and requirements.
 
 The agent's conversation transcript is noisy, so a round redirects it to a
 timestamped file under `logs/` and prints the path, tailing it if the agent exits
@@ -205,35 +216,24 @@ manager validates the whole file before applying it, starts missing enabled
 workers, gracefully stops disabled or removed ones, restarts only definitions
 that changed, and backs off repeated failures.
 
-You can also write the file by hand, which is how you reach the fields `add`
-does not cover (`restart`, `respect_claims`, `roadmap_extra_identities`):
+For fields that `add` does not expose, run `tauceti workers edit`, validate with
+`tauceti workers apply --check`, then apply. Editing while the manager runs is
+safe: it keeps the last valid generation if the new file fails validation. A
+later `enable`, `disable`, `add`, or `remove` rewrites the file canonically and
+drops comments and hand formatting.
 
-```toml
-version = 1
-
-[[workers]]
-id = "worker2"
-enabled = true
-agent = "codex"
-only = ["rebase", "review"]
-ignore_quota = true
-restart = "on-failure"
-```
-
-then `tauceti workers apply` (or `apply --check` to validate only). Editing it
-while the manager runs is fine; it reconciles, and keeps the last good generation
-if your edit does not parse. Note that a later `enable`/`disable`/`add`/`remove`
-rewrites the file canonically and drops comments; `tauceti workers edit` is there
-for when you want to keep them.
-
-`workers apply` starts a manager for the current login session. For operation
-that survives logout and returns after a reboot, install the native user service,
-a systemd user service on Linux or a LaunchAgent on macOS:
+`workers apply` starts a detached manager for the current login session. To hand
+an existing manager over to a native user service that survives logout and
+returns after a reboot:
 
 ```bash
+tauceti workers manager-stop --leave-workers
 tauceti workers service install
 tauceti workers service status
 ```
+
+This installs a systemd user service on Linux or a LaunchAgent on macOS. Omit
+the first command when no detached manager is running.
 
 Every worker needs a unique id, which `add` assigns for you. The id namespaces
 that worker's state, checkout, review store, and logs, and isolates its mutable
@@ -257,14 +257,15 @@ it cannot read counts as unavailable rather than free. The dashboard and
 
 | Control | Effect |
 | --- | --- |
-| _(default)_ | `used% < elapsed%` on every window |
-| `--pace 0:10,50:70,90:90` | A piecewise-linear `time%:budget%` curve instead: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Budgets ≥ 100 mean no cap. This shapes only the soft pace; a window at 100% used still backs off |
-| `--ignore-quota` | Turn the pacer off, with an explicit `--agent` |
-| `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: first line of stdout is the model to run, empty means wait |
+| _(default)_ | Require `used% < elapsed%` on every window |
+| `--pace 0:10,50:70,90:90` | Use a piecewise-linear `time%:budget%` curve instead: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Usage must remain strictly below the current budget. Budgets ≥ 100 mean no soft cap; a window at 100% used still backs off |
+| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex` or `--agent claude`; hard limits still apply |
+| `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
-`TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the last two by default. After a
-Claude window resets, `tauceti` may make one small request to start its usage
-clock, but only after it has found work and confirmed the other window has room.
+`TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the corresponding controls by
+default. After a Claude window resets, `tauceti` may make one small request to
+start its usage clock, but only after it has found work and confirmed the other
+window has room.
 [The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
 and that bootstrap in detail.
 
