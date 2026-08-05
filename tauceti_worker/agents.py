@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,6 +46,7 @@ from .quota import (
     mirror_creds,
 )
 from .runtime_status import report_failure
+from .transcript import AgentTranscriptRenderer
 
 # ============================================================================
 
@@ -386,16 +388,17 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
         # such as enterprise model providers, MCP servers, and notification hooks.
         env.pop("OPENAI_API_KEY", None)  # Codex rounds are paced against ChatGPT subscription usage
-        argv = ["codex", "exec", "--model", profile.model]
+        argv = ["codex", "exec", "--json", "--model", profile.model]
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
+        argv += ["-c", 'model_reasoning_summary="detailed"', "-c", "show_raw_agent_reasoning=false"]
         argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
         env.pop("ANTHROPIC_API_KEY", None)
         base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
-        argv = [*base, "-p", prompt, "--model", profile.model]
+        argv = [*base, "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
         argv += ["--dangerously-skip-permissions"]
@@ -408,7 +411,14 @@ def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logd
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(argv, env=env, cwd=cwd, logdir=logdir, label=f"agent-{profile.provider}")
+    return run_agent_proc(
+        argv,
+        env=env,
+        cwd=cwd,
+        logdir=logdir,
+        label=f"agent-{profile.provider}",
+        provider=profile.provider,
+    )
 
 
 # Provider statuses that mean "the service could not serve this request right now", as opposed to
@@ -488,54 +498,108 @@ _LAST_AGENT_FAILURE: str | None = None
 
 
 def take_last_agent_infra_failure() -> str | None:
-    """The infrastructure reason the last agent subprocess failed, or None (agent's own failure, no
-    agent run yet, or --stream, which keeps no log to classify). Reads AND CLEARS: a refund is granted
-    against one observed failure, so a second caller must not be able to spend the same one twice."""
+    """The infrastructure reason the last agent subprocess failed, or None (agent's own failure or no
+    agent run yet). Reads AND CLEARS: a refund is granted against one observed failure, so a second
+    caller must not be able to spend the same one twice."""
     global _LAST_AGENT_FAILURE
     reason, _LAST_AGENT_FAILURE = _LAST_AGENT_FAILURE, None
     return reason
 
 
-def run_agent_proc(argv: list[str], *, env: dict, logdir: Path, label: str, cwd: Path | None = None) -> int:
-    """Run an agent subprocess. The agent CLIs (codex/claude/pi) stream a very noisy conversation log;
-    by default we redirect it to a timestamped file under logdir and print only the path, so the round
-    output stays readable. Pass --stream (TAUCETI_STREAM=1) to watch it live on the terminal instead.
-    On a non-zero exit we always tail the log so failures aren't silent."""
+def run_agent_proc(
+    argv: list[str],
+    *,
+    env: dict,
+    logdir: Path,
+    label: str,
+    provider: str,
+    cwd: Path | None = None,
+) -> int:
+    """Run an agent subprocess through its readable transcript renderer.
+
+    By default the normalized transcript goes to a timestamped file under logdir. ``--stream`` sends
+    the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
+    failures aren't silent.
+    """
     global _LAST_AGENT_FAILURE
     _LAST_AGENT_FAILURE = None
     cwds = str(cwd) if cwd is not None else None
     # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
     # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
     # Codex then treats it as additional prompt input and waits forever for EOF.
+    renderer = AgentTranscriptRenderer(provider)
+    tail: deque[str] = deque(maxlen=20)
+
+    def write_rendered(destination, rendered: str) -> None:
+        # TextIOWrapper defaults to strict encoding errors. Preserve live streaming even under a
+        # non-UTF-8 locale by replacing characters that the terminal encoding cannot represent.
+        encoding = getattr(destination, "encoding", None)
+        if encoding:
+            rendered = rendered.encode(encoding, errors="replace").decode(encoding)
+        destination.write(rendered)
+        destination.flush()
+        tail.extend(rendered.splitlines())
+
+    def run_rendered(destination) -> int:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwds,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                rendered = renderer.render_line(line)
+                if rendered:
+                    write_rendered(destination, rendered)
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            proc.stdout.close()
+        rc = proc.wait()
+        if provider in {"codex", "claude"} and not renderer.active:
+            write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
+        return rc
+
+    def classify_rendered_failure() -> str | None:
+        # A refund asserts that the agent never ran. Structured work events are stronger evidence
+        # than transcript length, while a final structured provider diagnostic is stronger evidence
+        # than Bubble prelude lines. A retry event alone is deliberately not terminal evidence.
+        if provider in {"codex", "claude"} and renderer.saw_work:
+            return None
+        classification_text = "\n".join(tail)
+        if renderer.terminal_failure_final and renderer.terminal_failure_text:
+            classification_text = renderer.terminal_failure_text
+        return classify_agent_failure(classification_text)
+
     if os.environ.get("TAUCETI_STREAM"):
-        rc = subprocess.run(argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL).returncode
+        rc = run_rendered(sys.stdout)
         if rc != 0:
+            _LAST_AGENT_FAILURE = classify_rendered_failure()
             report_failure(f"{label.removeprefix('agent-')} agent exited with status {rc}", code=rc)
         return rc
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"{label}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     log(f"{label}: output → {logf}  (run with --stream to watch live)")
-    with open(logf, "ab") as f:
-        rc = subprocess.run(
-            argv, cwd=cwds, env=env, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT
-        ).returncode
+    with open(logf, "a", encoding="utf-8", errors="replace") as f:
+        rc = run_rendered(f)
     if rc != 0:
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
-        tail: list[str] = []
-        try:
-            tail = logf.read_text(errors="replace").splitlines()[-20:]
-            for line in tail:
-                print("    " + line)
-        except OSError:
-            pass
+        for line in tail:
+            print("    " + line)
         summary = next((line.strip() for line in reversed(tail) if line.strip()), "")
         reason = f"{label.removeprefix('agent-')} agent exited with status {rc}"
         if summary:
             reason += f": {summary}"
-        # Classify over the tail we already read, not the whole log: a provider failure is the last
-        # thing the CLI writes, and an earlier retry it recovered from must not be mistaken for the
-        # outcome. The caller decides what to do with this; recording it here is free.
-        _LAST_AGENT_FAILURE = classify_agent_failure("\n".join(tail))
+        _LAST_AGENT_FAILURE = classify_rendered_failure()
         report_failure(reason, code=rc, log_file=logf)
     return rc
 
@@ -887,8 +951,11 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     if profile.provider == "codex":
         effort_config = f'model_reasoning_effort="{profile.effort}"'
         effort = f" -c {shlex.quote(effort_config)}" if profile.effort else ""
+        summary = shlex.quote('model_reasoning_summary="detailed"')
+        raw_reasoning = shlex.quote("show_raw_agent_reasoning=false")
         return (
-            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --model {shlex.quote(profile.model)}{effort} "
+            f"env OPENAI_API_KEY= ANTHROPIC_API_KEY= codex exec --json --model "
+            f"{shlex.quote(profile.model)}{effort} -c {summary} -c {raw_reasoning} "
             '--sandbox danger-full-access --skip-git-repo-check "$(cat /opt/round/prompt.txt)"'
         )
     if profile.provider in OPENROUTER_MODELS:
@@ -900,7 +967,8 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     effort = f" --effort {shlex.quote(profile.effort)}" if profile.effort else ""
     return (
         'env ANTHROPIC_API_KEY= OPENAI_API_KEY= CLAUDECODE= claude -p "$(cat /opt/round/prompt.txt)" '
-        f"--model {shlex.quote(profile.model)}{effort} --dangerously-skip-permissions"
+        f"--output-format stream-json --verbose --model {shlex.quote(profile.model)}{effort} "
+        "--dangerously-skip-permissions"
     )
 
 
@@ -1122,7 +1190,13 @@ def run_in_bubble(
     w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
-            rc = run_agent_proc(argv, env=env, logdir=cfg.logdir, label=f"agent-{wm}")
+            rc = run_agent_proc(
+                argv,
+                env=env,
+                logdir=cfg.logdir,
+                label=f"agent-{wm}",
+                provider=profile.provider,
+            )
         else:  # review engine / probe — leave its output inline
             rc = subprocess.run(argv, env=env).returncode
     finally:

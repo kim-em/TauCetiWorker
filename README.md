@@ -192,9 +192,13 @@ they always run on the host. Bubble needs an
 [Incus](https://linuxcontainers.org/incus/) runtime. See
 [the sandbox notes](docs/sandbox.md) for the exact boundary and requirements.
 
-The agent's conversation transcript is noisy, so a round redirects it to a
-timestamped file under `logs/` and prints the path, tailing it if the agent exits
-non-zero. Pass `--stream` to watch it live instead.
+The agent's conversation transcript is normalized into readable narration,
+reasoning summaries, tool activity, and results. File edits are listed by path
+instead of repeating full diffs; tool inputs are bounded, and tool results over
+64 KiB keep their first and last 32 KiB with an omitted-byte marker. Raw thinking
+is never included. A round redirects this transcript to a timestamped file under
+`logs/` and prints the path, tailing it if the agent exits non-zero. Pass
+`--stream` to watch the identical transcript live instead.
 
 ## Persistent workers
 

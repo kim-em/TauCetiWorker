@@ -40,12 +40,31 @@ try:
     check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
     default_host, _ = tc.host_agent_argv("PROMPT", codex)
     default_bubble = tc.agent_inner_cmd(codex)
-    check("default Codex host launch is direct", default_host[:3], ["codex", "exec", "--model"])
+    default_claude_host, _ = tc.host_agent_argv("PROMPT", claude)
+    default_claude_bubble = tc.agent_inner_cmd(claude)
+    check("default Codex host launch is direct", default_host[:4], ["codex", "exec", "--json", "--model"])
     check("default Codex host launch prefers Sol", "gpt-5.6-sol" in default_host, True)
     check("default Codex host launch carries one model", "gpt-5.6-terra" in default_host, False)
     check("default Codex bubble launch is direct", "codex exec" in default_bubble, True)
     check("default Codex bubble launch prefers Sol", "--model gpt-5.6-sol" in default_bubble, True)
     check("default Codex bubble launch carries one model", "gpt-5.6-terra" in default_bubble, False)
+    check(
+        "Codex host requests detailed reasoning summaries", 'model_reasoning_summary="detailed"' in default_host, True
+    )
+    check("Codex bubble requests detailed reasoning summaries", "model_reasoning_summary" in default_bubble, True)
+    check("Codex host disables raw reasoning", "show_raw_agent_reasoning=false" in default_host, True)
+    check("Codex bubble disables raw reasoning", "show_raw_agent_reasoning=false" in default_bubble, True)
+    check(
+        "Claude host requests verbose JSONL",
+        all(flag in default_claude_host for flag in ("--output-format", "stream-json", "--verbose")),
+        True,
+    )
+    check(
+        "Claude bubble requests verbose JSONL",
+        "--output-format stream-json --verbose" in default_claude_bubble,
+        True,
+    )
+    check("Claude host avoids partial token events", "--include-partial-messages" in default_claude_host, False)
 
     os.environ["TAUCETI_AUTHORING_CODEX_MODEL"] = "env-model"
     os.environ["TAUCETI_AUTHORING_CODEX_EFFORT"] = "medium"
