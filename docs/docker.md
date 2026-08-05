@@ -96,7 +96,8 @@ next start.
 | Volume | Contents |
 |---|---|
 | `claude`, `codex` | Provider credentials, writable only by setup and the corresponding refresher |
-| `claude-worker`, `codex-worker` | Access-token mirrors, writable by refreshers and mounted read-only by the worker |
+| `claude-worker` | Refresh-token-free Claude mirror plus the worker's shared quota-bootstrap ledger |
+| `codex-worker` | Access-token mirror, writable by the refresher and mounted read-only by the worker |
 | `gh` | GitHub CLI credentials |
 | `uv-cache` | Downloaded Python tools and packages |
 | `checkouts` | Worker repositories and incremental Lean build artifacts |
@@ -105,7 +106,9 @@ next start.
 
 Claude and Codex use rotating, single-consumer refresh tokens. One refresher owns
 each provider credential and publishes a refresh-token-free mirror; the worker never
-mounts the source provider credentials.
+mounts the source provider credentials. The Claude mirror is writable by the worker
+only because its quota-bootstrap ledger lives beside it; the refresher republishes the
+access-only credential every polling cycle.
 
 The refreshers check once a minute, renew within 90 minutes of expiry, avoid rotating
 more than once per 10 minutes, and back off to 15 minutes after errors. Advanced

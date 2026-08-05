@@ -13,8 +13,10 @@ services:
       TAUCETI_WORKER_ID: docker
       TAUCETI_WORKER_ARGS: "${TAUCETI_WORKER_ARGS:-}"
     volumes:
-      # Agent and GitHub subscription credentials, created by the one-time login step.
-      - claude-worker:/root/.claude:ro
+      # Access-only agent credentials and GitHub authentication. Claude's mirror is writable because
+      # the worker keeps its shared quota-bootstrap ledger beside it; the renewable credential remains
+      # isolated in the separate `claude` volume.
+      - claude-worker:/root/.claude
       - codex-worker:/root/.codex:ro
       - gh:/root/.config/gh
       # Preserve build downloads when the image or isolated worker HOME changes. The pinned

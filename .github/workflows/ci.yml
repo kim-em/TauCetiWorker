@@ -102,6 +102,10 @@ jobs:
             -e HOME=/tmp/isolated-home \
             tauceti bash -euo pipefail -c '
             mkdir -p "$HOME"
+            mkdir -p /root/.claude/.tauceti-quota
+            touch /root/.claude/.tauceti-quota/bootstrap.lock
+            rm /root/.claude/.tauceti-quota/bootstrap.lock
+            rmdir /root/.claude/.tauceti-quota
             for tool in gh git uvx jq lake codex claude tauceti-oauth-refresh; do
               command -v "$tool" >/dev/null
             done
