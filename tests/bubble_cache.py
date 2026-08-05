@@ -36,6 +36,7 @@ build_i = bootstrap.index("lake build")
 agent_i = bootstrap.index("exec " + inner)
 check("cache/build/agent order", mathlib_i < tauceti_i < build_i < agent_i)
 check("TauCeti cache uses the canonical repository", f"--repo {tc.TAUCETI}" in bootstrap)
+check("TauCeti cache uses the current public domain", tc.TAUCETI_CACHE_DOMAIN == "cache.taucetiproject.org")
 check("Bubble, not the bootstrap, supplies Lake config", "LAKE_CONFIG" not in bootstrap)
 check("Bubble, not the bootstrap, supplies Lake restore settings", "LAKE_RESTORE_ARTIFACTS" not in bootstrap)
 

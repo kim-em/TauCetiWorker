@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Lake 4.33 parses curl's parallel-transfer JSON from stderr. Bookworm's curl 7.88 emits its
+# parallel progress meter there even when Lake passes --silent, corrupting that JSON stream.
+exec /usr/bin/curl --no-progress-meter "$@"

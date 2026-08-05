@@ -650,7 +650,7 @@ BUBBLE_MIN_VERSION = "0.7.30"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
-TAUCETI_CACHE_DOMAIN = "pub-1825e93d97ca45b2a98d9ad45a5972f8.r2.dev"
+TAUCETI_CACHE_DOMAIN = "cache.taucetiproject.org"
 TAUCETI_CACHE_SERVICE = "tauceti-public"
 TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
 TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
