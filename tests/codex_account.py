@@ -23,6 +23,7 @@ Exit 0 = every case agrees; 1 = a mismatch.
 import base64
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -91,6 +92,7 @@ os.environ.pop("CODEX_HOME", None)  # codex_dir() must resolve <home>/.codex, no
 class Cfg:
     home = home
     quota_cache = Path(tmp) / "quota-cache"  # never written here (no usage fetch), but Quota reads it
+    checkout = Path(tmp) / "checkout"  # host authoring checkout; a project config layer would live here
 
 
 def write(auth):
@@ -298,10 +300,47 @@ try:
     (codex / "config.toml").write_text('cli_auth_credentials_store = "some-future-store"\n')
     check("unknown store -> REFUSED", q().codex_account_problem("kim@example.com") is None, False)
 
-    # A malformed config is codex's problem to reject at startup; do not manufacture an --account
-    # failure from it, or every TOML typo becomes a confusing account error.
+    # A config we cannot READ is not the same as one that says `file`. "codex would fail to start on it
+    # anyway" does not hold: a permission error can clear before launch, and the entitlement probe runs
+    # with --ignore-user-config. None means "verified file-backed", so not-knowing must never return it.
     (codex / "config.toml").write_text("this is not valid toml [[[\n")
-    check("malformed config.toml -> not an account failure", q().codex_account_problem("kim@example.com"), None)
+    check_in(
+        "unreadable config -> REFUSED, not assumed file",
+        "could not be read",
+        q().codex_account_problem("kim@example.com"),
+    )
+    (codex / "config.toml").write_text("cli_auth_credentials_store = 7\n")
+    check("non-string store value -> REFUSED", q().codex_account_problem("kim@example.com") is None, False)
+    # codex itself rejects these, so normalising them to `file` would invent an agreement it does not have.
+    for weird in ('" FILE "', '"File"', '""'):
+        (codex / "config.toml").write_text(f"cli_auth_credentials_store = {weird}\n")
+        check(
+            f"store {weird} -> REFUSED (only exact `file` passes)",
+            q().codex_account_problem("kim@example.com") is None,
+            False,
+        )
+    (codex / "config.toml").unlink()
+
+    # A trusted project config layer OVERRIDES the user one — verified against codex 0.146.0: a trusted
+    # <project>/.codex/config.toml setting ephemeral makes doctor report Ephemeral even with the user
+    # config on file. Host rounds run codex with cwd=checkout, so that layer reaches them. Resolving
+    # codex's trust rules here would mean reimplementing them, so the file's presence is disqualifying.
+    check("no project config -> verifiable", q().codex_account_problem("kim@example.com"), None)
+    (Cfg.checkout / ".codex").mkdir(parents=True, exist_ok=True)
+    (Cfg.checkout / ".codex" / "config.toml").write_text("# even an empty one is not resolvable here\n")
+    problem = q().codex_account_problem("kim@example.com")
+    check("project config layer present -> REFUSED", problem is None, False)
+    check_in("names the project config that disqualified it", ".codex/config.toml", problem)
+    shutil.rmtree(Cfg.checkout)
+    check("project config removed -> verifiable again", q().codex_account_problem("kim@example.com"), None)
+
+    # The PACER inherits the same assumption: it reads auth.json for the token it measures usage with.
+    # Under a non-file store a leftover file would have it fetch and cache one account's usage while the
+    # agent spends another. No --account is involved, so this guard has to live below it.
+    (codex / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+    prov = q().codex()
+    check("pacer reports codex unavailable under a non-file store", prov.available, False)
+    check_in("pacer states the reason", "credential store", prov.error)
     (codex / "config.toml").unlink()
 
     # --- the gate ----------------------------------------------------------------------------------
