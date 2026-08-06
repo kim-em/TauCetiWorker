@@ -38,6 +38,7 @@ from . import (
     survey,
     transcript,
     tui,
+    usage,
     work_units,
     worker_manager,
 )
@@ -55,6 +56,7 @@ _MODULES = (
     round,
     runtime_status,
     transcript,
+    usage,
     agents,
     work_units,
     loop,

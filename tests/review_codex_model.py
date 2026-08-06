@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex review policy is independent from the authoring profile.
+"""Codex and Kiro review policy is independent from the authoring profile.
 
 Only $TAUCETI_REVIEW_CODEX_MODEL is forwarded to the engine; authoring model
 overrides must leave its default/fallback policy untouched.
@@ -36,6 +36,15 @@ check("set + codex -> value", f("codex") == "gpt-5.6-terra")
 check("set + claude -> None (not a codex reviewer)", f("claude") is None)
 check("set + 'claude,codex' -> value", f("claude,codex") == "gpt-5.6-terra")
 
+k = agents._kiro_review_model
+os.environ.pop("TAUCETI_REVIEW_KIRO_MODEL", None)
+os.environ["TAUCETI_AUTHORING_KIRO_MODEL"] = "claude-opus-4.8"
+check("Kiro review defaults to exact Sol", k("kiro") == "gpt-5.6-sol")
+check("Kiro authoring override does not affect review", k("kiro") != "claude-opus-4.8")
+check("non-Kiro review gets no Kiro model", k("codex") is None)
+os.environ["TAUCETI_REVIEW_KIRO_MODEL"] = "claude-opus-4.8"
+check("Kiro review can explicitly select Opus", k("claude,kiro") == "claude-opus-4.8")
+
 # --- end-to-end: the flag threads into the real review_in_bubble inner command ----------------------
 captured = {}
 
@@ -67,8 +76,15 @@ check("bubble: set -> --codex-model gpt-5.6-terra forwarded", "--codex-model gpt
 agents.review_in_bubble(w, 470, "abc123", "claude", opts)
 check("bubble: claude reviewer -> no codex flag even when set", "--codex-model" not in captured["inner"])
 
+agents.review_in_bubble(w, 470, "abc123", "kiro", opts)
+check("bubble: Kiro exact model is forwarded", "--kiro-model claude-opus-4.8" in captured["inner"])
+check("bubble: Kiro reviewer seeds only Kiro creds", captured["cred"] == "kiro")
+check("bubble: Kiro credential bootstrap is present", "kiro-auth.sqlite3" in captured["inner"])
+
 os.environ.pop("TAUCETI_REVIEW_ENGINE_DIR", None)
 os.environ.pop("TAUCETI_REVIEW_CODEX_MODEL", None)
 os.environ.pop("TAUCETI_AUTHORING_CODEX_MODEL", None)
+os.environ.pop("TAUCETI_REVIEW_KIRO_MODEL", None)
+os.environ.pop("TAUCETI_AUTHORING_KIRO_MODEL", None)
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)

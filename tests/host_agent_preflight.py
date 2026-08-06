@@ -30,6 +30,7 @@ def check(name, got, want):
 # --- review stage: literal names, matching the engine's own which() gate (it ignores CLAUDE_CMD/PI_RUN)
 check("review codex -> codex", wu._host_agent_binary("review", "codex"), "codex")
 check("review claude -> claude", wu._host_agent_binary("review", "claude"), "claude")
+check("review kiro -> kiro-cli", wu._host_agent_binary("review", "kiro"), "kiro-cli")
 check("review deepseek -> pi", wu._host_agent_binary("review", "deepseek"), "pi")
 check("review minimax -> pi", wu._host_agent_binary("review", "minimax"), "pi")
 check("review auto -> None (nothing to gate)", wu._host_agent_binary("review", "auto"), None)
@@ -37,7 +38,7 @@ check("review auto -> None (nothing to gate)", wu._host_agent_binary("review", "
 # --- non-review stages: the EXACT executable host_agent_argv will exec, so a custom TAUCETI_CLAUDE_CMD
 #     wrapper or PI_RUN path is preflighted faithfully (no false block, no missed gap). Cross-check the
 #     preflight target against the real launcher argv[0] for every model.
-for model in ("codex", "claude", "deepseek", "minimax"):
+for model in ("codex", "claude", "kiro", "deepseek", "minimax"):
     launcher_bin = tc.host_agent_argv("", model)[0][0]
     check(f"fix {model} -> host_agent_argv argv[0]", wu._host_agent_binary("fix", model), launcher_bin)
 check("fix deepseek -> PI_RUN", wu._host_agent_binary("fix", "deepseek"), tc.PI_RUN)

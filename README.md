@@ -26,6 +26,7 @@ act as, and log in to each subscription agent you want to use:
 gh auth login
 codex login            # for --agent codex, or auto
 claude auth login      # for --agent claude, or auto
+kiro-cli login         # for explicit --agent kiro
 ```
 
 Code-writing phases on the host also need an `elan`/`lake` toolchain. The
@@ -41,6 +42,7 @@ uv tool install git+https://github.com/kim-em/TauCetiWorker.git
 tauceti doctor                     # report the tools and credentials this host can use
 tauceti                            # the dashboard: see the available work, launch it
 tauceti status                     # the same survey, non-interactive (--json for scripts)
+tauceti usage --json               # prompt-free Kiro/OpenRouter credit telemetry
 tauceti work --only review         # one round of a specific kind of work, then exit
 tauceti work --loop --only review  # a focused worker: keep reviewing (or fix / roadmap / ...)
 tauceti work --loop                # fully automatic: keep picking the most useful job
@@ -147,16 +149,46 @@ turn it off with `--ignore-claims`; see [the reference](docs/reference.md).
 | `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
 | `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
 | `claude` | `claude-opus-5`, high effort | subscription, paced |
+| `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-4.8` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
-Set a default with `TAUCETI_AGENT`. The OpenRouter agents are pay-per-token, so
-they never run on their own; you have to ask for them by name.
+Set a default with `TAUCETI_AGENT`. Kiro and the OpenRouter agents are unpaced
+and never run on their own; you have to ask for them by name. Kiro always passes
+an exact model ID and first checks that the logged-in account advertises it—its
+Auto router is never used. For example:
+
+```bash
+tauceti work --agent kiro                              # exact gpt-5.6-sol
+tauceti work --agent kiro --author-model claude-opus-4.8
+```
+
+Run `kiro-cli chat --list-models --format json` to see which exact IDs your
+account currently has. `KIRO_API_KEY` is supported for headless runs; when set,
+TauCeti isolates Kiro's browser-login store so the persisted login cannot take
+precedence over the key.
 
 For an explicit provider, `--author-model` and `--author-effort` override the
 profile for one run. Pinning a Codex model also disables the automatic Terra
 fallback. Every authoring launch prints its effective provider, model, effort,
 and sandbox.
+
+### Credit telemetry
+
+`tauceti usage` reads Kiro subscription credits and OpenRouter balances without
+sending a model prompt. It is observability only and never changes provider
+selection or loop pacing:
+
+```bash
+tauceti usage --provider kiro
+tauceti usage --provider openrouter --json
+tauceti usage --kiro-burn-rate 2.4 --openrouter-burn-rate 1.50
+```
+
+The optional burn rates estimate rounds remaining. Kiro is queried through its
+ACP `usage` command and fractional `used`/`limit` values are preserved. An
+`OPENROUTER_API_KEY` reports its own usage and limit; additionally set an
+`OPENROUTER_MANAGEMENT_KEY` to report account-wide purchased credits and usage.
 
 ### Which account: `--account`
 

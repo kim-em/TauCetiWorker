@@ -25,6 +25,8 @@ keys = [
     "TAUCETI_AUTHORING_CODEX_EFFORT",
     "TAUCETI_AUTHORING_CLAUDE_MODEL",
     "TAUCETI_AUTHORING_CLAUDE_EFFORT",
+    "TAUCETI_AUTHORING_KIRO_MODEL",
+    "TAUCETI_AUTHORING_KIRO_EFFORT",
     "TAUCETI_CODEX_MODEL",
     "TAUCETI_AUTHORING_DEEPSEEK_EFFORT",
 ]
@@ -35,9 +37,11 @@ for key in keys:
 try:
     codex = tc.resolve_authoring_profile("codex")
     claude = tc.resolve_authoring_profile("claude")
+    kiro = tc.resolve_authoring_profile("kiro")
     check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-sol", "high"))
     check("committed Codex fallback", codex.fallback_model, "gpt-5.6-terra")
     check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
+    check("committed Kiro default is exact Sol", (kiro.model, kiro.effort), ("gpt-5.6-sol", "high"))
     default_host, _ = tc.host_agent_argv("PROMPT", codex)
     default_bubble = tc.agent_inner_cmd(codex)
     default_claude_host, _ = tc.host_agent_argv("PROMPT", claude)
@@ -65,6 +69,36 @@ try:
         True,
     )
     check("Claude host avoids partial token events", "--include-partial-messages" in default_claude_host, False)
+
+    kiro_host, _ = tc.host_agent_argv("PROMPT", kiro)
+    kiro_bubble = tc.agent_inner_cmd(kiro)
+    check("Kiro host pins model", kiro_host[kiro_host.index("--model") + 1], "gpt-5.6-sol")
+    check("Kiro host never invokes Auto", "auto" in [arg.lower() for arg in kiro_host], False)
+    check("Kiro bubble pins model", "--model gpt-5.6-sol" in kiro_bubble, True)
+    check("Kiro bubble never invokes Auto", "--model auto" in kiro_bubble.lower(), False)
+
+    os.environ["TAUCETI_AUTHORING_KIRO_MODEL"] = "claude-opus-4.8"
+    os.environ["TAUCETI_AUTHORING_KIRO_EFFORT"] = "high"
+    kiro_opus = tc.resolve_authoring_profile("kiro")
+    check("Kiro can explicitly select Opus", kiro_opus.model, "claude-opus-4.8")
+    check("Kiro Opus selection reaches host", "claude-opus-4.8" in tc.host_agent_argv("P", kiro_opus)[0], True)
+    check("Kiro Opus selection reaches Bubble", "--model claude-opus-4.8" in tc.agent_inner_cmd(kiro_opus), True)
+    os.environ.pop("TAUCETI_AUTHORING_KIRO_MODEL")
+    os.environ.pop("TAUCETI_AUTHORING_KIRO_EFFORT")
+
+    for source, kwargs in (
+        ("CLI", {"cli_model": "Auto"}),
+        ("environment", {}),
+    ):
+        if source == "environment":
+            os.environ["TAUCETI_AUTHORING_KIRO_MODEL"] = "auto-premium"
+        try:
+            tc.resolve_authoring_profile("kiro", **kwargs)
+            kiro_auto_rejected = False
+        except tc.Die:
+            kiro_auto_rejected = True
+        check(f"Kiro {source} cannot select Auto", kiro_auto_rejected, True)
+        os.environ.pop("TAUCETI_AUTHORING_KIRO_MODEL", None)
 
     os.environ["TAUCETI_AUTHORING_CODEX_MODEL"] = "env-model"
     os.environ["TAUCETI_AUTHORING_CODEX_EFFORT"] = "medium"

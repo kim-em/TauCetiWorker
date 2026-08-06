@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import signal
 import subprocess
@@ -28,6 +29,7 @@ from pathlib import Path
 from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
+    KIRO_BUBBLE_MIN_VERSION,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
     bubble_supports_lake_cache_service,
@@ -61,6 +63,7 @@ from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
+from .usage import kiro_data_dir, usage_snapshot
 from .work_units import RoundOpts, Worker, _bubble, raise_on_account_mismatch, run_round, want
 from .worker_manager import WorkersError, add_workers_parser, cmd_managed_runner, cmd_workers
 
@@ -148,7 +151,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         choices=AGENTS,
         default=None,
         help="which agent to run: auto (Codex preferred, Opus fallback), codex, claude, "
-        "or deepseek/minimax (pay-per-token OpenRouter, asked for by name) "
+        "kiro (exact model, subscription credits), or deepseek/minimax (pay-per-token "
+        "OpenRouter). Kiro/OpenRouter are explicit-only and unpaced "
         "(default: $TAUCETI_AGENT or auto)",
     )
     p.add_argument(
@@ -252,7 +256,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="ignore the quota PACER (run the requested --agent even when ahead of the burn pace); "
         "a HARD block — a window at 100%%, unreadable usage, or the usage endpoint refusing to answer — "
-        "still backs off (needs an explicit --agent codex|claude — 'auto' can't choose without the pacer)",
+        "still backs off (needs an explicit paced --agent codex|claude — 'auto' can't choose without the pacer)",
     )
     # Internal: the loop sets this on a round it selected while a Claude window was reset-but-unopened.
     # It authorizes the round's launch stage to spend ONE small claude request to open that window,
@@ -396,6 +400,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true", help="emit the survey as JSON")
     s.add_argument("--worker-id", dest="worker_id", default=None)
 
+    u = sub.add_parser("usage", help="read Kiro/OpenRouter credits without sending a model prompt")
+    u.add_argument(
+        "--provider",
+        action="append",
+        choices=["kiro", "openrouter"],
+        help="provider to query (repeatable; default: both)",
+    )
+    u.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    u.add_argument(
+        "--kiro-burn-rate",
+        default=os.environ.get("TAUCETI_KIRO_BURN_RATE"),
+        metavar="CREDITS_PER_ROUND",
+        help="report estimated Kiro rounds remaining at this credit burn (observability only)",
+    )
+    u.add_argument(
+        "--openrouter-burn-rate",
+        default=os.environ.get("TAUCETI_OPENROUTER_BURN_RATE"),
+        metavar="USD_PER_ROUND",
+        help="report estimated OpenRouter rounds remaining at this USD burn (observability only)",
+    )
+    u.add_argument("--timeout", type=float, default=30.0, help="per-provider query timeout in seconds")
+
     sub.add_parser("doctor", help="check the environment (tools, bubble, quota creds)")
 
     add_workers_parser(sub)
@@ -434,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_tui(args)
     if cmd == "status":
         return cmd_status(args)
+    if cmd == "usage":
+        return cmd_usage(args)
     if cmd in ("work", "_round"):
         only = resolve_tasks(getattr(args, "only", []), getattr(args, "skip", []))
         agent = resolve_agent(args)
@@ -465,6 +493,85 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_managed_runner(args)
     parser.print_help()
     return 64
+
+
+def _usage_burn_rate(value: str | float | None, label: str) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        raise Die(f"{label} must be a non-negative finite number") from None
+    if not math.isfinite(rate) or rate < 0:
+        raise Die(f"{label} must be a non-negative finite number")
+    return rate
+
+
+def _fmt_usage_number(value) -> str:
+    return "?" if value is None else f"{value:g}"
+
+
+def cmd_usage(args) -> int:
+    providers = getattr(args, "provider", None) or ["kiro", "openrouter"]
+    timeout = getattr(args, "timeout", 30.0)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise Die("--timeout must be a positive finite number")
+    snap = usage_snapshot(
+        providers=providers,
+        kiro_burn_rate=_usage_burn_rate(args.kiro_burn_rate, "--kiro-burn-rate"),
+        openrouter_burn_rate=_usage_burn_rate(args.openrouter_burn_rate, "--openrouter-burn-rate"),
+        timeout=timeout,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(snap, indent=2, sort_keys=True))
+        return 0 if all(v.get("ok") for v in snap.values()) else 1
+
+    for provider in providers:
+        value = snap[provider]
+        if not value.get("ok"):
+            print(f"{provider}: unavailable ({value.get('error')})")
+            continue
+        if provider == "kiro":
+            print(
+                f"kiro: {value.get('plan_name') or 'unknown plan'}"
+                + (f"; resets {value['billing_cycle_reset']}" if value.get("billing_cycle_reset") else "")
+            )
+            for item in value.get("usage_breakdowns", []):
+                line = (
+                    f"  {item.get('displayName') or item.get('resourceType') or 'credits'}: "
+                    f"{_fmt_usage_number(item.get('used'))}/{_fmt_usage_number(item.get('limit'))} "
+                    f"{item.get('unit')} ({_fmt_usage_number(item.get('percentage'))}% used, "
+                    f"{_fmt_usage_number(item.get('remaining'))} left)"
+                )
+                if item.get("estimated_rounds_remaining") is not None:
+                    line += f"; ~{item['estimated_rounds_remaining']:.1f} rounds at configured burn"
+                print(line)
+        else:
+            print("openrouter:")
+            key = value.get("key")
+            if key:
+                line = f"  key {key.get('label') or '(unnamed)'}: {_fmt_usage_number(key.get('used'))} USD used" + (
+                    f", {_fmt_usage_number(key.get('remaining'))} of "
+                    f"{_fmt_usage_number(key.get('limit'))} USD key limit left"
+                    if key.get("limit") is not None
+                    else "; no key spending limit"
+                )
+                if key.get("estimated_rounds_remaining") is not None:
+                    line += f"; ~{key['estimated_rounds_remaining']:.1f} rounds at configured burn"
+                print(line)
+            account = value.get("account")
+            if account:
+                line = (
+                    f"  account credits: {_fmt_usage_number(account.get('used'))}/"
+                    f"{_fmt_usage_number(account.get('purchased'))} USD used, "
+                    f"{_fmt_usage_number(account.get('remaining'))} left"
+                )
+                if account.get("estimated_rounds_remaining") is not None:
+                    line += f"; ~{account['estimated_rounds_remaining']:.1f} rounds at configured burn"
+                print(line)
+            elif value.get("account_unavailable_reason"):
+                print(f"  account credits: not queried ({value['account_unavailable_reason']})")
+    return 0 if all(v.get("ok") for v in snap.values()) else 1
 
 
 def cmd_status(args) -> int:
@@ -693,6 +800,7 @@ def cmd_doctor(args) -> int:
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
+    rows.append(("kiro-cli", _have("kiro-cli"), "for --agent kiro"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
     codex_creds = codex_dir(cfg.home) / "auth.json"
     rows.append(("codex creds", _safe_exists(codex_creds), str(codex_creds)))
@@ -716,6 +824,14 @@ def cmd_doctor(args) -> int:
         rows.append(
             ("claude creds", _claude_keychain_creds() is not None, 'macOS login Keychain ("Claude Code-credentials")')
         )
+    kiro_db = kiro_data_dir(cfg.home) / "data.sqlite3"
+    rows.append(
+        (
+            "kiro auth",
+            bool((os.environ.get("KIRO_API_KEY") or "").strip()) or _safe_exists(kiro_db),
+            "$KIRO_API_KEY" if (os.environ.get("KIRO_API_KEY") or "").strip() else str(kiro_db),
+        )
+    )
     bad = 0
     print(f"tauceti doctor — worker '{cfg.wid}'")
     for name, ok, note in rows:
@@ -766,10 +882,11 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
         )
     if uses_bubble and not opts.dry_run:
         bubble_version = installed_bubble_version()
-        if not bubble_version_meets_minimum(bubble_version):
+        minimum = KIRO_BUBBLE_MIN_VERSION if opts.work_model == "kiro" else BUBBLE_MIN_VERSION
+        if not bubble_version_meets_minimum(bubble_version, minimum):
             found = bubble_version or "unreadable"
             raise Die(
-                f"preflight: --bubble needs Bubble {BUBBLE_MIN_VERSION} or newer; found {found}. "
+                f"preflight: --bubble needs Bubble {minimum} or newer; found {found}. "
                 "Older versions do not fail closed when a requested Lake cache service cannot be "
                 "configured. Update the stable install with\n"
                 f"    uv tool install --force {BUBBLE_REPO}\n"

@@ -12,10 +12,14 @@ services:
     environment:
       TAUCETI_WORKER_ID: docker
       TAUCETI_WORKER_ARGS: "${TAUCETI_WORKER_ARGS:-}"
+      KIRO_API_KEY: "${KIRO_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENROUTER_MANAGEMENT_KEY: "${OPENROUTER_MANAGEMENT_KEY:-}"
     volumes:
       # Agent and GitHub subscription credentials, created by the one-time login step.
       - claude-worker:/root/.claude:ro
       - codex-worker:/root/.codex:ro
+      - kiro:/root/.local/share/kiro-cli:ro
       - gh:/root/.config/gh
       # Preserve build downloads when the image or isolated worker HOME changes. The pinned
       # Lean toolchain remains image-owned so an image update cannot be hidden by a stale volume.
@@ -38,6 +42,7 @@ services:
     volumes:
       - claude:/root/.claude
       - codex:/root/.codex
+      - kiro:/root/.local/share/kiro-cli
       - gh:/root/.config/gh
 
   # These are the only processes allowed to rotate each provider's shared refresh token.
@@ -75,6 +80,7 @@ volumes:
   codex:
   claude-worker:
   codex-worker:
+  kiro:
   gh:
   uv-cache:
   checkouts:

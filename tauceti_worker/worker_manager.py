@@ -1587,13 +1587,13 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument(
         "--ignore-quota",
         action="store_true",
-        help="ignore soft pacing for explicit codex/claude; hard limits still apply",
+        help="ignore soft pacing for explicit codex/claude; Kiro/OpenRouter are already unpaced",
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
-    add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude agent")
+    add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
     add.add_argument("--pace", help="soft pacing curve as time%%:budget%% points, e.g. 0:10,50:70,90:90")
     add.add_argument("--stream", action="store_true", help="keep the agent transcript in the console log")
     add.add_argument(

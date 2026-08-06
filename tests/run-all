@@ -41,6 +41,7 @@ RUN_STDLIB=(
   inflight_review.py
   isolate_home_macos.py
   isolate_home_paths.py
+  kiro.py
   ledger_blocking.py
   loop_sigterm.py
   mirror_creds.py
@@ -48,6 +49,7 @@ RUN_STDLIB=(
   oauth_refresh_loop.py
   pace_curve.py
   preflight_review_lake.py
+  provider_usage.py
   quota_cache_fp.py
   quota_loop_refresh.py
   review_sync_failure.py

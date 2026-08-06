@@ -99,7 +99,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | --- | --- | --- | --- |
 | `id` | string | required | `[a-z0-9-]+`, at most 40 characters; namespaces the worker's state, checkout, review store, and logs |
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
-| `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `deepseek`, or `minimax` |
+| `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`. Empty means the whole cascade |
 | `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
 | `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
@@ -109,7 +109,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
-| `author_effort` | string | unset | Authoring reasoning effort for Codex or Claude. Requires an explicit `agent` |
+| `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |
 | `pace` | string | unset | Pacing curve as `time%:budget%` points, for example `0:10,50:70,90:90` |
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
 | `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
@@ -135,7 +135,7 @@ entry with `enabled = true`.
 | `--roadmap-skip AREAS` | `roadmap_skip`, as a comma-separated list |
 | `--source PATH_OR_URL` | `source`; also requires `roadmap` in `--only` and a non-empty `--roadmap-only` |
 | `--author-model MODEL` | `author_model` |
-| `--author-effort EFFORT` | `author_effort`; Codex or Claude only |
+| `--author-effort EFFORT` | `author_effort`; Codex, Claude, or Kiro only |
 | `--pace CURVE` | `pace` |
 | `--stream` | `stream` |
 | `--isolate-home` | `isolate_home`; useful when the id is `default` |

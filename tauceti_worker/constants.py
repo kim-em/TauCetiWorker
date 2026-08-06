@@ -146,7 +146,13 @@ OPENROUTER_MODELS = {
     "minimax": os.environ.get("MINIMAX_MODEL", "minimax/minimax-m3"),
 }
 
-AGENT_NAMES = {"codex": "Codex", "claude": "Claude Code", "deepseek": "DeepSeek", "minimax": "MiniMax"}
+AGENT_NAMES = {
+    "codex": "Codex",
+    "claude": "Claude Code",
+    "kiro": "Kiro",
+    "deepseek": "DeepSeek",
+    "minimax": "MiniMax",
+}
 
 # Reproducible authoring defaults. Provider selection remains quota-driven; once
 # selected, host and bubble launchers consume this exact model/effort profile.
@@ -161,6 +167,9 @@ AUTHORING_DEFAULTS = {
     # Pin Claude to the current exact Opus generation, not its moving alias.
     "codex": ("gpt-5.6-sol", "high"),
     "claude": ("claude-opus-5", "high"),
+    # Never use Kiro's Auto router. Operators can select another exact entitled
+    # id (for example claude-opus-4.8) with the existing --author-model flag.
+    "kiro": ("gpt-5.6-sol", "high"),
 }
 
 PI_RUN = os.environ.get("PI_RUN", os.path.expanduser("~/.claude/skills/pi/scripts/run.sh"))
@@ -202,4 +211,4 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 SANDBOX_DEFAULT["progress"] = False
 
 
-AGENTS = ["auto", "codex", "claude", "deepseek", "minimax"]
+AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]

@@ -1,14 +1,14 @@
 # Docker deployment
 
-The Compose deployment packages TauCetiWorker, Lean, GitHub CLI, Codex, and Claude
-Code for an unattended Linux host.
+The Compose deployment packages TauCetiWorker, Lean, GitHub CLI, Codex, Claude
+Code, and the checksum-pinned Kiro CLI for an unattended Linux host.
 
 ## Requirements
 
 - Docker with Compose v2, either as `docker compose` or the standalone `docker-compose`
 - At least 8 GB of RAM for Lean builds
 - Roughly 25 GB of free disk for the image, toolchain, and Mathlib cache
-- GitHub access plus Codex and Claude subscription credentials
+- GitHub access plus credentials for whichever of Codex, Claude, and Kiro you use
 
 ## Setup
 
@@ -21,6 +21,7 @@ docker compose build
 docker compose run --rm auth gh auth login --git-protocol https
 docker compose run --rm auth codex login --device-auth
 docker compose run --rm auth claude auth login
+docker compose run --rm auth kiro-cli login
 ```
 
 Start the worker and follow its logs:
@@ -38,7 +39,7 @@ the worker environment. Once they have started, an optional check is:
 docker compose run --rm tauceti ./tauceti doctor
 ```
 
-Codex and Claude credentials should report `[ok]`. Missing `bubble`, `incus`, and `pi`
+Codex, Claude, and Kiro credentials should report `[ok]` when configured. Missing `bubble`, `incus`, and `pi`
 are expected for the standard host-mode deployment; they are only needed for Bubble
 sandboxing or the DeepSeek and MiniMax agents.
 
@@ -66,6 +67,16 @@ docker compose up -d
 The options are appended to `tauceti work --loop`. Edit or remove the line and run
 `docker compose up -d` again to change or clear them; credentials and worker data are
 retained.
+
+For headless Kiro auth, set `KIRO_API_KEY` in `.env` instead of running the Kiro
+login command. Compose also forwards `OPENROUTER_API_KEY` and
+`OPENROUTER_MANAGEMENT_KEY` from `.env` for credit telemetry (and for an
+operator-installed `pi` runner). You can inspect either balance without sending
+a model prompt:
+
+```bash
+docker compose run --rm tauceti ./tauceti usage --json
+```
 
 ## Operations
 
@@ -96,6 +107,7 @@ next start.
 | Volume | Contents |
 |---|---|
 | `claude`, `codex` | Provider credentials, writable only by setup and the corresponding refresher |
+| `kiro` | Kiro browser-login database, writable by setup and snapshotted into the isolated worker home |
 | `claude-worker`, `codex-worker` | Access-token mirrors, writable by refreshers and mounted read-only by the worker |
 | `gh` | GitHub CLI credentials |
 | `uv-cache` | Downloaded Python tools and packages |

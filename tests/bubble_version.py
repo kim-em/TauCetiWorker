@@ -23,6 +23,8 @@ for version, accepted in (
     ("0.7.29", False),  # has the macOS $HOME fix but not bubble's $CODEX_HOME support
     ("0.7.30", True),
     ("0.7.30+local", True),
+    ("0.7.31", True),
+    ("0.7.31+local", True),
     ("0.8.0", True),
     ("", False),
     ("not-a-version", False),
@@ -33,11 +35,11 @@ for version, accepted in (
     )
 
 
-def opts(*, dry_run=False):
+def opts(*, dry_run=False, model="claude"):
     return tc.RoundOpts(
         only=["review"],
         agent="claude",
-        work_model="claude",
+        work_model=model,
         sandbox_host=False,
         dry_run=dry_run,
     )
@@ -60,11 +62,26 @@ try:
 
     tc.cli.installed_bubble_version = lambda: "0.7.30"
     try:
+        tc.cli.preflight(SimpleNamespace(), opts(model="kiro"))
+        kiro_blocked = False
+    except tc.Die as exc:
+        kiro_blocked = "0.7.31" in str(exc)
+    check("Kiro Bubble round requires the Kiro-capable release", kiro_blocked)
+
+    try:
+        tc.cli.preflight(SimpleNamespace(), opts(model="claude"))
+        existing_agent_accepted = True
+    except tc.Die:
+        existing_agent_accepted = False
+    check("existing agents remain compatible with Bubble 0.7.30", existing_agent_accepted)
+
+    tc.cli.installed_bubble_version = lambda: "0.7.31"
+    try:
         tc.cli.preflight(SimpleNamespace(), opts())
         accepted = True
     except tc.Die:
         accepted = False
-    check("real bubble review accepts 0.7.30", accepted)
+    check("real bubble review accepts 0.7.31", accepted)
 
     tc.cli.installed_bubble_version = lambda: "0.7.27"
     try:

@@ -47,6 +47,7 @@ from .quota import (
 )
 from .runtime_status import report_failure
 from .transcript import AgentTranscriptRenderer
+from .usage import UsageError, kiro_data_dir, kiro_process_env, snapshot_kiro_auth_db
 
 # ============================================================================
 
@@ -61,6 +62,13 @@ class AuthoringProfile:
     model_source: str
     effort_source: str
     fallback_model: str | None = None
+
+
+def _validate_kiro_model_pin(model: str, source: str) -> str:
+    """Reject Kiro's router anywhere an exact model id is required."""
+    if model.lower().startswith("auto"):
+        raise Die(f"Kiro model from {source} must be an exact model id, not the Auto router: {model!r}")
+    return model
 
 
 def resolve_authoring_profile(
@@ -113,6 +121,8 @@ def resolve_authoring_profile(
 
     if not model:
         raise Die(f"authoring model for {provider} must not be empty")
+    if provider == "kiro":
+        _validate_kiro_model_pin(model, model_source)
     if effort and not re.fullmatch(r"[A-Za-z0-9._-]+", effort):
         raise Die(f"authoring effort for {provider} contains unsupported characters: {effort!r}")
     fallback_model = None
@@ -312,6 +322,67 @@ def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> Author
     return replace(profile, model=fallback, model_source="subscription fallback", fallback_model=None)
 
 
+def _kiro_model_ids(payload) -> set[str]:
+    """Extract exact ids from the documented `--list-models --format json` shapes."""
+    found: set[str] = set()
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, str):
+                found.add(item)
+            else:
+                found.update(_kiro_model_ids(item))
+    elif isinstance(payload, dict):
+        for key in ("id", "modelId", "model_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                found.add(value)
+        for key in ("models", "availableModels", "available_models", "data"):
+            if key in payload:
+                found.update(_kiro_model_ids(payload[key]))
+    return found
+
+
+def validate_kiro_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
+    """Confirm that Kiro advertises the exact pinned model without sending a prompt."""
+    if profile.provider != "kiro":
+        return profile
+    _validate_kiro_model_pin(profile.model, profile.model_source)
+    cfg.state.mkdir(parents=True, exist_ok=True)
+    env = kiro_process_env(dict(os.environ))
+    try:
+        result = subprocess.run(
+            ["kiro-cli", "chat", "--list-models", "--format", "json"],
+            cwd=cfg.state,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+        )
+    except OSError as e:
+        raise NoProgress(f"Kiro model-access check could not launch: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        raise NoProgress("Kiro model-access check timed out after 60s; not launching authoring") from e
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()[-1000:]
+        raise NoProgress(f"Kiro could not list this account's models: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise NoProgress("Kiro returned malformed JSON from --list-models; not risking its Auto router") from e
+    models = _kiro_model_ids(payload)
+    if not models:
+        raise NoProgress("Kiro returned no model ids from --list-models; not risking its Auto router")
+    if profile.model not in models:
+        available = ", ".join(sorted(models))
+        raise NoProgress(
+            f"Kiro model {profile.model!r} is not available to this account (available: {available}); "
+            "the worker will not fall back to Auto"
+        )
+    return profile
+
+
 # Agents — prompt filling, the host checkout, and the agent launch. The host argv lists are a frozen
 # contract — keep them byte-for-byte stable (the historical `( cd … ) 9>&-` and `env -u` shell
 # mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh / git-safe-push /
@@ -393,6 +464,22 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
         argv += ["-c", 'model_reasoning_summary="detailed"', "-c", "show_raw_agent_reasoning=false"]
         argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+    elif profile.provider == "kiro":
+        # --model is mandatory: Kiro's Auto router is never allowed to choose on
+        # the worker's behalf. Isolate its platform credential store for API-key
+        # runs so a persisted browser login cannot shadow the key.
+        env = kiro_process_env(env)
+        argv = [
+            "kiro-cli",
+            "chat",
+            "--no-interactive",
+            "--trust-all-tools",
+            "--model",
+            profile.model,
+        ]
+        if profile.effort:
+            argv += ["--effort", profile.effort]
+        argv += [prompt]
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
@@ -647,6 +734,7 @@ def _shq(s: str) -> str:
 
 BUBBLE_REPO = "git+https://github.com/kim-em/bubble.git"
 BUBBLE_MIN_VERSION = "0.7.30"
+KIRO_BUBBLE_MIN_VERSION = "0.7.31"
 
 # TauCeti's public, anonymous Lake artifact cache. Mathlib's separate cache is fetched by
 # `lake exe cache get`; this one contains TauCeti's own main-built outputs.
@@ -924,7 +1012,34 @@ def ensure_bubble_home(cfg: Config) -> dict:
 
 def _uses_claude_credentials(work_model: str) -> bool:
     """Keep Bubble's Claude credential flag and macOS private-seed decision on one predicate."""
-    return work_model != "codex" and work_model not in OPENROUTER_MODELS
+    models = {m.strip() for m in work_model.split(",")}
+    known_non_claude = {"codex", "kiro", *OPENROUTER_MODELS}
+    return bool(models & {"claude", "sonnet"}) or not models <= known_non_claude
+
+
+def _copy_kiro_auth_db(src: Path, dst: Path) -> None:
+    """Take a consistent snapshot of Kiro's live SQLite credential store."""
+    try:
+        snapshot_kiro_auth_db(src, dst)
+    except UsageError as e:
+        raise Die(str(e)) from e
+
+
+def _uses_kiro_credentials(models: str) -> bool:
+    return "kiro" in {model.strip() for model in models.split(",")}
+
+
+def _stage_kiro_credentials(cfg: Config, rounddir: Path) -> None:
+    """Stage exactly one Kiro auth mechanism for a read-only Bubble mount."""
+    key = (os.environ.get("KIRO_API_KEY") or "").strip()
+    keyf = rounddir / "kiro.key"
+    keyf.write_text(key)
+    os.chmod(keyf, 0o600)
+    if key:
+        return
+    src = kiro_data_dir(cfg.home) / "data.sqlite3"
+    if _safe_exists(src):
+        _copy_kiro_auth_db(src, rounddir / "kiro-auth.sqlite3")
 
 
 def agent_cred_flags(work_model: str) -> list[str]:
@@ -963,6 +1078,25 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
             'env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY="$(cat /opt/round/openrouter.key)" '
             f"pi --provider openrouter --model {shlex.quote(profile.model)} --print "
             '"$(cat /opt/round/prompt.txt)"'
+        )
+    if profile.provider == "kiro":
+        effort = f" --effort {shlex.quote(profile.effort)}" if profile.effort else ""
+        setup = (
+            "set -eu; "
+            "export KIRO_HOME=/tmp/tauceti-kiro-home XDG_DATA_HOME=/tmp/tauceti-kiro-data; "
+            'mkdir -p "$KIRO_HOME" "$XDG_DATA_HOME/kiro-cli"; '
+            "if [ -s /opt/round/kiro.key ]; then "
+            'export KIRO_API_KEY="$(cat /opt/round/kiro.key)"; '
+            "else unset KIRO_API_KEY; "
+            "test -f /opt/round/kiro-auth.sqlite3 || "
+            "{ echo 'Kiro is not logged in and KIRO_API_KEY is unset' >&2; exit 2; }; "
+            'cp /opt/round/kiro-auth.sqlite3 "$XDG_DATA_HOME/kiro-cli/data.sqlite3"; fi; '
+            f"exec kiro-cli chat --no-interactive --trust-all-tools --model {shlex.quote(profile.model)}"
+            f'{effort} "$(cat /opt/round/prompt.txt)"'
+        )
+        return (
+            "env ANTHROPIC_API_KEY= OPENAI_API_KEY= OPENROUTER_API_KEY= OPENROUTER_MANAGEMENT_KEY= sh -c "
+            + shlex.quote(setup)
         )
     effort = f" --effort {shlex.quote(profile.effort)}" if profile.effort else ""
     return (
@@ -1088,6 +1222,10 @@ def run_in_bubble(
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
         os.chmod(keyf, 0o600)
+    if _uses_kiro_credentials(cred_model):
+        # Prefer API-key authentication. Otherwise snapshot the browser login;
+        # never expose the live SQLite store to the untrusted container.
+        _stage_kiro_credentials(cfg, rounddir)
 
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
@@ -1214,6 +1352,15 @@ def _codex_review_model_override(reviewers: str) -> str | None:
     return m if (m and "codex" in [r.strip() for r in reviewers.split(",")]) else None
 
 
+def _kiro_review_model(reviewers: str) -> str | None:
+    """Exact Kiro review model, independent of authoring model policy."""
+    if "kiro" not in [r.strip() for r in reviewers.split(",")]:
+        return None
+    configured = (os.environ.get("TAUCETI_REVIEW_KIRO_MODEL") or "").strip()
+    model = configured or AUTHORING_DEFAULTS["kiro"][0]
+    return _validate_kiro_model_pin(model, "$TAUCETI_REVIEW_KIRO_MODEL" if configured else "repository default")
+
+
 def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
@@ -1251,13 +1398,32 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
 
     cm = _codex_review_model_override(reviewers)
     codex_flag = f" --codex-model {shlex.quote(cm)}" if cm else ""  # operator override; else engine default
+    km = _kiro_review_model(reviewers)
+    kiro_flag = f" --kiro-model {shlex.quote(km)}" if km else ""
     inner = (
         "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
         f"--no-mathlib --no-sync --store /opt/review-store --post "
         f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
-        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}"
+        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}{kiro_flag}"
     )
+    if km:
+        # The review engine creates another clean reviewer HOME. Seed this
+        # container's provider-only credential first so that clean-room copy has
+        # a source, while keeping the operator's live database outside Bubble.
+        setup = (
+            "set -eu; export KIRO_HOME=/tmp/tauceti-kiro-home "
+            "XDG_DATA_HOME=/home/user/.local/share; "
+            'mkdir -p "$KIRO_HOME" "$XDG_DATA_HOME/kiro-cli"; '
+            "if [ -s /opt/round/kiro.key ]; then "
+            'export KIRO_API_KEY="$(cat /opt/round/kiro.key)"; '
+            "else unset KIRO_API_KEY; "
+            "test -f /opt/round/kiro-auth.sqlite3 || "
+            "{ echo 'Kiro is not logged in and KIRO_API_KEY is unset' >&2; exit 2; }; "
+            'cp /opt/round/kiro-auth.sqlite3 "$XDG_DATA_HOME/kiro-cli/data.sqlite3"; fi; '
+            f"exec {inner}"
+        )
+        inner = "sh -c " + shlex.quote(setup)
     # target is the PR so bubble checks it out; prompt unused by the engine.
     return run_in_bubble(w, f"{TAUCETI}/pull/{pr}", "", opts, mounts=mounts, inner_cmd=inner, cred_model=reviewers)
 
@@ -1327,6 +1493,7 @@ def isolate_home(wid: str) -> Path:
 
     home = _worker_iso_home(wid)
     iso_claude, iso_codex = home / ".claude", home / ".codex"
+    iso_kiro_home, iso_kiro_data = home / ".kiro", kiro_data_dir(home, {})
     # Idempotence: a loop child inherits its parent's isolation and must not re-copy or re-warn. The
     # signal is one sentinel naming the isolation root, not any individual redirect: keying on
     # $CLAUDE_CONFIG_DIR alone would return early for an operator who happens to export that path,
@@ -1338,11 +1505,20 @@ def isolate_home(wid: str) -> Path:
         # resolves through, and a child that lost one would silently use the operator's account.
         os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
         os.environ["CODEX_HOME"] = str(iso_codex)
+        os.environ["TAUCETI_KIRO_HOME"] = str(iso_kiro_home)
+        os.environ["TAUCETI_KIRO_DATA_DIR"] = str(iso_kiro_data)
+        if sys.platform == "darwin":
+            os.environ["TAUCETI_KIRO_PROCESS_HOME"] = str(home)
+        else:
+            os.environ["TAUCETI_KIRO_XDG_DATA_HOME"] = str(iso_kiro_data.parent)
         return home
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
+    real_kiro_data = kiro_data_dir(real)
     iso_claude.mkdir(parents=True, exist_ok=True)
     iso_codex.mkdir(parents=True, exist_ok=True)
+    iso_kiro_home.mkdir(parents=True, exist_ok=True)
+    iso_kiro_data.mkdir(parents=True, exist_ok=True)
     for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
         src, dst = real_claude / item, iso_claude / item
         if _safe_exists(src) and not dst.exists():
@@ -1384,11 +1560,38 @@ def isolate_home(wid: str) -> Path:
             codex_marker.write_text(str(real_codex))
         except OSError:
             pass
+    # Kiro's browser login is a SQLite database outside KIRO_HOME. Give each
+    # worker a consistent snapshot, but do not let an absent or malformed Kiro
+    # login break a worker that may only use Codex or Claude.
+    kiro_src, kiro_dst = real_kiro_data / "data.sqlite3", iso_kiro_data / "data.sqlite3"
+    if _safe_exists(kiro_src) and not kiro_dst.exists():
+        try:
+            _copy_kiro_auth_db(kiro_src, kiro_dst)
+        except Die as e:
+            log(f"WARNING: {e}; Kiro browser authentication was not isolated")
+    kiro_marker = iso_kiro_data / ".tauceti-creds-source"
+    if kiro_marker.exists():
+        if kiro_marker.read_text().strip() != str(real_kiro_data):
+            log(
+                f"WARNING: worker '{wid}' keeps Kiro creds first copied from "
+                f"{kiro_marker.read_text().strip()} (not {real_kiro_data}); use a fresh "
+                "--worker-id to switch accounts."
+            )
+    else:
+        kiro_marker.write_text(str(real_kiro_data))
     # Both credential dirs are addressed by environment variable, and both CLIs honour the same ones the
     # worker's own claude_dir()/codex_dir() read, so the pacer and the spawned agent always agree. These
     # are the WHOLE isolation on macOS, and they ride alongside the $HOME move elsewhere.
     os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
     os.environ["CODEX_HOME"] = str(iso_codex)
+    os.environ["TAUCETI_KIRO_HOME"] = str(iso_kiro_home)
+    os.environ["TAUCETI_KIRO_DATA_DIR"] = str(iso_kiro_data)
+    if sys.platform == "darwin":
+        # Change HOME only in Kiro subprocesses so that its native macOS data
+        # path resolves to the private profile without disrupting Keychain/gh.
+        os.environ["TAUCETI_KIRO_PROCESS_HOME"] = str(home)
+    else:
+        os.environ["TAUCETI_KIRO_XDG_DATA_HOME"] = str(iso_kiro_data.parent)
     # The worker's data root, wherever $HOME ends up pointing. Config.resolve hangs the review store,
     # the bubble home and the claim scratch off this, so those stay per-worker and stay put on macOS
     # even though $HOME no longer moves. Written last: it doubles as the completion sentinel above.

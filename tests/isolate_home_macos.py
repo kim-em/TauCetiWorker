@@ -13,6 +13,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -26,7 +27,18 @@ codex_dir = tc.quota.codex_dir
 claude_dir = tc.quota.claude_dir
 fails = 0
 
-ISOLATION_VARS = ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "TAUCETI_DATA_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL")
+ISOLATION_VARS = (
+    "HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "TAUCETI_KIRO_HOME",
+    "TAUCETI_KIRO_DATA_DIR",
+    "TAUCETI_KIRO_PROCESS_HOME",
+    "TAUCETI_KIRO_XDG_DATA_HOME",
+    "TAUCETI_DATA_HOME",
+    "GH_CONFIG_DIR",
+    "GIT_CONFIG_GLOBAL",
+)
 
 
 def check(name, got, want):
@@ -67,6 +79,16 @@ def seeded_real_home(root):
     (real / ".codex" / "auth.json").write_text('{"tokens": {"access_token": "operator"}}')
     (real / ".claude").mkdir(parents=True)
     (real / ".config" / "gh").mkdir(parents=True)
+    # The test switches sys.platform after constructing this fixture, so seed
+    # both platform-default locations with valid SQLite stores.
+    for kiro in (
+        real / ".local" / "share" / "kiro-cli",
+        real / "Library" / "Application Support" / "kiro-cli",
+    ):
+        kiro.mkdir(parents=True)
+        with sqlite3.connect(kiro / "data.sqlite3") as db:
+            db.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+            db.execute("INSERT INTO auth_kv VALUES ('login', 'operator')")
     return real
 
 
@@ -78,9 +100,21 @@ with tempfile.TemporaryDirectory() as root:
     check("macOS leaves $HOME at the operator's", env["HOME"], str(real))
     check("macOS isolates CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
     check("macOS isolates CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    check("macOS isolates KIRO_HOME", env["TAUCETI_KIRO_HOME"], str(iso / ".kiro"))
+    check(
+        "macOS isolates Kiro native data",
+        env["TAUCETI_KIRO_DATA_DIR"],
+        str(iso / "Library" / "Application Support" / "kiro-cli"),
+    )
+    check("macOS redirects HOME only for Kiro", env["TAUCETI_KIRO_PROCESS_HOME"], str(iso))
     check("data root is exported", env["TAUCETI_DATA_HOME"], str(iso))
     check("codex credential is copied in", (iso / ".codex" / "auth.json").exists(), True)
     check("codex source marker recorded", (iso / ".codex" / ".tauceti-creds-source").read_text(), str(real / ".codex"))
+    check(
+        "Kiro credential database is snapshotted",
+        (iso / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3").exists(),
+        True,
+    )
 
     # The redirect is what makes the isolation real: with $HOME still the operator's, a bare
     # <home>/.codex would resolve to the operator's own credential rather than the worker's copy.
@@ -107,6 +141,12 @@ with tempfile.TemporaryDirectory() as root:
     # back to the operator's account.
     check("early return reasserts CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
     check("early return reasserts CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    check("early return reasserts KIRO_HOME", env["TAUCETI_KIRO_HOME"], str(iso / ".kiro"))
+    check(
+        "early return reasserts Kiro native data",
+        env["TAUCETI_KIRO_DATA_DIR"],
+        str(iso / "Library" / "Application Support" / "kiro-cli"),
+    )
 
 # --- the sentinel, not any single redirect, decides "already isolated" ----------------------------
 with tempfile.TemporaryDirectory() as root:
@@ -129,6 +169,12 @@ with tempfile.TemporaryDirectory() as root:
     check("Linux still moves $HOME", env["HOME"], str(iso))
     check("Linux isolates CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"], str(iso / ".claude"))
     check("Linux isolates CODEX_HOME", env["CODEX_HOME"], str(iso / ".codex"))
+    check("Linux isolates KIRO_HOME", env["TAUCETI_KIRO_HOME"], str(iso / ".kiro"))
+    check(
+        "Linux isolates Kiro data",
+        env["TAUCETI_KIRO_DATA_DIR"],
+        str(iso / ".local" / "share" / "kiro-cli"),
+    )
     check("Linux exports the same data root", env["TAUCETI_DATA_HOME"], str(iso))
     # gh and git config are redirected back at the operator's, since the moved $HOME has neither.
     check("Linux redirects GH_CONFIG_DIR", env["GH_CONFIG_DIR"], str(real / ".config" / "gh"))
