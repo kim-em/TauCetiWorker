@@ -74,6 +74,24 @@ print("[OK ] claude env drops ANTHROPIC_API_KEY")
 a, env = tc.host_agent_argv(P, "deepseek")
 check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"], "--prompt", P])
 
+a, env = tc.host_agent_argv(P, "kiro")
+check(
+    "kiro",
+    a,
+    [
+        "kiro-cli",
+        "chat",
+        "--no-interactive",
+        "--trust-all-tools",
+        "--model",
+        "gpt-5.6-sol",
+        "--effort",
+        "high",
+        P,
+    ],
+)
+check("kiro model is explicit (never Auto)", "auto" in [arg.lower() for arg in a], False)
+
 # PATH must prepend HERE so the agent resolves git-safe-push / gh-safe-pr-create / claim.sh
 assert env["PATH"].startswith(str(tc.HERE / "scripts") + ":"), "PATH must prepend the repo dir"
 print("[OK ] PATH prepends repo dir for the safe-push/claim wrappers")

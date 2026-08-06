@@ -69,7 +69,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
     rate-limited GitHub."""
-    openrouter = agent in OPENROUTER_MODELS
+    unpaced = agent in OPENROUTER_MODELS or agent == "kiro"
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -99,8 +99,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
             # while a window of it is reset-but-unopened: the round is authorized to spend ONE small
             # request to open it, but only once it has found work (see work_units.dispatch).
             pending_init = False
-            if openrouter:
-                model = agent  # pay-per-token; no quota wait
+            if unpaced:
+                model = agent  # explicit unpaced provider; no subscription quota wait
             elif ignore_quota and not quota_cmd:
                 # --ignore-quota overrides PACING (the soft over-pace throttle), not AVAILABILITY. We
                 # still read the usage endpoint and wait out a HARD block: a window at 100% (exhausted),
@@ -273,7 +273,8 @@ def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
 def choose_model(cfg: Config, agent: str, quota_cmd: str | None, *, refresh: bool = False) -> tuple[str | None, dict]:
     """Decide which model to run now. With --quota-cmd / TAUCETI_QUOTA_CMD set, consult that external
     command instead of the built-in pacer (the escape hatch for e.g. a multi-account scheme): run
-    `<quota_cmd> <agent>`; its first stdout token is the model to run (codex/claude/deepseek/minimax)
+    `<quota_cmd> <agent>`; its first stdout token is the model to run
+    (codex/claude/kiro/deepseek/minimax)
     or empty = none available. Otherwise use the self-contained pacer.
 
     This is a pure READ: choosing a model never spends quota. In particular an `auto` selection that
@@ -303,17 +304,17 @@ def resolve_work_model(
     cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None
 ) -> tuple[str, bool]:
     """Turn the --agent dial into (concrete model, needs-launch-stage-bootstrap). 'auto' consults the
-    pacer (or --quota-cmd); codex preferred, opus fallback. OpenRouter agents are pay-per-token (no
-    pacing). Dry-run symbolic. The bootstrap flag never launches anything by itself — it says the round
+    pacer (or --quota-cmd); codex preferred, opus fallback. Kiro and OpenRouter agents are explicit
+    and unpaced. Dry-run symbolic. The bootstrap flag never launches anything by itself — it says the round
     must ask for launch authorization once it has a work unit in hand."""
     if dry:
         return agent, False
-    if agent in OPENROUTER_MODELS:
+    if agent in OPENROUTER_MODELS or agent == "kiro":
         return agent, False
     if ignore_quota and not quota_cmd:
         if agent == "auto":
             raise SystemExit(
-                "--ignore-quota needs an explicit --agent (codex/claude); 'auto' can't choose without the pacer"
+                "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
             )
         return agent, False
     chosen, snap = choose_model(cfg, agent, quota_cmd)

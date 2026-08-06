@@ -40,8 +40,9 @@ discarded when the container is popped.
 
 ## Requirements
 
-Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime, and
-TauCetiWorker requires Bubble 0.7.30 or newer. Real sandbox rounds need a stable
+Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime.
+Kiro rounds require Bubble 0.7.31 or newer; existing agents require 0.7.30.
+Real sandbox rounds need a stable
 installed executable because Bubble owns a host-global auth daemon. For dry-run
 capability checks only, `tauceti` can fetch it with `uvx`. `tauceti doctor`
 reports whether the Bubble and Incus executables are present; the round preflight
@@ -54,6 +55,16 @@ executable, and `TAUCETI_BUBBLE_HOME` overrides the private Bubble home.
 [`pi`](https://github.com/badlogic/pi-mono) and allows openrouter.ai egress
 ([kim-em/bubble#299](https://github.com/kim-em/bubble/pull/299)), and
 `OPENROUTER_API_KEY` is staged read-only into the container.
+
+## Kiro
+
+`--agent kiro` is available in Bubble with the same exact-model entitlement
+check as host mode. Bubble installs the checksum-pinned native Kiro CLI and
+allows only Kiro's documented authentication, runtime, management, telemetry,
+and download domains. TauCeti snapshots either the selected `KIRO_API_KEY` or
+the browser-login SQLite database into the read-only round mount; Kiro receives
+a private, writable copy inside the disposable container. Other provider
+credentials do not cross the boundary.
 
 ## macOS Claude credentials
 

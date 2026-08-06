@@ -18,6 +18,7 @@ from pathlib import Path
 from .agents import (
     AuthoringProfile,
     _codex_review_model_override,
+    _kiro_review_model,
     fetch_git_source,
     fetch_ref,
     fill_prompt,
@@ -30,6 +31,7 @@ from .agents import (
     run_in_bubble,
     run_to_logfile,
     take_last_agent_infra_failure,
+    validate_kiro_model_access,
 )
 from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
@@ -87,8 +89,8 @@ def want(only: list[str], task: str) -> bool:
 @dataclass
 class RoundOpts:
     only: list[str]
-    agent: str  # auto|codex|claude|deepseek|minimax (the requested dial)
-    work_model: str  # the concrete model to run (codex|claude|deepseek|minimax), or 'auto' for dry-run
+    agent: str  # auto|codex|claude|kiro|deepseek|minimax (the requested dial)
+    work_model: str  # the concrete model to run, or 'auto' for dry-run
     sandbox_host: bool  # True = run on the host (the default); False = --bubble (use the sandbox)
     dry_run: bool
     source: str | None = None  # local directory or Git URL used read-only by a single-area roadmap PR
@@ -281,7 +283,7 @@ def _host_agent_binary(stage: str, model: str) -> str | None:
     if stage == "review":
         if model in OPENROUTER_MODELS:
             return "pi"
-        return {"codex": "codex", "claude": "claude"}.get(model)
+        return {"codex": "codex", "claude": "claude", "kiro": "kiro-cli"}.get(model)
     argv, _ = host_agent_argv("", model)
     return argv[0] if argv else None
 
@@ -314,7 +316,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         )
         return 0
     profile = _effective_authoring_profile(opts) if stage != "review" else None
+    kiro_probe_profile = profile
+    if stage == "review" and opts.work_model == "kiro":
+        kiro_probe_profile = resolve_authoring_profile("kiro", cli_model=_kiro_review_model("kiro"))
     needs_codex_probe = bool(profile and profile.provider == "codex" and profile.fallback_model)
+    needs_kiro_probe = bool(kiro_probe_profile and kiro_probe_profile.provider == "kiro")
     # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
     # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
     # review engine rejects `--reviewer codex` and do_review counts it as a PER-PR review error — so a
@@ -323,8 +329,14 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # would hit the identical failure, so it must not be charged to any single PR's error budget.
     # A default Codex authoring round also makes its read-only entitlement probe on the host before
     # entering Bubble, against the same mirrored subscription credential. Explicit Codex pins bypass it.
-    if not bubble or needs_codex_probe:
-        binname = "codex" if needs_codex_probe else _host_agent_binary(stage, opts.work_model)
+    if not bubble or needs_codex_probe or needs_kiro_probe:
+        binname = (
+            "codex"
+            if needs_codex_probe
+            else "kiro-cli"
+            if needs_kiro_probe
+            else _host_agent_binary(stage, opts.work_model)
+        )
         if binname and shutil.which(binname) is None:
             warn_red(
                 f"agent '{opts.work_model}' needs the `{binname}` CLI on PATH, but it is not "
@@ -342,6 +354,13 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         # Resolve Sol/Terra before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
         opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
+    if needs_kiro_probe:
+        # `--list-models` is authenticated but sends no model prompt. Require
+        # the exact pin before entering either backend; Kiro Auto is never a
+        # fallback for an account that lacks Sol/Opus access.
+        checked = validate_kiro_model_access(w.cfg, kiro_probe_profile)
+        if stage != "review":
+            opts.authoring_profile = checked
     # LAUNCH STAGE for a Claude round selected on an unopened window. Everything the bootstrap decision
     # requires is true exactly here and not earlier: a concrete work unit is in hand, the survey (and so
     # the GitHub preflight) succeeded, Claude is the model actually about to run, and the agent binary
@@ -420,6 +439,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         else:
             logf = w.cfg.logdir / f"review-{pr}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             cm = _codex_review_model_override(reviewers)  # operator override; else the engine default
+            km = _kiro_review_model(reviewers)
             rc = run_to_logfile(
                 [
                     "uvx",
@@ -440,6 +460,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     "--submitted-by",
                     me(),
                     *(["--codex-model", cm] if cm else []),
+                    *(["--kiro-model", km] if km else []),
                 ],
                 logf,
                 f"review #{pr}",

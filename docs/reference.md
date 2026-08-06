@@ -11,9 +11,9 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
 | `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap` (default: the whole cascade). |
 | `--skip TASKS` | Drop a comma list of tasks from the cascade. Combines with `--only` by subtraction. |
-| `--agent AGENT` | `auto` (default), `codex`, `claude`, `deepseek`, or `minimax`. |
+| `--agent AGENT` | `auto` (default), `codex`, `claude`, `kiro`, `deepseek`, or `minimax`. Kiro and OpenRouter providers are explicit-only and unpaced. |
 | `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
-| `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex or Claude provider. |
+| `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex, Claude, or Kiro provider. |
 | `--account EMAIL_OR_ID` | Require the Codex credential to be this account (email, or the workspace UUID `tauceti doctor` prints) and refuse to run otherwise. Checks only; never switches. Needs an explicit `--agent codex`. |
 | `--bubble` | Run code and review agents inside the Bubble sandbox instead of directly on the host. The outer survey and coordination, plus all progress-report rounds, remain on the host. |
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
@@ -23,10 +23,10 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
-| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. OpenRouter agents do not use the subscription pacer. |
+| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): usage must remain below the interpolated budget; time 0/100 default to 0/100. Default is `used% < elapsed%`. |
-| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux, `$CLAUDE_CONFIG_DIR` + `$CODEX_HOME` on macOS). |
+| `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux; provider-specific Claude, Codex, and Kiro directories on macOS). |
 | `--isolate-home` | Force that per-worker isolation even for the `default` id (a distinct id already implies it). |
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
 
@@ -67,6 +67,32 @@ An explicit `--author-model`, `TAUCETI_AUTHORING_CODEX_MODEL`, or legacy
 
 A generic authoring override is rejected with `--agent auto`, because the model
 or effort may not apply to whichever provider quota selection picks.
+
+## Kiro exact-model selection
+
+Kiro is explicit-only. The committed authoring default is `gpt-5.6-sol` at high
+effort; `--author-model claude-opus-4.8` selects Kiro's current exact Opus ID.
+Before either a host or Bubble launch, TauCeti runs
+`kiro-cli chat --list-models --format json` and requires the requested exact ID
+to be present. That command sends no prompt. A missing entitlement pauses the
+round instead of invoking Kiro Auto or silently downgrading.
+
+Reviews use the independent `TAUCETI_REVIEW_KIRO_MODEL` pin, defaulting to the
+same exact Sol ID. Use `KIRO_API_KEY` for headless authentication or
+`kiro-cli login` for a persisted browser login.
+
+## Credit usage
+
+`tauceti usage [--provider kiro|openrouter] [--json]` is a prompt-free,
+read-only telemetry command. `--provider` is repeatable and defaults to both.
+`--kiro-burn-rate CREDITS` and `--openrouter-burn-rate USD` add estimated rounds
+remaining to the report; they do not pace or select a provider. The equivalent
+environment defaults are `TAUCETI_KIRO_BURN_RATE` and
+`TAUCETI_OPENROUTER_BURN_RATE`.
+
+Kiro usage comes from the CLI's ACP extension and retains fractional credit
+values. OpenRouter's inference key reports key usage/limits; an optional
+`OPENROUTER_MANAGEMENT_KEY` adds account-wide purchased-credit telemetry.
 
 ## Codex accounts
 
@@ -112,10 +138,16 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-4.8` selects Opus; Kiro Auto is never used. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin, independent of the authoring model. Unset preserves the review engine's own default and fallback. |
+| `TAUCETI_REVIEW_KIRO_MODEL` | `gpt-5.6-sol` | Exact Kiro review-model pin, independent of authoring. |
 | `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`. |
 | `DEEPSEEK_MODEL` / `MINIMAX_MODEL` | `deepseek/deepseek-v4-pro` / `minimax/minimax-m3` | OpenRouter model ids for those agents. |
 | `OPENROUTER_API_KEY` | — | Required for `--agent deepseek\|minimax`; staged read-only into the bubble. |
+| `OPENROUTER_MANAGEMENT_KEY` | — | Optional management key for account-wide `tauceti usage` credit totals; never passed to an agent. |
+| `KIRO_API_KEY` | browser login | Optional headless Kiro credential. TauCeti isolates the browser store when set so the key wins deterministically. |
+| `TAUCETI_KIRO_HOME` / `TAUCETI_KIRO_DATA_DIR` | per-worker when isolated | Internal redirects for Kiro settings and its platform-native browser-auth SQLite store. |
+| `TAUCETI_KIRO_BURN_RATE` / `TAUCETI_OPENROUTER_BURN_RATE` | _(unset)_ | Observability-only default burn rates for `tauceti usage`; never used by the loop pacer. |
 | `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |
 | `TAUCETI_BUBBLE` | `bubble` (else `uvx` for dry-run probes only) | Override the Bubble executable. |
 | `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |

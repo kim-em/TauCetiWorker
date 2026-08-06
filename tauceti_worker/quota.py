@@ -1794,7 +1794,7 @@ class Quota:
         """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
 
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
-        fallback. OpenRouter agents (deepseek/minimax) bypass this entirely (handled by the caller).
+        fallback. Kiro and OpenRouter agents bypass this entirely (handled by the caller).
         """
         snap = {}
         if forced in (None, "auto", "codex"):
