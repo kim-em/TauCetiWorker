@@ -149,7 +149,7 @@ turn it off with `--ignore-claims`; see [the reference](docs/reference.md).
 | `auto` (default) | Codex (`gpt-5.6-sol` → Terra if unavailable, high) preferred; Claude (`claude-opus-5`, high) fallback | subscription, paced |
 | `codex` | `gpt-5.6-sol`, high effort; Terra fallback if Sol is unavailable | subscription, paced |
 | `claude` | `claude-opus-5`, high effort | subscription, paced |
-| `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-4.8` opt-in | subscription credits, unpaced |
+| `kiro` | `gpt-5.6-sol`, high effort by default; exact `claude-opus-5` opt-in | subscription credits, unpaced |
 | `deepseek` | `deepseek/deepseek-v4-pro` via OpenRouter + [`pi`](https://github.com/badlogic/pi-mono) | pay-per-token (`OPENROUTER_API_KEY`) |
 | `minimax` | `minimax/minimax-m3` via OpenRouter + `pi` | pay-per-token (`OPENROUTER_API_KEY`) |
 
@@ -160,7 +160,7 @@ Auto router is never used. For example:
 
 ```bash
 tauceti work --agent kiro                              # exact gpt-5.6-sol
-tauceti work --agent kiro --author-model claude-opus-4.8
+tauceti work --agent kiro --author-model claude-opus-5
 ```
 
 Run `kiro-cli chat --list-models --format json` to see which exact IDs your

@@ -27,8 +27,8 @@ def check(name, got, want):
 
 check(
     "model ids are extracted from Kiro's nested JSON",
-    agents._kiro_model_ids({"data": {"models": [{"modelId": "gpt-5.6-sol"}, {"model_id": "claude-opus-4.8"}]}}),
-    {"gpt-5.6-sol", "claude-opus-4.8"},
+    agents._kiro_model_ids({"data": {"models": [{"modelId": "gpt-5.6-sol"}, {"model_id": "claude-opus-5"}]}}),
+    {"gpt-5.6-sol", "claude-opus-5"},
 )
 
 saved_run = agents.subprocess.run
@@ -40,7 +40,7 @@ def fake_run(argv, **kwargs):
     return subprocess.CompletedProcess(
         argv,
         0,
-        stdout=json.dumps({"models": [{"id": "gpt-5.6-sol"}, {"id": "claude-opus-4.8"}]}),
+        stdout=json.dumps({"models": [{"id": "gpt-5.6-sol"}, {"id": "claude-opus-5"}]}),
         stderr="",
     )
 

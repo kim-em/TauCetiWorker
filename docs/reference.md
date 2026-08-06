@@ -71,7 +71,7 @@ or effort may not apply to whichever provider quota selection picks.
 ## Kiro exact-model selection
 
 Kiro is explicit-only. The committed authoring default is `gpt-5.6-sol` at high
-effort; `--author-model claude-opus-4.8` selects Kiro's current exact Opus ID.
+effort; `--author-model claude-opus-5` selects Kiro's current exact Opus ID.
 Before either a host or Bubble launch, TauCeti runs
 `kiro-cli chat --list-models --format json` and requires the requested exact ID
 to be present. That command sends no prompt. A missing entitlement pauses the
@@ -138,7 +138,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
-| `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-4.8` selects Opus; Kiro Auto is never used. |
+| `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-5` selects Opus; Kiro Auto is never used. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin, independent of the authoring model. Unset preserves the review engine's own default and fallback. |
 | `TAUCETI_REVIEW_KIRO_MODEL` | `gpt-5.6-sol` | Exact Kiro review-model pin, independent of authoring. |
 | `TAUCETI_CODEX_MODEL` | _(deprecated)_ | Legacy fallback for the Codex authoring model only. Prefer `TAUCETI_AUTHORING_CODEX_MODEL`. |
