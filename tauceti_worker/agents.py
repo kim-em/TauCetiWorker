@@ -68,7 +68,14 @@ def _validate_kiro_model_pin(model: str, source: str) -> str:
     """Reject Kiro's router anywhere an exact model id is required."""
     if model.lower().startswith("auto"):
         raise Die(f"Kiro model from {source} must be an exact model id, not the Auto router: {model!r}")
+    _reject_retired_opus(model, source)
     return model
+
+
+def _reject_retired_opus(model: str, source: str) -> None:
+    """Keep direct Claude and Kiro dispatches off the replaced Opus generation."""
+    if model.lower() in {"claude-opus-4.8", "claude-opus-4-8"}:
+        raise Die(f"Claude Opus 4.8 from {source} is retired; use the exact claude-opus-5 model")
 
 
 def resolve_authoring_profile(
@@ -123,6 +130,8 @@ def resolve_authoring_profile(
         raise Die(f"authoring model for {provider} must not be empty")
     if provider == "kiro":
         _validate_kiro_model_pin(model, model_source)
+    elif provider == "claude":
+        _reject_retired_opus(model, model_source)
     if effort and not re.fullmatch(r"[A-Za-z0-9._-]+", effort):
         raise Die(f"authoring effort for {provider} contains unsupported characters: {effort!r}")
     fallback_model = None

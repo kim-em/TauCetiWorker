@@ -77,12 +77,20 @@ try:
     check("Kiro bubble pins model", "--model gpt-5.6-sol" in kiro_bubble, True)
     check("Kiro bubble never invokes Auto", "--model auto" in kiro_bubble.lower(), False)
 
-    os.environ["TAUCETI_AUTHORING_KIRO_MODEL"] = "claude-opus-4.8"
+    os.environ["TAUCETI_AUTHORING_KIRO_MODEL"] = "claude-opus-5"
     os.environ["TAUCETI_AUTHORING_KIRO_EFFORT"] = "high"
     kiro_opus = tc.resolve_authoring_profile("kiro")
-    check("Kiro can explicitly select Opus", kiro_opus.model, "claude-opus-4.8")
-    check("Kiro Opus selection reaches host", "claude-opus-4.8" in tc.host_agent_argv("P", kiro_opus)[0], True)
-    check("Kiro Opus selection reaches Bubble", "--model claude-opus-4.8" in tc.agent_inner_cmd(kiro_opus), True)
+    check("Kiro can explicitly select Opus", kiro_opus.model, "claude-opus-5")
+    check("Kiro Opus selection reaches host", "claude-opus-5" in tc.host_agent_argv("P", kiro_opus)[0], True)
+    check("Kiro Opus selection reaches Bubble", "--model claude-opus-5" in tc.agent_inner_cmd(kiro_opus), True)
+
+    for provider, retired in (("claude", "claude-opus-4-8"), ("kiro", "claude-opus-4.8")):
+        try:
+            tc.resolve_authoring_profile(provider, cli_model=retired)
+        except tc.Die as exc:
+            check(f"{provider}: retired Opus is rejected", "claude-opus-5" in str(exc), True)
+        else:
+            check(f"{provider}: retired Opus is rejected", False, True)
     os.environ.pop("TAUCETI_AUTHORING_KIRO_MODEL")
     os.environ.pop("TAUCETI_AUTHORING_KIRO_EFFORT")
 

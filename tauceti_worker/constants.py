@@ -168,7 +168,7 @@ AUTHORING_DEFAULTS = {
     "codex": ("gpt-5.6-sol", "high"),
     "claude": ("claude-opus-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled
-    # id (for example claude-opus-4.8) with the existing --author-model flag.
+    # id (for example claude-opus-5) with the existing --author-model flag.
     "kiro": ("gpt-5.6-sol", "high"),
 }
 
