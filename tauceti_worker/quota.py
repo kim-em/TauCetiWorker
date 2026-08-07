@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import oauth as credential_refresh
 from .config import Config, log
 from .constants import CLAUDE_CMD
 from .github import GitHubError, _parse_retry_after
@@ -50,6 +51,14 @@ CLAUDE_RESET_SKEW_S = 60
 CLAUDE_BOOTSTRAP_RETRY_S = 3600
 
 CLAUDE_BOOTSTRAP_TIMEOUT_S = 120
+
+# How early the pacer rotates its own Claude access token, and how often it may contact the token
+# endpoint about one credential. An unattended `work --loop` otherwise stalls indefinitely once the
+# token expires: every poll reads HTTP 401 and waits for a human who is not there. The retry bound
+# matters because `claude()` is also called by the dashboard, which polls far faster than the loop —
+# a credential that cannot be rotated at all must not turn into a request flood.
+CLAUDE_REFRESH_SKEW_S = 5400
+CLAUDE_REFRESH_RETRY_S = 600
 
 # How long past its timeout an in-progress reservation is still believed. Covers a request that is
 # slower than the timeout we gave it plus clock skew between workers, so a crashed worker's claim
@@ -506,6 +515,12 @@ def _claude_payload_problem(payload: object) -> str | None:
     if isinstance(payload, dict):
         return None
     return f"claude usage response is not a JSON object (got {type(payload).__name__})"
+
+
+def _claude_unauthorized(prov: Provider) -> bool:
+    """Whether this verdict is the usage endpoint refusing our credential, as opposed to any of the
+    other ways a read fails. Only this one is worth answering with a credential rotation."""
+    return bool(prov.error and prov.error.startswith("claude usage HTTP 401"))
 
 
 def _claude_readings(payload: dict, now: float | None = None) -> list[Reading]:
@@ -1374,10 +1389,73 @@ class Quota:
             return block, sys.platform == "darwin"
         return None, False
 
-    def claude(self, *, refresh: bool = False) -> Provider:
+    def _refresh_claude_credential(self, *, force: bool = False) -> bool:
+        """Rotate this worker's Claude access token when it has expired or is about to, and report
+        whether the credential on disk actually changed.
+
+        An unattended `tauceti work --loop` has nobody to re-run `claude` for it, so without this a token
+        expiry ends the run: every poll reads HTTP 401 and sleeps.
+
+        OFF unless the operator sets --auto-refresh / $TAUCETI_AUTO_REFRESH=1, and that is a deliberate
+        default. Both providers issue single-use refresh tokens: exchanging one retires it. TauCeti can
+        serialize its OWN processes on this host (the flock below), but it cannot serialize an
+        interactive `claude` sharing the file, a second refresher, or a copy of the credential on another
+        machine — for any of those, a rotation here logs the other one out, and only the operator knows
+        whether the file is exclusively this worker's. So the default is to leave the token alone and
+        report Claude unavailable, which is recoverable; the opt-in says "nothing else uses this file".
+
+        Even when opted in it is skipped where the token still is not ours to spend:
+
+          * macOS, where the login Keychain is the store and any file beside it shares the operator's one
+            refresh token — rotating it would log out their interactive claude;
+          * a credential with no real refresh token, which is exactly what a worker MIRROR is. The Docker
+            deployment strips it on purpose and runs one dedicated refresher; the worker must not race it.
+
+        `force` is for the case where the stored expiry said the token was fine and the endpoint said
+        otherwise. Both paths are rate-limited by markers beside the credential, shared across every
+        worker on the host, so a credential that can no longer be rotated is retried at a bounded rate
+        rather than once per poll, and a rotation another process just performed is not immediately
+        spent again. A failure is reported and swallowed: an unrefreshable credential still reads as an
+        unavailable provider, which is the honest answer."""
+        if sys.platform == "darwin" or os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
+            return False
+        # The ORIGINAL, never the mirror the pacer reads: mirror_creds overwrites the mirror from the
+        # original every cycle, so rotating the mirror would be undone and leave the real credential
+        # expired. _claude_creds_source resolves the isolate_home marker for exactly this.
+        prov = credential_refresh.provider("claude", credentials=self._claude_creds_source() / ".credentials.json")
+        if not credential_refresh.renewable(prov):
+            return False
+        if not force:
+            # Pre-check before taking the lock: renewal is offered on every loop poll, and the common
+            # answer is "nothing to do". Reading the expiry costs one small read and no writes at all.
+            expiry = credential_refresh.expires_at(prov)
+            if expiry is None or expiry > time.time() + CLAUDE_REFRESH_SKEW_S:
+                return False
+        try:
+            result = credential_refresh.refresh_if_due(
+                prov,
+                CLAUDE_REFRESH_SKEW_S,
+                force=force,
+                attempt_interval_seconds=CLAUDE_REFRESH_RETRY_S,
+            )
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"claude credential: refresh failed ({e}) — claude stays unavailable until it is renewed")
+            return False
+        if result == "refreshed":
+            log(f"claude credential: access token renewed ({prov.credentials})")
+            return True
+        return False
+
+    def claude(self, *, refresh: bool = False, renew: bool = False) -> Provider:
         """Read the Claude usage endpoint and report whether opus may run. PURE: it reads, it never
         spends. A dashboard refresh, `tauceti status`, and an `auto` selection that ends up picking
         codex must all be able to call this without making a Claude request.
+
+        `renew` is the one exception, and it is opt-in per caller rather than a property of the read.
+        Rotating an access token spends no quota, but it consumes a single-use refresh token and
+        rewrites the operator's credential file, which is not something an inspection command may do
+        behind their back. Only callers that are about to act on the verdict pass it: the loop driver
+        pacing towards a round, the round resolving the model it will launch, and the launch stage.
 
         The state machine, per window and independent of the sibling window (they reset on separate
         clocks, so neither may be inferred from the other):
@@ -1390,6 +1468,10 @@ class Quota:
           post-reset gap)          controlled side effect can clear. Acting on it is the caller's
                                    explicit decision (authorize_claude_launch), never a read's.
         """
+        # Renew before reading, then mirror, so a rotation reaches an isolated worker's copy in the same
+        # call that performed it.
+        if renew:
+            self._refresh_claude_credential()
         mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         oauth, _from_keychain = self._claude_creds()
         if not oauth:
@@ -1402,6 +1484,16 @@ class Quota:
         # The bootstrap RESERVATION deliberately does not use this — see _claude_account_key.
         fp = self._fingerprint(oauth.get("accessToken"))
         prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh)
+        if renew and _claude_unauthorized(prov):
+            # The stored expiry said the token was live and the endpoint disagreed — a clock skew, a
+            # server-side revocation, or a credential rotated behind our back. Believe the endpoint over
+            # the file: rotate once (rate-limited), and re-read rather than reporting a 401 we can fix.
+            if self._refresh_claude_credential(force=True):
+                mirror_creds(self.cfg)
+                oauth, _from_keychain = self._claude_creds()
+                if oauth:
+                    fp = self._fingerprint(oauth.get("accessToken"))
+                    prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=True)
         return prov
 
     def authorize_claude_launch(self) -> Provider:
@@ -1416,7 +1508,7 @@ class Quota:
         The request is taken under a durable, cross-worker reservation, so a crash between the request
         and its outcome cannot license a second one. Afterwards the cache is dropped and a FRESH usage
         response decides: a bootstrap never grants availability by itself."""
-        prov = self.claude()
+        prov = self.claude(renew=True)  # about to spend a request: the token must be live
         if prov.available or not prov.bootstrap_eligible:
             return prov  # nothing to do, or something other than an initializable idle window blocks
         windows = list(prov.pending_bootstrap)
@@ -1436,7 +1528,7 @@ class Quota:
         self._forget_raw("claude")  # whatever we cached predates the request meant to change it
         if not ok:
             log(f"claude quota: bootstrap request failed ({detail}) — claude stays unavailable")
-        return self.claude()  # the fresh telemetry decides, including whether there is headroom to spend
+        return self.claude(renew=True)  # the fresh telemetry decides, including whether there is headroom to spend
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False
@@ -1458,12 +1550,11 @@ class Quota:
                     notes, bootstrap_recorded = self._idle_notes(readings)
                     return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded), readings
                 return Provider("claude", False, None, error=str(e)), None
-            # The worker never refreshes: the operator owns the single-use refresh token (rotating it here
-            # would invalidate their copy). An expired access token reads as unavailable until the operator's
-            # external refresher rotates it and mirror_creds picks it up next cycle. (On macOS the keychain-
-            # first read above already means we never hold a file refresh token to rotate.) Always name the
-            # status code — an auth failure, a rate-limited endpoint and a server error are different
-            # problems with different fixes, and none of them is "usage unknown".
+            # A 401 here is the endpoint refusing the access token. `claude()` answers it by rotating the
+            # credential once and re-reading, where the token is this worker's to rotate — see
+            # _refresh_claude_credential for the cases where it is not, which are the cases this error
+            # survives into. Always name the status code: an auth failure, a rate-limited endpoint and a
+            # server error are different problems with different fixes, and none of them is "usage unknown".
             if code != 200 or not payload:
                 if refresh and cached is not None and code != 401:
                     readings = _claude_readings(cached)
@@ -1471,7 +1562,7 @@ class Quota:
                     return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded), readings
                 err = f"claude usage HTTP {code}"
                 if code == 401:
-                    err += " (token expired; refresh left to the operator)"
+                    err += " (access token expired or rejected; log in again)"
                 elif code == 429:
                     err += " (usage endpoint rate-limited)"
                 elif code == 200:
@@ -1790,17 +1881,20 @@ class Quota:
         return min(blocked) if blocked else None
 
     # --- selection ---------------------------------------------------------
-    def choose(self, forced: str | None, *, refresh: bool = False) -> tuple[str | None, dict]:
+    def choose(self, forced: str | None, *, refresh: bool = False, renew: bool = False) -> tuple[str | None, dict]:
         """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
 
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
         fallback. Kiro and OpenRouter agents bypass this entirely (handled by the caller).
+
+        `renew` is passed through to Quota.claude: a caller that is about to act on the answer may
+        renew an expiring access token, an inspection command may not.
         """
         snap = {}
         if forced in (None, "auto", "codex"):
             snap["codex"] = self.codex(refresh=refresh)
         if forced in (None, "auto", "claude"):
-            snap["claude"] = self.claude(refresh=refresh)
+            snap["claude"] = self.claude(refresh=refresh, renew=renew)
         codex_ok = snap.get("codex") and snap["codex"].available
         opus_ok = snap.get("claude") and snap["claude"].available
         if forced == "codex":

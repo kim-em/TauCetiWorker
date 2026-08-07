@@ -30,6 +30,7 @@ from . import (
     constants,
     github,
     loop,
+    oauth,  # noqa: F401 — a submodule attribute, deliberately not flattened below
     paths,
     quota,
     review_state,
@@ -45,6 +46,8 @@ from . import (
 
 # Flatten each submodule's public + private top-level names into the package namespace, in
 # dependency order, so the entire former single-module surface is reachable as tauceti_worker.<NAME>.
+# `oauth` is deliberately absent: it is a self-contained credential-rotation module whose names
+# (Provider, provider, expires_at) would collide with the pacer's. Reach it as tauceti_worker.oauth.
 _MODULES = (
     paths,
     constants,

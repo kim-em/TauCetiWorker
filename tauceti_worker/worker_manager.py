@@ -44,6 +44,7 @@ _WORKER_KEYS = {
     "only",
     "sandbox",
     "ignore_quota",
+    "auto_refresh",
     "roadmap_only",
     "roadmap_skip",
     "roadmap_extra_identities",
@@ -183,6 +184,7 @@ class WorkerSpec:
     only: tuple[str, ...] = ()
     sandbox: str = "host"
     ignore_quota: bool = False
+    auto_refresh: bool = False
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
@@ -227,6 +229,7 @@ class WorkerSpec:
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
+            auto_refresh=_boolean(raw.get("auto_refresh", False), f"workers[{index}].auto_refresh"),
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
             roadmap_extra_identities=_strings(
@@ -257,6 +260,8 @@ class WorkerSpec:
             value["sandbox"] = self.sandbox
         if self.ignore_quota:
             value["ignore_quota"] = True
+        if self.auto_refresh:
+            value["auto_refresh"] = True
         if self.roadmap_only is not None:
             value["roadmap_only"] = self.roadmap_only
         if self.roadmap_skip:
@@ -293,6 +298,8 @@ class WorkerSpec:
             argv.append("--bubble")
         if self.ignore_quota:
             argv.append("--ignore-quota")
+        if self.auto_refresh:
+            argv.append("--auto-refresh")
         if self.roadmap_only is not None:
             argv += ["--roadmap-only", self.roadmap_only]
         if self.roadmap_skip:
@@ -1080,6 +1087,10 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         pacing += f" · curve {spec['pace']}"
     lines.extend(_status_field("pacing", [pacing], width))
 
+    # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
+    if spec.get("auto_refresh"):
+        lines.extend(_status_field("credential", ["renews its own Claude access token (--auto-refresh)"], width))
+
     if "roadmap" in phases:
         focus = spec.get("roadmap_only")
         roadmap = "auto (random each round)" if focus is None else ("all areas" if focus == "" else str(focus))
@@ -1507,10 +1518,11 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         for token in flags:
             if token in ("--loop", "--host"):
                 continue
-            if token in ("--ignore-quota", "--stream", "--isolate-home", "--bubble"):
+            if token in ("--ignore-quota", "--auto-refresh", "--stream", "--isolate-home", "--bubble"):
                 values[
                     {
                         "--ignore-quota": "ignore_quota",
+                        "--auto-refresh": "auto_refresh",
                         "--stream": "stream",
                         "--isolate-home": "isolate_home",
                         "--bubble": "bubble",
@@ -1588,6 +1600,13 @@ def add_workers_parser(subparsers) -> None:
         "--ignore-quota",
         action="store_true",
         help="ignore soft pacing for explicit codex/claude; Kiro/OpenRouter are already unpaced",
+    )
+    add.add_argument(
+        "--auto-refresh",
+        action="store_true",
+        help="renew this worker's Claude access token when it expires, instead of parking until a "
+        "human runs `claude`. Only safe when nothing else uses the same credential file "
+        "(see `tauceti work --help`)",
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
@@ -1673,6 +1692,7 @@ def cmd_workers(args) -> int:
                     "only": [item for item in args.only.split(",") if item],
                     "sandbox": args.sandbox,
                     "ignore_quota": args.ignore_quota,
+                    "auto_refresh": args.auto_refresh,
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
