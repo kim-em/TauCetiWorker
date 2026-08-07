@@ -207,5 +207,31 @@ ok = displayed == plain and "[red]✗[/]" in displayed
 print(f"[{'OK ' if ok else 'XX '}] genuine hard failure is unchanged: {displayed!r}")
 fails += not ok
 
+# --- markup=False: the same line for a destination that renders nothing ----------------------------
+# The loop driver logs the quota summary every time it sleeps, and log() writes to stderr and a file,
+# neither of which is a Rich console. A style tag left in is not a one-off blemish: it is on every line
+# of an idle worker's log. Only the glyph wrapper goes; the reason text is identical.
+for label, snap in (
+    ("error", {"claude": tc.Provider("claude", False, None, error="usage HTTP 401")}),
+    ("available", {"codex": tc.Provider("codex", True, "gpt-5")}),
+    ("soft", soft),
+    ("hard", hard),
+):
+    styled, bare = tc.quota_line(snap), tc.quota_line(snap, markup=False)
+    ok = not any(tag in bare for tag in ("[yellow]", "[green]", "[red]", "[/]")) and styled == bare.replace(
+        "?", "[yellow]?[/]"
+    ).replace("✓", "[green]✓[/]").replace("~", "[yellow]~[/]").replace("✗", "[red]✗[/]")
+    print(f"[{'OK ' if ok else 'XX '}] quota_line {label} drops only the glyph wrapper: {bare!r}")
+    fails += not ok
+
+bare_wait = tc._wait_quota_line({"codex": codex_paced, "claude": idle_paced}, markup=False)
+for want in ("claude ~ (", "codex ~ (", "session window reset — initialization deferred until pacing permits"):
+    ok = want in bare_wait
+    print(f"[{'OK ' if ok else 'XX '}] plain wait line contains {want!r}: {bare_wait!r}")
+    fails += not ok
+ok = "[" not in bare_wait
+print(f"[{'OK ' if ok else 'XX '}] plain wait line has no bracket at all: {bare_wait!r}")
+fails += not ok
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
