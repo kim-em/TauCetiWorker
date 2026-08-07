@@ -1855,19 +1855,27 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
     return False, "unavailable"
 
 
-def quota_line(snap: dict) -> str:
-    """One-line quota summary from a {provider: Provider} snapshot."""
+def _glyph(mark: str, style: str, markup: bool) -> str:
+    """A status mark, styled for a Rich console or bare for a plain stream. The same line is written
+    once and shown twice — the dashboard renders it, the loop driver logs it — and `print()` has no idea
+    what `[yellow]` means, so an unrendered line reads `claude [yellow]?[/] (...)` on every poll."""
+    return f"[{style}]{mark}[/]" if markup else mark
+
+
+def quota_line(snap: dict, *, markup: bool = True) -> str:
+    """One-line quota summary from a {provider: Provider} snapshot. `markup=False` for any destination
+    that is not a Rich console: log(), an on-disk log, a runtime-status detail."""
     parts = []
     for name in ("codex", "claude"):
         prov = snap.get(name)
         if prov is None:
             continue
         if prov.error:
-            parts.append(f"{name} [yellow]?[/] ({prov.error})")
+            parts.append(f"{name} {_glyph('?', 'yellow', markup)} ({prov.error})")
         elif prov.available:
-            parts.append(f"{name} [green]✓[/] {prov.model}")
+            parts.append(f"{name} {_glyph('✓', 'green', markup)} {prov.model}")
         else:
             soft, why = _unavail_reason(prov)
-            glyph = "[yellow]~[/]" if soft else "[red]✗[/]"
+            glyph = _glyph("~", "yellow", markup) if soft else _glyph("✗", "red", markup)
             parts.append(f"{name} {glyph} ({why})")
     return "   ".join(parts) if parts else "quota: (not checked)"

@@ -11,7 +11,7 @@ from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
-from .quota import Provider, Quota, _unavail_reason, quota_line
+from .quota import Provider, Quota, _glyph, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
@@ -33,15 +33,17 @@ def _pace_wait_reason(window) -> str:
     return f"{window.name} {label}{comparison}{left}"
 
 
-def _wait_quota_line(snap: dict) -> str:
+def _wait_quota_line(snap: dict, *, markup: bool = True) -> str:
     """Render the immediate pacing bottleneck when it defers an otherwise-initializable idle window.
 
     The provider remains HARD-blocked for launch-control purposes until the window is initialized; this
     is display-only. But when the only hard state is a plain post-reset idle window and a sibling window
     is pacing-blocked, the sibling is what must clear first. Show that condition first instead of hiding
     it behind the latent idle state.
+
+    `markup=False` for a plain destination; see quota_line.
     """
-    line = quota_line(snap)
+    line = quota_line(snap, markup=markup)
     prov = snap.get("claude")
     if prov is None or prov.error or prov.available:
         return line
@@ -59,8 +61,8 @@ def _wait_quota_line(snap: dict) -> str:
             *(f"{w.name} window reset — initialization deferred until pacing permits" for w in idle),
         ]
     )
-    old = quota_line({"claude": prov})
-    new = f"claude [yellow]~[/] ({why})"
+    old = quota_line({"claude": prov}, markup=markup)
+    new = f"claude {_glyph('~', 'yellow', markup)} ({why})"
     return line.replace(old, new, 1)
 
 
@@ -149,8 +151,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                             # throughout a known multi-hour wait. Recheck at least hourly so sibling
                             # workers or operator activity are still observed reasonably promptly.
                             nap = max(nap, min(int(min(eligible) - time.time()) + 5, 3600))
-                    log(f"quota: {_wait_quota_line(snap)} — sleeping {nap}s")
-                    report_runtime("waiting-quota", detail=_wait_quota_line(snap), next_action_at=time.time() + nap)
+                    # Neither destination renders Rich markup: log() writes to stderr and a file, and a
+                    # runtime-status detail is read back as data.
+                    waiting = _wait_quota_line(snap, markup=False)
+                    log(f"quota: {waiting} — sleeping {nap}s")
+                    report_runtime("waiting-quota", detail=waiting, next_action_at=time.time() + nap)
                     time.sleep(nap)
                     continue
 
