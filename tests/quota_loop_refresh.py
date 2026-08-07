@@ -22,22 +22,25 @@ class FakeQuota:
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def choose(self, forced, *, refresh=False):
-        calls.append((forced, refresh))
+    def choose(self, forced, *, refresh=False, renew=False):
+        calls.append((forced, refresh, renew))
         return "claude", {}
 
 
 saved = tc.loop.Quota
 tc.loop.Quota = FakeQuota
 try:
-    tc.loop.choose_model(object(), "claude", None, refresh=True)
+    tc.loop.choose_model(object(), "claude", None, refresh=True, renew=True)
     tc.loop.choose_model(object(), "auto", None)
+    # resolve_work_model runs in the round that will launch the model it picks, so it renews an
+    # expiring access token; a bare choose_model (status, dashboard) must not.
+    tc.loop.resolve_work_model(object(), "claude", dry=False, ignore_quota=False)
 finally:
     tc.loop.Quota = saved
 
-want = [("claude", True), (None, False)]
+want = [("claude", True, True), (None, False, False), ("claude", False, True)]
 ok = calls == want
-print(f"[{'OK ' if ok else 'XX '}] loop refresh vs ordinary cached read: got={calls!r} want={want!r}")
+print(f"[{'OK ' if ok else 'XX '}] loop refresh/renew vs ordinary cached read: got={calls!r} want={want!r}")
 
 # Pin the semantic behind the plumbing: a forced read must contact the endpoint even with a valid
 # cache, refresh that cache on success, and retain the valid cached verdict across a transient error.
@@ -84,8 +87,8 @@ saved_round = tc.loop.run_round_subprocess
 saved_sleep = tc.loop.time.sleep
 
 
-def choose(_cfg, agent, _cmd, *, refresh=False):
-    driver_calls.append((agent, refresh))
+def choose(_cfg, agent, _cmd, *, refresh=False, renew=False):
+    driver_calls.append((agent, refresh, renew))
     return "claude", {"claude": tc.Provider("claude", True, "opus")}
 
 
@@ -107,7 +110,7 @@ finally:
     tc.loop.run_round_subprocess = saved_round
     tc.loop.time.sleep = saved_sleep
 
-driver_want = [("claude", True), ("claude", True)]
+driver_want = [("claude", True, True), ("claude", True, True)]
 driver_ok = driver_calls == driver_want
 print(
     f"[{'OK ' if driver_ok else 'XX '}] paced and ignore-quota drivers refresh: "

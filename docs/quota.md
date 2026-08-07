@@ -16,14 +16,19 @@ that lands on Codex make no model request at all.
 
 ## Keeping the Claude token alive
 
-Where Claude keeps its credentials in a file, the pacer renews the access token
+Where Claude keeps its credentials in a file, the worker renews the access token
 itself once it is within 90 minutes of expiry, so an unattended `work --loop`
 does not stop at the first expiry and wait for a human to re-run `claude`. It
 renews the file the operator owns, never a worker's stripped mirror, and it never
 touches a credential that carries no refresh token, so the Docker deployment's
-dedicated refresher stays the single writer there. Set
-`$TAUCETI_NO_AUTO_REFRESH=1` if the file is shared with something else that
-rotates it and you want the pacer to keep out of the way.
+dedicated refresher stays the single writer there.
+
+Only the paths that are about to run something renew: the loop pacing towards a
+round, a round resolving the model it will launch, and the launch stage. Reading
+commands stay reads — `tauceti status` and the dashboard report an expired token
+rather than rotating it behind you. Set `$TAUCETI_NO_AUTO_REFRESH=1` to keep the
+worker off the refresh token entirely, if the file is shared with something else
+that rotates it.
 
 ## macOS and the login Keychain
 

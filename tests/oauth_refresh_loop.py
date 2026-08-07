@@ -6,10 +6,12 @@ pacer's own auto-refresh, so this exercises the module rather than the script.
 """
 
 import base64
+import http.client
 import json
 import sys
 import tempfile
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +35,11 @@ def check(label, condition):
 def responds(body, status=200):
     """Patch the one HTTP seam. The core returns (status, parsed-body-or-None) and never the raw text."""
     return patch.object(oauth, "_post_json", return_value=(status, body))
+
+
+def clear_cooldown(credentials):
+    """Drop the success marker, so the next case exercises the exchange rather than the rate limit."""
+    credentials.with_name(f".{credentials.name.lstrip('.')}.refresh.last-success").unlink()
 
 
 with tempfile.TemporaryDirectory() as temporary:
@@ -144,6 +151,18 @@ with tempfile.TemporaryDirectory() as temporary:
         not oauth.renewable(oauth.Provider("codex", codex_mirror, "https://example.test/codex", "codex-client")),
     )
 
+    # A successful rotation binds the next one for `minimum_interval_seconds`, and `force` does not lift
+    # that: forcing means "do not believe the stored expiry", not "spend a token issued moments ago".
+    with patch.object(oauth, "_post_json") as post:
+        check(
+            "the success cooldown holds a forced rotation back",
+            oauth.refresh_if_due(provider, 5400, force=True) == "cooldown",
+        )
+        post.assert_not_called()
+
+    # The cases below exercise the exchange itself, so step past the cooldown the rotation above set.
+    clear_cooldown(codex_file)
+
     # A server may rotate the refresh token and then return an incomplete response. Preserve the
     # new token before reporting the malformed exchange so a retry does not replay the old one.
     with responds({"refresh_token": "codex-rescue-refresh"}):
@@ -213,6 +232,24 @@ with tempfile.TemporaryDirectory() as temporary:
             "a rotation is attempted again once the interval elapses",
             oauth.refresh_if_due(provider, 5400, attempt_interval_seconds=600) == "refreshed",
         )
+
+    # A truncated or malformed response raises out of http.client, which is NOT under OSError. Left
+    # uncaught it would kill the refresher daemon that is supposed to back off, and crash a quota read.
+    # Only the exception type is reported: a token endpoint may echo request details into a body.
+    for failure in (
+        http.client.IncompleteRead(b"part"),
+        http.client.BadStatusLine("garbage"),
+        urllib.error.URLError("connection refused"),
+    ):
+        with patch.object(oauth.urllib.request, "urlopen", side_effect=failure):
+            try:
+                oauth._post_json("https://example.test/codex", {"refresh_token": "secret-token"})
+            except OSError as error:
+                caught = str(error)
+            else:
+                raise AssertionError(f"{type(failure).__name__} should surface as OSError")
+        check(f"{type(failure).__name__} becomes a catchable OSError", caught.startswith("token endpoint unreachable:"))
+        check(f"{type(failure).__name__} does not quote the request", "secret-token" not in caught)
 
     leftovers = list(root.rglob(".refresh.*"))
     check("atomic writes leave no temporary files", not leftovers)

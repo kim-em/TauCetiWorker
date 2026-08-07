@@ -104,7 +104,7 @@ try:
     quota, src, mirror = setup(tmp)
     seen, usage = usage_seen()
     with rotates_to("fresh-access") as post, usage:
-        prov = quota.claude()
+        prov = quota.claude(renew=True)
     check("an expired credential is rotated", post.call_count, 1)
     check(
         "the rotation writes the operator's source file",
@@ -126,16 +126,32 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-# 2) A credential nowhere near expiry is left alone — and not even locked, since `claude()` also runs on
-#    every dashboard tick.
+# 2) A credential nowhere near expiry is left alone — and not even locked, since renewal is offered on
+#    every loop poll.
 tmp = Path(tempfile.mkdtemp())
 try:
     quota, src, mirror = setup(tmp, expired=False)
     seen, usage = usage_seen()
     with patch.object(oauth, "_post_json") as post, usage:
-        quota.claude()
+        quota.claude(renew=True)
     check("a live credential is not rotated", post.call_count, 0)
     check("no lock file is created for a live credential", list(src.parent.glob("*.lock")), [])
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
+# 2b) Renewal is opt-in per caller. `tauceti status` and the dashboard read the same verdict, and must
+#     not consume the operator's single-use refresh token or rewrite their credential file to do it.
+tmp = Path(tempfile.mkdtemp())
+try:
+    quota, src, mirror = setup(tmp)  # expired, so a renewing caller WOULD rotate here
+    seen, usage = usage_seen()
+    with patch.object(oauth, "_post_json") as post, usage:
+        quota.claude()
+        tc.Quota(quota.cfg).choose(None)
+    check("an inspecting read never rotates", post.call_count, 0)
+    check(
+        "the credential file is untouched", json.loads(src.read_text())["claudeAiOauth"]["accessToken"], "stale-access"
+    )
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -146,7 +162,7 @@ try:
     quota, src, mirror = setup(tmp, refresh=None)
     seen, usage = usage_seen()
     with patch.object(oauth, "_post_json") as post, usage:
-        quota.claude()
+        quota.claude(renew=True)
     check("a credential with no refresh token is never rotated", post.call_count, 0)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
@@ -158,7 +174,7 @@ try:
     os.environ["TAUCETI_NO_AUTO_REFRESH"] = "1"
     seen, usage = usage_seen()
     with patch.object(oauth, "_post_json") as post, usage:
-        prov = quota.claude()
+        prov = quota.claude(renew=True)
     check("$TAUCETI_NO_AUTO_REFRESH keeps the pacer off the refresh token", post.call_count, 0)
     check("the stale token is still used as-is", seen, ["Bearer stale-access"])
 finally:
@@ -179,7 +195,7 @@ try:
         return answers.pop(0)
 
     with rotates_to("rescued-access") as post, patch.object(tc.quota, "_http_get_json", side_effect=fake):
-        prov = quota.claude()
+        prov = quota.claude(renew=True)
     check("a 401 forces exactly one rotation", post.call_count, 1)
     check("the retry uses the rotated token", seen, ["Bearer stale-access", "Bearer rescued-access"])
     check("the rescued read decides the verdict", prov.available, True)
@@ -195,7 +211,7 @@ try:
         patch.object(oauth, "_post_json", return_value=(400, None)),
         patch.object(tc.quota, "_http_get_json", return_value=(401, {}, None)),
     ):
-        prov = quota.claude()
+        prov = quota.claude(renew=True)
     check("an unrecoverable 401 stays a hard block", prov.available, False)
     check(
         "the error names the status and the fix",

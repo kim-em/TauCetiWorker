@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import http.client
 import json
 import os
 import tempfile
@@ -253,13 +254,20 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int = 15) -> tuple[in
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
+    # http.client raises its own exception tree for a truncated or malformed response (IncompleteRead,
+    # BadStatusLine), and it is not under OSError. `requests` folded those into RequestException, which
+    # the refresher daemon caught; left uncaught here they would kill a daemon that is supposed to back
+    # off, and crash a status read. Only the exception TYPE is reported — a body is never quoted.
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status, raw = response.status, response.read().decode()
     except urllib.error.HTTPError as error:
-        error.read()
+        try:
+            error.read()
+        except (OSError, http.client.HTTPException):
+            pass
         return error.code, None
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, UnicodeDecodeError) as error:
         raise OSError(f"token endpoint unreachable: {type(error).__name__}") from error
     try:
         return status, json.loads(raw)
@@ -308,7 +316,11 @@ def refresh_if_due(
             return "current"
         if not force and expiry is None:
             raise ValueError(f"cannot determine {prov.name} access-token expiry; log in again")
-        if not force and last_success is not None and now < last_success + minimum_interval_seconds:
+        # The success cooldown binds even a FORCED rotation. `force` means "do not believe the stored
+        # expiry", which is not a reason to spend a refresh token that was issued moments ago: a caller
+        # reacting to a 401 that arrives right after another process rotated would otherwise retire the
+        # brand-new credential, and this marker is the only bound shared with that process.
+        if last_success is not None and now < last_success + minimum_interval_seconds:
             return "cooldown"
         if attempt_interval_seconds:
             last_attempt = _marker_time(attempt_path)
