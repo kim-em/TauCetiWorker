@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""The pacer renews its own Claude access token instead of stalling on HTTP 401.
+"""With --auto-refresh, the worker renews its Claude access token instead of stalling on HTTP 401.
 
-An unattended `tauceti work --loop` has nobody to re-run `claude` for it, so a token expiry used to end
-the run: every poll read 401 and slept. Quota.claude() now rotates the credential the worker owns —
-and only that one. The cases where the token is NOT the worker's to spend (a stripped worker mirror, an
-operator opt-out) must still leave it alone, because a single-use refresh token spent by two processes
-leaves one of them holding a credential the server has already retired.
+An unattended `tauceti work --loop` has nobody to re-run `claude` for it, so a token expiry ends the
+run: every poll reads 401 and sleeps. An operator who has told us the credential file is exclusively
+this worker's can opt into renewing it.
+
+The opt-in is the point of most of these cases. A refresh token is single-use, so every path where the
+token might not be ours — no opt-in, a stripped worker mirror, an inspecting caller — must leave it
+alone, or the process that shares the file is left holding a credential the server has retired.
 """
 
 import json
@@ -60,7 +62,7 @@ def creds(access, expires_at, refresh="operator-refresh"):
     return json.dumps({"claudeAiOauth": block})
 
 
-def setup(tmp, *, expired=True, refresh="operator-refresh"):
+def setup(tmp, *, expired=True, refresh="operator-refresh", opt_in=True):
     """An isolated worker: it reads a MIRROR of the operator's credential, with a marker naming the
     original. Returns (quota, source credential path, mirror credential path)."""
     real, iso = tmp / "real", tmp / "iso"
@@ -69,6 +71,9 @@ def setup(tmp, *, expired=True, refresh="operator-refresh"):
         d.mkdir(parents=True)
     (dst / ".tauceti-creds-source").write_text(str(src))
     os.environ["CLAUDE_CONFIG_DIR"] = str(dst)
+    os.environ.pop("TAUCETI_AUTO_REFRESH", None)
+    if opt_in:
+        os.environ["TAUCETI_AUTO_REFRESH"] = "1"
     expiry = (time.time() - 60 if expired else time.time() + 86400) * 1000
     (src / ".credentials.json").write_text(creds("stale-access", expiry, refresh))
     (dst / ".credentials.json").write_text(creds("stale-access", expiry, None))  # mirrors carry no token
@@ -167,18 +172,20 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-# 4) The operator opt-out, for a credential file shared with something else that rotates it.
+# 4) The default. Without the opt-in the worker never touches the operator's refresh token, even on a
+#    renewing call with an expired credential: it reports Claude unavailable, which is recoverable.
 tmp = Path(tempfile.mkdtemp())
 try:
-    quota, src, mirror = setup(tmp)
-    os.environ["TAUCETI_NO_AUTO_REFRESH"] = "1"
+    quota, src, mirror = setup(tmp, opt_in=False)
     seen, usage = usage_seen()
     with patch.object(oauth, "_post_json") as post, usage:
-        prov = quota.claude(renew=True)
-    check("$TAUCETI_NO_AUTO_REFRESH keeps the pacer off the refresh token", post.call_count, 0)
+        quota.claude(renew=True)
+    check("without --auto-refresh nothing rotates", post.call_count, 0)
     check("the stale token is still used as-is", seen, ["Bearer stale-access"])
+    check(
+        "the credential file is untouched", json.loads(src.read_text())["claudeAiOauth"]["accessToken"], "stale-access"
+    )
 finally:
-    os.environ.pop("TAUCETI_NO_AUTO_REFRESH", None)
     shutil.rmtree(tmp, ignore_errors=True)
 
 # 5) The stored expiry says the token is live and the endpoint says otherwise (clock skew, or a

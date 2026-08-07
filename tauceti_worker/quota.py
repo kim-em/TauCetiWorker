@@ -1394,15 +1394,22 @@ class Quota:
         whether the credential on disk actually changed.
 
         An unattended `tauceti work --loop` has nobody to re-run `claude` for it, so without this a token
-        expiry ends the run: every poll reads HTTP 401 and sleeps. Rotating is only safe where the token
-        is genuinely this worker's to spend, so it is skipped when it is not:
+        expiry ends the run: every poll reads HTTP 401 and sleeps.
+
+        OFF unless the operator sets --auto-refresh / $TAUCETI_AUTO_REFRESH=1, and that is a deliberate
+        default. Both providers issue single-use refresh tokens: exchanging one retires it. TauCeti can
+        serialize its OWN processes on this host (the flock below), but it cannot serialize an
+        interactive `claude` sharing the file, a second refresher, or a copy of the credential on another
+        machine — for any of those, a rotation here logs the other one out, and only the operator knows
+        whether the file is exclusively this worker's. So the default is to leave the token alone and
+        report Claude unavailable, which is recoverable; the opt-in says "nothing else uses this file".
+
+        Even when opted in it is skipped where the token still is not ours to spend:
 
           * macOS, where the login Keychain is the store and any file beside it shares the operator's one
             refresh token — rotating it would log out their interactive claude;
           * a credential with no real refresh token, which is exactly what a worker MIRROR is. The Docker
-            deployment strips it on purpose and runs one dedicated refresher; the worker must not race it;
-          * $TAUCETI_NO_AUTO_REFRESH=1, for an operator who runs their own refresher (or shares the file
-            with an interactive session) and wants the pacer to keep its hands off.
+            deployment strips it on purpose and runs one dedicated refresher; the worker must not race it.
 
         `force` is for the case where the stored expiry said the token was fine and the endpoint said
         otherwise. Both paths are rate-limited by markers beside the credential, shared across every
@@ -1410,7 +1417,7 @@ class Quota:
         rather than once per poll, and a rotation another process just performed is not immediately
         spent again. A failure is reported and swallowed: an unrefreshable credential still reads as an
         unavailable provider, which is the honest answer."""
-        if sys.platform == "darwin" or os.environ.get("TAUCETI_NO_AUTO_REFRESH") == "1":
+        if sys.platform == "darwin" or os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
             return False
         # The ORIGINAL, never the mirror the pacer reads: mirror_creds overwrites the mirror from the
         # original every cycle, so rotating the mirror would be undone and leave the real credential

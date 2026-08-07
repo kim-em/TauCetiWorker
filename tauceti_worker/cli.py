@@ -110,6 +110,7 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
+  TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   CLAUDE_CONFIG_DIR      Claude config/credential source (Bubble uses a private macOS handoff)
                          (account switching, where the creds live in a file)
@@ -250,15 +251,16 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="opt OUT of avoiding roadmap targets other contributors have claimed on the "
         "intentions board (claim-respect is on by default). Sets $TAUCETI_RESPECT_CLAIMS=false",
     )
-    # Escape hatch for an operator whose Claude credential file is shared with something else that
-    # rotates it (their own refresher, or an interactive claude on the same file): the pacer then keeps
-    # its hands off the single-use refresh token entirely. Sets $TAUCETI_NO_AUTO_REFRESH=1.
     p.add_argument(
-        "--no-auto-refresh",
+        "--auto-refresh",
         dest="auto_refresh",
-        action="store_false",
+        action="store_true",
         default=None,
-        help=argparse.SUPPRESS,
+        help="renew this worker's Claude access token when it expires, instead of reporting Claude "
+        "unavailable until a human runs `claude` again. ONLY safe when nothing else uses the same "
+        "credential file: the refresh token is single-use, so an interactive `claude`, a second "
+        "refresher, or a copy of the credential on another host can be logged out by the rotation. "
+        "Off by default; sets $TAUCETI_AUTO_REFRESH=1 (inherited by loop children)",
     )
     p.add_argument(
         "--ignore-quota",
@@ -635,9 +637,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
     if getattr(args, "respect_claims", None) is False:
         os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
-    # --no-auto-refresh likewise, so loop children and the dashboard read the same decision.
-    if getattr(args, "auto_refresh", None) is False:
-        os.environ["TAUCETI_NO_AUTO_REFRESH"] = "1"
+    # --auto-refresh likewise, so a loop child renews on the same authority the driver was given.
+    if getattr(args, "auto_refresh", None):
+        os.environ["TAUCETI_AUTO_REFRESH"] = "1"
     # --pace overrides the env and is inherited by loop children (read live via pace_curve()). Validate
     # up front so a typo fails loudly here rather than silently falling back to the strict legacy curve.
     if getattr(args, "pace", None) is not None:

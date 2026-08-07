@@ -14,21 +14,37 @@ Reading quota never spends anything, with the one exception described under
 "window bootstrap" below. `tauceti status`, the dashboard, and an auto selection
 that lands on Codex make no model request at all.
 
-## Keeping the Claude token alive
+## Keeping the Claude token alive: `--auto-refresh`
 
-Where Claude keeps its credentials in a file, the worker renews the access token
-itself once it is within 90 minutes of expiry, so an unattended `work --loop`
-does not stop at the first expiry and wait for a human to re-run `claude`. It
-renews the file the operator owns, never a worker's stripped mirror, and it never
-touches a credential that carries no refresh token, so the Docker deployment's
-dedicated refresher stays the single writer there.
+By default the worker never rotates a refresh token. When the Claude access token
+expires it reports Claude unavailable, and your next `claude` run (or one
+`--ignore-quota --agent claude` round) renews it. That is fine at a keyboard and
+fatal unattended: `work --loop` will sit at
+`claude usage HTTP 401 (access token expired or rejected; log in again)` until
+someone intervenes.
 
-Only the paths that are about to run something renew: the loop pacing towards a
+`tauceti work --loop --auto-refresh` (or `$TAUCETI_AUTO_REFRESH=1`) lets the
+worker renew the token itself once it is within 90 minutes of expiry.
+
+**Only turn it on when nothing else uses that credential file.** Claude and Codex
+issue single-use refresh tokens: exchanging one retires it and returns a
+replacement. TauCeti serializes its own processes on the host, but it cannot
+serialize an interactive `claude` sharing `~/.claude/.credentials.json`, a second
+refresher, or a copy of the credential on another machine — a rotation here logs
+any of those out. The shape this is meant for is a worker running as its own
+user, with its own Claude account nobody signs into interactively;
+`$CLAUDE_CONFIG_DIR` gives the same separation on a shared login. On macOS the
+flag does nothing: the Keychain is the store, and the section below applies
+instead.
+
+When it is on: it renews the file the operator owns, never a worker's stripped
+mirror, and it never touches a credential carrying no refresh token, so the
+Docker deployment's dedicated refresher stays the single writer there. Rotations
+are rate-limited by markers beside the credential, shared across every worker on
+the host. Only the paths about to run something renew — the loop pacing towards a
 round, a round resolving the model it will launch, and the launch stage. Reading
-commands stay reads — `tauceti status` and the dashboard report an expired token
-rather than rotating it behind you. Set `$TAUCETI_NO_AUTO_REFRESH=1` to keep the
-worker off the refresh token entirely, if the file is shared with something else
-that rotates it.
+commands stay reads: `tauceti status` and the dashboard report an expired token
+rather than rotating it behind you.
 
 ## macOS and the login Keychain
 
