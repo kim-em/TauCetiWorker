@@ -250,6 +250,16 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="opt OUT of avoiding roadmap targets other contributors have claimed on the "
         "intentions board (claim-respect is on by default). Sets $TAUCETI_RESPECT_CLAIMS=false",
     )
+    # Escape hatch for an operator whose Claude credential file is shared with something else that
+    # rotates it (their own refresher, or an interactive claude on the same file): the pacer then keeps
+    # its hands off the single-use refresh token entirely. Sets $TAUCETI_NO_AUTO_REFRESH=1.
+    p.add_argument(
+        "--no-auto-refresh",
+        dest="auto_refresh",
+        action="store_false",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument(
         "--ignore-quota",
         dest="ignore_quota",
@@ -625,6 +635,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
         os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
     if getattr(args, "respect_claims", None) is False:
         os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
+    # --no-auto-refresh likewise, so loop children and the dashboard read the same decision.
+    if getattr(args, "auto_refresh", None) is False:
+        os.environ["TAUCETI_NO_AUTO_REFRESH"] = "1"
     # --pace overrides the env and is inherited by loop children (read live via pace_curve()). Validate
     # up front so a typo fails loudly here rather than silently falling back to the strict legacy curve.
     if getattr(args, "pace", None) is not None:

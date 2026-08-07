@@ -14,6 +14,17 @@ Reading quota never spends anything, with the one exception described under
 "window bootstrap" below. `tauceti status`, the dashboard, and an auto selection
 that lands on Codex make no model request at all.
 
+## Keeping the Claude token alive
+
+Where Claude keeps its credentials in a file, the pacer renews the access token
+itself once it is within 90 minutes of expiry, so an unattended `work --loop`
+does not stop at the first expiry and wait for a human to re-run `claude`. It
+renews the file the operator owns, never a worker's stripped mirror, and it never
+touches a credential that carries no refresh token, so the Docker deployment's
+dedicated refresher stays the single writer there. Set
+`$TAUCETI_NO_AUTO_REFRESH=1` if the file is shared with something else that
+rotates it and you want the pacer to keep out of the way.
+
 ## macOS and the login Keychain
 
 On macOS, Claude Code keeps its credentials in the login Keychain rather than in

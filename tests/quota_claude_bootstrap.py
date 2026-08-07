@@ -408,7 +408,7 @@ for label, payload in (("idle", IDLE), ("malformed", MALFORMED), ("absent", ABSE
 
 # --- endpoint failures are named, and never bootstrapped --------------------------------------------
 for code, want, ra in (
-    (401, "claude usage HTTP 401 (token expired; refresh left to the operator)", None),
+    (401, "claude usage HTTP 401 (access token expired or rejected; log in again)", None),
     (429, "claude usage HTTP 429 (usage endpoint rate-limited)", 580.0),
     (503, "claude usage HTTP 503", None),
 ):
