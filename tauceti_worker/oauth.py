@@ -22,6 +22,7 @@ import base64
 import fcntl
 import http.client
 import json
+import math
 import os
 import tempfile
 import time
@@ -79,20 +80,40 @@ def _jwt_exp(token: str) -> int | None:
         return None
 
 
-def _expires_at(prov: Provider, data: dict[str, Any]) -> float | None:
-    if prov.name == "claude":
-        value = (data.get("claudeAiOauth") or {}).get("expiresAt")
-        if isinstance(value, (int, float)):
-            return value / 1000 if value >= 100_000_000_000 else float(value)
+def _block(data: Any, key: str) -> dict[str, Any]:
+    """A named credential block, or {} for anything that is not a JSON object. Nothing here writes these
+    files: a partially-written one, a hand edit, or a schema change all arrive as valid JSON of the wrong
+    SHAPE, and `.get()` on a list raises AttributeError — which the daemon does not catch, so a mangled
+    credential would kill the process whose entire job is to keep retrying. Wrong shape must read as
+    "nothing usable here"."""
+    if not isinstance(data, dict):
+        return {}
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _seconds(value: Any) -> float | None:
+    """A finite, non-boolean number of seconds, else None. JSON admits Infinity and NaN, and both would
+    propagate into an expiry that then either never lapses or fails every comparison."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    token = (data.get("tokens") or {}).get("access_token")
+    return float(value) if math.isfinite(value) else None
+
+
+def _expires_at(prov: Provider, data: Any) -> float | None:
+    if prov.name == "claude":
+        value = _seconds(_block(data, "claudeAiOauth").get("expiresAt"))
+        if value is None:
+            return None
+        return value / 1000 if value >= 100_000_000_000 else value
+    token = _block(data, "tokens").get("access_token")
     return _jwt_exp(token) if isinstance(token, str) else None
 
 
-def _stored_refresh_token(prov: Provider, data: dict[str, Any]) -> str | None:
+def _stored_refresh_token(prov: Provider, data: Any) -> str | None:
     block = "claudeAiOauth" if prov.name == "claude" else "tokens"
     key = "refreshToken" if prov.name == "claude" else "refresh_token"
-    value = (data.get(block) or {}).get(key)
+    value = _block(data, block).get(key)
     if not isinstance(value, str) or not value or value == CODEX_REFRESH_PLACEHOLDER:
         return None
     return value
@@ -106,7 +127,7 @@ def renewable(prov: Provider) -> bool:
         data = json.loads(prov.credentials.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    return isinstance(data, dict) and _stored_refresh_token(prov, data) is not None
+    return _stored_refresh_token(prov, data) is not None
 
 
 def expires_at(prov: Provider) -> float | None:
@@ -115,7 +136,7 @@ def expires_at(prov: Provider) -> float | None:
         data = json.loads(prov.credentials.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    return _expires_at(prov, data) if isinstance(data, dict) else None
+    return _expires_at(prov, data)
 
 
 def _refresh_request(prov: Provider, data: dict[str, Any]) -> tuple[dict[str, str], str]:
@@ -149,9 +170,9 @@ def _merge_response(
         raise ValueError("refresh response contained no refresh token")
     prior_expiry = _expires_at(prov, credentials)
     if prov.name == "claude":
-        expires_in = response.get("expires_in")
-        candidate_expiry = time.time() + expires_in if isinstance(expires_in, (int, float)) else None
-        block = dict(credentials.get("claudeAiOauth") or {})
+        expires_in = _seconds(response.get("expires_in"))
+        candidate_expiry = time.time() + expires_in if expires_in is not None else None
+        block = dict(_block(credentials, "claudeAiOauth"))
         block["refreshToken"] = refresh_token
         regressed = prior_expiry is not None and candidate_expiry is not None and candidate_expiry <= prior_expiry
         if isinstance(access_token, str) and access_token and not regressed:
@@ -168,7 +189,7 @@ def _merge_response(
     else:
         candidate_expiry = _jwt_exp(access_token) if isinstance(access_token, str) else None
         regressed = prior_expiry is not None and candidate_expiry is not None and candidate_expiry <= prior_expiry
-        tokens = dict(credentials.get("tokens") or {})
+        tokens = dict(_block(credentials, "tokens"))
         tokens["refresh_token"] = refresh_token
         if isinstance(access_token, str) and access_token and not regressed:
             tokens["access_token"] = access_token
@@ -215,13 +236,13 @@ def _write_worker_mirror(prov: Provider, credentials: dict[str, Any]) -> None:
         return
     output = dict(credentials)
     if prov.name == "claude":
-        block = dict(output.get("claudeAiOauth") or {})
+        block = dict(_block(output, "claudeAiOauth"))
         block.pop("refreshToken", None)
         if not block.get("accessToken"):
             return
         output["claudeAiOauth"] = block
     else:
-        tokens = dict(output.get("tokens") or {})
+        tokens = dict(_block(output, "tokens"))
         if not tokens.get("access_token"):
             return
         tokens["refresh_token"] = CODEX_REFRESH_PLACEHOLDER
@@ -303,6 +324,10 @@ def refresh_if_due(
             return "waiting"
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"cannot read {prov.credentials}: {error}") from error
+        if not isinstance(credentials, dict):
+            # Valid JSON of the wrong shape. Rewriting it would discard whatever the operator has, and
+            # every field we need is absent, so say so and let the caller's back-off take over.
+            raise ValueError(f"{prov.credentials} is not a credential object; log in again")
 
         # Publish immediately after login/startup as well as after a rotation. This lets the
         # read-only worker volume become usable without waiting for the token to approach expiry.

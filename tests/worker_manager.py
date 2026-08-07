@@ -97,11 +97,14 @@ try:
 
     # Legacy command import produces the same semantic settings without retaining shell syntax.
     legacy = root / "workers.conf"
-    legacy.write_text("./tauceti work --loop --worker-id worker2 --agent codex --only rebase,review --ignore-quota\n")
+    legacy.write_text(
+        "./tauceti work --loop --worker-id worker2 --agent codex --only rebase,review --ignore-quota --auto-refresh\n"
+    )
     imported = wm.parse_legacy_config(legacy)
     assert imported[0].id == "worker2"
     assert imported[0].only == ("rebase", "review")
     assert imported[0].ignore_quota is True
+    assert imported[0].auto_refresh is True
 
     # The full semantic model must remain parseable by the real work CLI.
     maximal = wm.WorkerSpec(
@@ -110,6 +113,7 @@ try:
         only=("roadmap", "review"),
         sandbox="bubble",
         ignore_quota=True,
+        auto_refresh=True,
         roadmap_only="RepresentationTheory",
         roadmap_skip=("Algebra",),
         roadmap_extra_identities=("Maintainer",),
@@ -123,6 +127,12 @@ try:
     )
     parsed = build_parser().parse_args(maximal.work_argv()[3:])
     assert parsed.cmd == "work" and parsed.worker_id == "maximal"
+    assert parsed.auto_refresh is True
+    # A worker that has NOT opted in must not emit the flag: the default is to leave the operator's
+    # single-use refresh token alone.
+    assert "--auto-refresh" not in wm.WorkerSpec(id="plain").work_argv()
+    assert wm.WorkerSpec.from_dict({"id": "plain"}, 0).auto_refresh is False
+    assert wm.WorkerSpec.from_dict({"id": "opted", "auto_refresh": True}, 0).as_dict()["auto_refresh"] is True
 
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(

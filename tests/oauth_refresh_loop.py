@@ -251,5 +251,34 @@ with tempfile.TemporaryDirectory() as temporary:
         check(f"{type(failure).__name__} becomes a catchable OSError", caught.startswith("token endpoint unreachable:"))
         check(f"{type(failure).__name__} does not quote the request", "secret-token" not in caught)
 
+    # Valid JSON of the wrong SHAPE. Nothing here writes these files, so a hand edit or a schema change
+    # must read as "nothing usable" — `.get()` on a list raises AttributeError, which the daemon does not
+    # catch, so this used to kill the process whose whole job is to keep retrying.
+    misshapen = root / ".misshapen" / ".credentials.json"
+    misshapen.parent.mkdir()
+    shaped = oauth.Provider("claude", misshapen, "https://example.test/claude", "claude-client")
+    for body in ('{"claudeAiOauth": ["bad"]}', '{"claudeAiOauth": "bad"}', '["not an object"]', "null"):
+        misshapen.write_text(body)
+        check(f"{body} is not renewable", oauth.renewable(shaped) is False)
+        check(f"{body} yields no expiry", oauth.expires_at(shaped) is None)
+        with patch.object(oauth, "_post_json") as post:
+            try:
+                oauth.refresh_if_due(shaped, 5400, force=True)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{body} should fail with a named error, not rotate")
+            post.assert_not_called()
+
+    # A non-finite lifetime would give an expiry that never lapses (or fails every comparison). JSON
+    # admits Infinity and NaN, so the response is not a place to assume real numbers.
+    misshapen.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "expiresAt": 1}}))
+    with responds({"access_token": "b", "refresh_token": "r2", "expires_in": float("inf")}):
+        oauth.refresh_if_due(shaped, 5400, force=True)
+    check(
+        "a non-finite lifetime is ignored rather than stored",
+        json.loads(misshapen.read_text())["claudeAiOauth"]["expiresAt"] == 1,
+    )
+
     leftovers = list(root.rglob(".refresh.*"))
     check("atomic writes leave no temporary files", not leftovers)

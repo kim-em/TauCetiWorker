@@ -69,6 +69,20 @@ def main() -> int:
                 break
             backoff = min(maximum_backoff, max(poll_seconds, backoff * 2))
             continue
+        except Exception as error:  # noqa: BLE001 — a daemon that exists to keep retrying must not die
+            # Nothing is expected here; the named types above are. Report the TYPE only: an unanticipated
+            # exception may carry a credential in its message, and this line goes to container logs.
+            print(
+                f"{provider.name}-refresh: unexpected {type(error).__name__}; retrying in {backoff}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            if run_once:
+                return 1
+            if stop.wait(backoff):
+                break
+            backoff = min(maximum_backoff, max(poll_seconds, backoff * 2))
+            continue
         if run_once:
             return 0
         stop.wait(poll_seconds)
