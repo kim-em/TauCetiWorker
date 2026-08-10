@@ -33,7 +33,7 @@ MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR withou
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "f735789ac2b5185f6650f46e91a074fefdee6d68")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "880e8b9737973bfbd8f1f214f4ac2ded67f5b856")
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
