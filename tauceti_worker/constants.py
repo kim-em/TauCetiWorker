@@ -37,6 +37,14 @@ PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "880e8b9737973bfbd8f1f214f
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
+# Lines of a failing `tauceti-progress` subcommand echoed into the main log. The whole output is
+# saved to a file regardless; this is only how much of it a reader sees without opening that file.
+# Matches the 20 lines `agents.run_to_logfile` tails for the review engine.
+PROGRESS_TOOL_TAIL = 20
+# And a cap on each of those lines, because a line COUNT bounds nothing: a tool that dies without
+# printing a newline emits one line, and that line was reaching both the main log and the exception
+# message at its full length. Wide enough for a traceback's last line, which is the one that matters.
+PROGRESS_TOOL_LINE = 500
 
 # (the engine can't produce a review at all), stop retrying and ESCALATE —
 # a loud per-round warning + a tracking issue — since a PR that can never be

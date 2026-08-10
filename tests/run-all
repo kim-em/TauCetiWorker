@@ -49,6 +49,7 @@ RUN_STDLIB=(
   oauth_refresh_loop.py
   pace_curve.py
   preflight_review_lake.py
+  progress_tool_failure_log.py
   provider_usage.py
   quota_auto_refresh.py
   quota_cache_fp.py

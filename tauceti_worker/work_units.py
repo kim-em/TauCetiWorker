@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,8 @@ from .constants import (
     MAX_OPEN_PRS,
     OPENROUTER_MODELS,
     PROGRESS_REF,
+    PROGRESS_TOOL_LINE,
+    PROGRESS_TOOL_TAIL,
     REVIEW,
     REVIEW_DAILY_CAP,
     ROADMAP,
@@ -758,6 +761,91 @@ def do_progress(w, sv, c, opts, bubble) -> int | None:
             subprocess.run([CLAIM_SH, "release", "progress"], capture_output=True)
 
 
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _clip(line: str) -> str:
+    """One line of third-party output, made safe to put in front of a terminal.
+
+    Control bytes are stripped rather than passed through: this text reaches a tty, and an escape
+    sequence in a tool's output must not be able to move the cursor or set a title in the operator's
+    terminal. The length cap is what keeps a newline-free megabyte from becoming a megabyte-long log
+    line -- a line COUNT bounds nothing when the output contains no newlines.
+    """
+    clean = _CONTROL_RE.sub("", line)
+    return clean if len(clean) <= PROGRESS_TOOL_LINE else clean[:PROGRESS_TOOL_LINE] + " …[truncated]"
+
+
+def _best_effort_log(msg: str) -> None:
+    """`log`, for diagnostics that must not become the failure they are describing.
+
+    The disk that could not take the subsidiary log is usually the disk the main log is on, so the
+    write that reports "could not save the output" is itself likely to raise -- and that exception
+    would propagate in place of the tool failure we were called to explain.
+    """
+    try:
+        log(msg)
+    except (OSError, UnicodeError):
+        pass
+
+
+def _progress_tool_failed(w, sub: str, proc) -> str:
+    """Persist a failing `tauceti-progress <sub>`'s WHOLE output; return the reason to raise Die with.
+
+    These three subcommands must be captured rather than inherited — `prompt`'s stdout IS the prompt,
+    and `plan`'s carries the verdict — so on failure their output only exists in this process. It used
+    to be sliced to a few hundred characters straight into the main log, which cuts a Python traceback
+    off inside its FIRST frame: what got written down was the entry point and a path, never the
+    exception. A five-day reporting outage was diagnosed by re-running `plan` by hand, because the
+    error that caused it had been thrown away every time it happened.
+
+    Same convention as the review engine's per-review log (`agents.run_to_logfile`): the detail goes to
+    a file beside the round's other logs, the main log gets the last few lines and a pointer, and the
+    Die message carries the one line most likely to name the cause.
+    """
+    # Labelled sections, not concatenation. `plan` puts its verdict on stdout and its traceback on
+    # stderr, and joining them directly fuses the last line of one onto the first line of the other
+    # whenever the first does not end in a newline — inventing a line that neither stream contains.
+    saved = (
+        "".join(
+            f"=== {name} ===\n{text if text.endswith(chr(10)) else text + chr(10)}"
+            for name, text in (("stdout", proc.stdout or ""), ("stderr", proc.stderr or ""))
+            if text
+        )
+        or "(no output)\n"
+    )
+
+    where = ""
+    try:
+        w.cfg.logdir.mkdir(parents=True, exist_ok=True)
+        # `mkstemp` rather than a timestamped name, for two reasons at once. It creates the file 0600,
+        # and this one keeps a third-party tool's output verbatim -- a traceback does not print the
+        # environment, but nothing here can promise the tool never will, and the private copy is the
+        # one place the unabridged text has to live. And it cannot collide: `strftime` resolves to the
+        # second, so two failures inside one second shared a name and the first was simply lost.
+        fd, name = tempfile.mkstemp(
+            dir=w.cfg.logdir, prefix=f"progress-{sub}-{time.strftime('%Y%m%d-%H%M%S')}-", suffix=".log"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
+            f.write(saved)
+        logf = Path(name)
+        where = f"; full output → {logf}"
+    except OSError as exc:  # a log we cannot write must never replace the error we were reporting
+        _best_effort_log(f"  progress: could not save the {sub} output ({exc})")
+
+    # Bound what reaches the main log and the exception, in CHARACTERS as well as lines. A tool that
+    # dies without printing a newline produces exactly one line, so a line count alone bounds nothing:
+    # a megabyte of output became a megabyte-long log call and a megabyte-long Die message.
+    lines = (saved.splitlines() or [""])[-PROGRESS_TOOL_TAIL:]
+    _best_effort_log(f"  progress: tauceti-progress {sub} exited {proc.returncode}; last lines:")
+    for line in lines:
+        _best_effort_log("    " + _clip(line))
+    # The LAST non-empty line: for a traceback that is the exception itself, which the leading frames
+    # never name. Anything shorter than a tail loses it, which is exactly how this went undiagnosed.
+    summary = next((s.strip() for s in reversed(saved.splitlines()) if s.strip()), "")
+    return f"tauceti-progress {sub} failed (rc={proc.returncode}): {_clip(summary)}{where}"
+
+
 def _do_progress_inner(w, opts) -> int | None:
     # Record the ATTEMPT before anything fallible. The cadence check keys on the last *landed* report,
     # so without this a run that dies (or whose PR is later rejected) looks due again on the very next
@@ -798,8 +886,18 @@ def _do_progress_inner(w, opts) -> int | None:
         stale.unlink(missing_ok=True)  # never ship a previous round's prose
 
     def run_tool(*args: str, capture: bool = False):
+        # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
+        # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
+        # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
+        # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
         log(f"  $ tauceti-progress {args[0]} …")
-        return subprocess.run(progress_argv(w.cfg.state, *args), capture_output=capture, text=True, timeout=1800)
+        return subprocess.run(
+            progress_argv(w.cfg.state, *args),
+            capture_output=capture,
+            text=True,
+            errors="replace",
+            timeout=1800,
+        )
 
     # 1) The decision, re-run from FRESH state now that the claim is held — never from the survey's
     #    cached verdict, which is up to PROGRESS_TTL old and says nothing about which area won.
@@ -819,7 +917,7 @@ def _do_progress_inner(w, opts) -> int | None:
         return None
     if proc.returncode != 0:
         w.counters.incr("progress-err")
-        raise Die(f"tauceti-progress plan failed: {(proc.stderr or proc.stdout or '').strip()[:400]}")
+        raise Die(_progress_tool_failed(w, "plan", proc))
     plan = json.loads(plan_file.read_text())
     log(f"progress: {plan['roadmap']} — {len(plan['prs'])} PR(s), {plan['from_sha'][:7]}..{plan['to_sha'][:7]}")
 
@@ -842,7 +940,7 @@ def _do_progress_inner(w, opts) -> int | None:
     proc = run_tool("prompt", "progress", capture=True)
     if proc.returncode != 0 or not proc.stdout.strip():
         w.counters.incr("progress-err")
-        raise Die(f"tauceti-progress prompt failed: {(proc.stderr or '').strip()[:200]}")
+        raise Die(_progress_tool_failed(w, "prompt", proc))
     prompt_file.write_text(proc.stdout, encoding="utf-8")
     prompt = fill_prompt(
         prompt_file,
@@ -880,13 +978,15 @@ def _do_progress_inner(w, opts) -> int | None:
         capture=True,
     )
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    log(out[:600])
+    # A failure logs its own tail and saves the whole output, so it must be handled BEFORE the
+    # excerpt below — otherwise the same text lands in the log twice, once uselessly clipped.
+    if proc.returncode not in (0, EX_NOPROGRESS):
+        w.counters.incr("progress-err")
+        raise Die(_progress_tool_failed(w, "apply", proc))
+    log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
     if proc.returncode == EX_NOPROGRESS:
         bust_progress_cache(w.cfg)
         raise NoProgress("progress: this window is already in flight or already landed")
-    if proc.returncode != 0:
-        w.counters.incr("progress-err")
-        raise Die(f"tauceti-progress apply failed: {out[:400]}")
 
     # A report landed (as a PR). Clear the error streak, and drop the cached "due" verdict immediately:
     # otherwise this same worker would still read `due` from cache on its next round, minutes from now,
