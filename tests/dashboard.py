@@ -76,6 +76,7 @@ def fake_survey(next_stage="review"):
         ("awaiting-CI", 0, 0),
         ("awaiting-review", 2, 1),
         ("review-in-progress", 0, 0),
+        ("ci-failed", 0, 0),
         ("awaiting-author", 0, 0),
         ("ready-to-merge", 0, 0),
     ]
