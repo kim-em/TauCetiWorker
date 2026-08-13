@@ -396,14 +396,44 @@ def validate_kiro_model_access(cfg: Config, profile: AuthoringProfile) -> Author
 # Agents — prompt filling, the host checkout, and the agent launch. The host argv lists are a frozen
 # contract — keep them byte-for-byte stable (the historical `( cd … ) 9>&-` and `env -u` shell
 # mechanics map to cwd=, close_fds=True, and a pruned env). claim.sh / git-safe-push /
-# gh-safe-pr-create are put on the agent's PATH.
+# gh-safe-pr-create are put on the agent's PATH, AND named by absolute path in the prompts — see
+# wrapper_bin.
 # ============================================================================
 
 
+def wrapper_bin(bubble: bool = False) -> str:
+    """The directory holding the write wrappers, as the prompts must spell it.
+
+    PATH alone is not enough. Codex runs its shell as `bash -lc`, and a login shell re-runs the
+    system profile: on NixOS /etc/profile REPLACES $PATH outright unless $__ETC_PROFILE_SOURCED
+    came in with the environment, so the `HERE/scripts` prefix host_agent_argv exports is silently
+    dropped. Observed on 131 of 1525 codex transcripts and none of 1161 claude ones (claude uses a
+    non-login shell): `git-safe-push: command not found`, at the one moment that matters — after a
+    green build, before anything is pushed. 120 of those rounds spent two to four turns hunting for
+    the wrapper with `rg --files`; 11 never pushed at all and their work was lost.
+
+    The agents were right to refuse a raw `git push` — the prompts forbid it and it would bypass the
+    branch CAS. So the fix belongs here: name the wrapper by a path that no shell startup file can
+    take away. The PATH prefix stays as well, so a hand-written `git-safe-push` keeps working."""
+    return "/opt/round" if bubble else str(HERE / "scripts")
+
+
+_PLACEHOLDER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")
+
+
 def fill_prompt(path: Path, **subs) -> str:
-    out = Path(path).read_text()
+    path = Path(path)
+    out = path.read_text()
     for k, v in subs.items():
         out = out.replace(f"__{k}__", str(v))
+    # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
+    # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
+    # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
+    # to a scratch file), and its placeholder set is that repo's business, not ours.
+    if path.parent == HERE / "prompts":
+        left = sorted(set(_PLACEHOLDER_RE.findall(out)))
+        if left:
+            raise Die(f"{path.name}: unfilled prompt placeholder(s) {', '.join(left)}")
     return out
 
 

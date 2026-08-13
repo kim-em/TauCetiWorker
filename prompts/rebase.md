@@ -31,7 +31,7 @@ Iterate until green. Never push red — a botched conflict resolution that build
 - Commit the merge/resolution (if `git merge` left a merge commit, keep its default message; otherwise `<type>: <subject>`, ending the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push with the project's safe wrapper — and ONLY the wrapper:
   ```
-  git-safe-push
+  __BIN__/git-safe-push
   ```
   It compare-and-swaps the PR branch against the head you started from (so it works whether you merged or rebased, and never clobbers a concurrent push). Do NOT run a raw `git push` (nor `git push --force` / `--force-with-lease`); the wrapper is the only sanctioned push. If it reports the branch moved or the lease was lost, another agent pushed — STOP and say so in your report; do not work around it.
 - Do NOT open a new PR; do NOT touch other files.
