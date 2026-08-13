@@ -293,6 +293,14 @@ Bubble rounds copy that shared Claude credential into a private transient
 directory without modifying the Keychain. See [the sandbox notes](sandbox.md)
 for that handoff.
 
+What an isolated worker inherits is the credential, not your configuration. Its
+`.claude` directory gets a `settings.json` of its own, no `CLAUDE.md`, and only
+the one `pi` skill the worker itself dispatches through, so a round behaves the
+same whoever ran it and your personal instructions cannot contradict the task
+prompt. Edit that generated `settings.json` in place to tune a worker; it is
+written once and never overwritten. `TAUCETI_INHERIT_CLAUDE_CONFIG=1` restores
+the previous behaviour of sharing your own `CLAUDE.md`, settings, and skills.
+
 ## State on disk
 
 | Path | Contents |

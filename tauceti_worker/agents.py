@@ -1535,9 +1535,102 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
     return {var: os.environ[var] for var in ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR")}
 
 
+# Operator config that is tooling the WORKER runs, not instructions the AGENT reads. Symlinked into
+# the isolated config dir as before: none of it reaches a prompt.
+_MIRRORED_TOOLING = ("swap-account", "bin", "config.json")
+
+# The one skill the worker itself dispatches through: $PI_RUN defaults to
+# ~/.claude/skills/pi/scripts/run.sh, and in a loop child `~` is already the isolated home, so the
+# OpenRouter agents need this path to resolve. Symlinked individually rather than by exposing the
+# whole skills dir.
+_WORKER_SKILL = "pi"
+
+# What the isolated config dir gets instead of the operator's settings.json. Only the settings that
+# change how an UNATTENDED round behaves; --model / --effort / --dangerously-skip-permissions come
+# from host_agent_argv, so they are deliberately absent rather than a second source of truth.
+_WORKER_CLAUDE_SETTINGS = {
+    # The isolated .claude/projects/*.jsonl is the only per-turn record of what a claude round did;
+    # the worker's own logs/agent-*.log is a rendered summary. Keep both.
+    "cleanupPeriodDays": 36500,
+    "permissions": {"defaultMode": "bypassPermissions"},
+    # An unattended round has no one to show an artifact to, and publishing one is outward-facing.
+    "enableArtifact": False,
+    "alwaysThinkingEnabled": True,
+}
+
+
+def seed_worker_claude_config(real_claude: Path, iso_claude: Path) -> None:
+    """Give the worker's Claude config dir its own instruction surface, not the operator's.
+
+    isolate_home used to symlink `CLAUDE.md`, `settings.json` and `skills` from the operator's real
+    config dir, so every authoring round loaded whatever that operator happens to keep there. On this
+    fleet that is a 7 KB personal CLAUDE.md and 63 personal skills — roughly 5,500 tokens per round of
+    Kindle, WhatsApp and mathlib-fork instructions — and several of its rules contradict the task
+    prompt outright (a different PR-body sign-off, "always clone to /tmp for a repository that isn't
+    the cwd", "'draft a reply' means show it to me first" against a fix round that must post its
+    contest). It also made a round's behaviour depend on who ran it.
+
+    This is the same clean-room the review engine already builds for a reviewer, and for the same
+    stated reason: seed the credential, not the personality. Tooling the worker itself shells out to
+    is still symlinked (none of it reaches a prompt), and so is the single `pi` skill $PI_RUN
+    resolves through.
+
+    Existing worker homes are migrated: a symlink pointing into the operator's real config dir is
+    removed, because it is one we created. Anything the operator put there by hand — a real file, or
+    a symlink somewhere else — is left exactly as found, and so is a settings.json we already wrote.
+    `$TAUCETI_INHERIT_CLAUDE_CONFIG=1` restores the old wholesale mirroring."""
+    if os.environ.get("TAUCETI_INHERIT_CLAUDE_CONFIG") == "1":
+        for item in ("skills", "settings.json", "CLAUDE.md", *_MIRRORED_TOOLING):
+            src, dst = real_claude / item, iso_claude / item
+            if _safe_exists(src) and not dst.exists():
+                try:
+                    dst.symlink_to(src)
+                except OSError:
+                    pass
+        return
+
+    for item in _MIRRORED_TOOLING:
+        src, dst = real_claude / item, iso_claude / item
+        if _safe_exists(src) and not dst.exists():
+            try:
+                dst.symlink_to(src)
+            except OSError:
+                pass
+
+    # Drop the inherited instruction surface. Only ever our own symlink into the operator's dir.
+    for item in ("CLAUDE.md", "settings.json", "skills"):
+        dst = iso_claude / item
+        if dst.is_symlink():
+            try:
+                if Path(os.readlink(dst)) == real_claude / item:
+                    dst.unlink()
+            except OSError:
+                pass
+
+    # One skill, not the operator's shelf. A pre-existing real skills dir is left alone.
+    skills = iso_claude / "skills"
+    if not skills.exists() and not skills.is_symlink():
+        src = real_claude / "skills" / _WORKER_SKILL
+        try:
+            skills.mkdir(parents=True, exist_ok=True)
+            if _safe_exists(src):
+                (skills / _WORKER_SKILL).symlink_to(src)
+        except OSError:
+            pass
+
+    # Written once, so an operator can tune a worker by editing it in place.
+    settings = iso_claude / "settings.json"
+    if not settings.exists() and not settings.is_symlink():
+        try:
+            _write_json_atomic(settings, _WORKER_CLAUDE_SETTINGS)
+        except OSError:
+            pass
+
+
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
-    review / the --isolate-home flag). Symlinks the read-only Claude tool/config surface from the real
+    review / the --isolate-home flag). Gives the config dir its own agent-facing surface rather than
+    the operator's (seed_worker_claude_config) and symlinks the worker's own tooling from the real
     config dir; copies the mutable Claude/Codex auth files in ONCE, then records the source dirs in
     .tauceti-creds-source markers so mirror_creds() can re-mirror a fresher access token whenever the
     operator's external refresher rotates it. The worker itself never refreshes (never touches the
@@ -1589,13 +1682,7 @@ def isolate_home(wid: str) -> Path:
     iso_codex.mkdir(parents=True, exist_ok=True)
     iso_kiro_home.mkdir(parents=True, exist_ok=True)
     iso_kiro_data.mkdir(parents=True, exist_ok=True)
-    for item in ("skills", "swap-account", "bin", "config.json", "settings.json", "CLAUDE.md"):
-        src, dst = real_claude / item, iso_claude / item
-        if _safe_exists(src) and not dst.exists():
-            try:
-                dst.symlink_to(src)
-            except OSError:
-                pass
+    seed_worker_claude_config(real_claude, iso_claude)
     for f in (".credentials.json", ".gist-id", ".gist-encryption-key"):
         src, dst = real_claude / f, iso_claude / f
         if _safe_exists(src) and not dst.exists():
