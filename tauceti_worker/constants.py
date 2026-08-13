@@ -86,11 +86,20 @@ MAX_OPEN_PRS = 8
 
 # The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
 # The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
-# (a PR climbs CI -> review -> author fixes -> merge). Fixed set: a new status label won't appear here
+# (a PR climbs CI -> review -> author fixes -> merge). `ci-failed` and `awaiting-author` are both
+# author-action states, split because a red build is read in the build log and a changes request in
+# the review threads. Fixed set: a new status label won't appear here
 # until it is added, which keeps the line stable and its columns comparable round to round. These are
 # not a partition — a PR carrying none of them lands in no bucket, and the roadmap/* area labels are a
 # separate axis that this line ignores.
-STATUS_LABELS = ("awaiting-CI", "awaiting-review", "review-in-progress", "awaiting-author", "ready-to-merge")
+STATUS_LABELS = (
+    "awaiting-CI",
+    "awaiting-review",
+    "review-in-progress",
+    "ci-failed",
+    "awaiting-author",
+    "ready-to-merge",
+)
 
 
 # Loop timing. Env-overridable for tuning and tests.
@@ -197,7 +206,7 @@ WORK_TASKS = list(ALLOWED_TASKS)
 
 # Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
 # honor the project's globally paced progress reporting. The worker's fix/CI maintenance remains
-# ahead of fleet-wide reviews so awaiting-author work cannot be starved by unrelated reviews. Roadmap
+# ahead of fleet-wide reviews so author-action work cannot be starved by unrelated reviews. Roadmap
 # is the final fallback and is handled separately after these stages. The durable attempt breaker
 # keeps a stuck or rejected progress report from burning every round.
 AUTO_STAGES = ("rebase", "bump", "progress", "fix-ci", "fix", "review")
