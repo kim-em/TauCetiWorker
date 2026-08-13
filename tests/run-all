@@ -68,6 +68,7 @@ RUN_STDLIB=(
   round_group_sweep.py
   safe_exists.py
   scoreboard_trust.py
+  shared_build_caches.py
   source_argument.py
   spread_candidates.py
   ssl_cert_file.py

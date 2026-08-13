@@ -990,6 +990,11 @@ def ensure_bubble_home(cfg: Config) -> dict:
 
     home = bubble_home(cfg)
     env = {**os.environ, "BUBBLE_HOME": str(home)}
+    # Host cache paths mean nothing inside the container, and Bubble supplies the in-container Lake and
+    # Mathlib cache configuration itself (through its own download-only proxy and a per-round overlay,
+    # below). Drop the host redirects so they cannot reach the container if Bubble ever forwards them.
+    for var, _ in SHARED_BUILD_CACHES:
+        env.pop(var, None)
     home.mkdir(parents=True, exist_ok=True)
 
     def overlay_configured() -> bool:
@@ -1477,6 +1482,35 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
     return root / f"{wid[:keep]}-{digest}"
 
 
+# The Lean build caches every worker reads, and where each tool looks for its own by default. Both are
+# addressed by environment variable, so the redirect is all it takes; Lake's artifact/output cache needs
+# no entry because it lives under the toolchain directory and so follows ELAN_HOME.
+SHARED_BUILD_CACHES = (("MATHLIB_CACHE_DIR", (".cache", "mathlib")), ("ELAN_HOME", (".elan",)))
+
+
+def share_build_caches() -> dict[str, str]:
+    """Point the machine-wide Lean build caches at the login user's home, not the per-worker one.
+
+    Mathlib's cache tool resolves `~/.cache/mathlib` and elan resolves `~/.elan` through $HOME, so
+    moving $HOME for credential isolation silently gave every worker a private copy of the same
+    immutable, content-addressed downloads. Measured on a five-worker fleet: of one week's 10.2 GB of
+    `.ltar` traffic, 5.2 GB was a file another worker had already fetched from Mathlib's cache server,
+    and 22 toolchain installs covered 6 distinct toolchains. Nothing in either cache is a credential —
+    a `.ltar` is public and content-addressed, a toolchain is immutable — so there is nothing for the
+    isolation to protect, and pooling them is the configuration Mathlib and elan assume anyway (both
+    defaults are per-login-user, shared across a user's checkouts).
+
+    Resolves the target through `_host_home()` (pwd, not $HOME) so it computes the same paths whether
+    or not $HOME has already moved. isolate_home() therefore calls it on both its fresh and its
+    already-isolated path, which is what lets a round child of an older loop pick the caches up without
+    the whole fleet restarting. An operator-supplied value always wins; that is also how a host whose
+    caches live on another volume, or a test, opts out. Returns the resolved mapping, for logging."""
+    host = _host_home()
+    for var, parts in SHARED_BUILD_CACHES:
+        os.environ.setdefault(var, str(host.joinpath(*parts)))
+    return {var: os.environ[var] for var, _ in SHARED_BUILD_CACHES}
+
+
 def isolate_home(wid: str) -> Path:
     """Give this worker its OWN $HOME so its credentials can't race other workers or the operator (Codex
     review / the --isolate-home flag). Symlinks the read-only Claude tool/config surface from the real
@@ -1512,6 +1546,9 @@ def isolate_home(wid: str) -> Path:
     if os.environ.get("TAUCETI_DATA_HOME") == str(home):
         # Reassert the redirects rather than trusting them: they are what every credential read
         # resolves through, and a child that lost one would silently use the operator's account.
+        # The build caches are asserted here too, so a round child running this code under a loop
+        # parent that predates it still pools its downloads.
+        share_build_caches()
         os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
         os.environ["CODEX_HOME"] = str(iso_codex)
         os.environ["TAUCETI_KIRO_HOME"] = str(iso_kiro_home)
@@ -1601,6 +1638,10 @@ def isolate_home(wid: str) -> Path:
         os.environ["TAUCETI_KIRO_PROCESS_HOME"] = str(home)
     else:
         os.environ["TAUCETI_KIRO_XDG_DATA_HOME"] = str(iso_kiro_data.parent)
+    # Immutable, public build artifacts are pooled per machine rather than per worker; see
+    # share_build_caches(). Set on both platforms, and before the sentinel below.
+    caches = share_build_caches()
+    log("shared build caches: " + ", ".join(f"{var}={path}" for var, path in caches.items()))
     # The worker's data root, wherever $HOME ends up pointing. Config.resolve hangs the review store,
     # the bubble home and the claim scratch off this, so those stay per-worker and stay put on macOS
     # even though $HOME no longer moves. Written last: it doubles as the completion sentinel above.

@@ -223,6 +223,17 @@ Claude and Codex credential copies. GitHub CLI and Git configuration remain
 shared so the worker still acts as the operator's `gh` account. `--isolate-home`
 applies the same isolation when the id is literally `default`.
 
+The Lean build caches are deliberately outside that isolation. Mathlib's `.ltar`
+cache and the elan toolchain directory hold public, immutable, content-addressed
+artifacts that every worker fetches identically, so `$MATHLIB_CACHE_DIR` and
+`$ELAN_HOME` point at the login user's `~/.cache/mathlib` and `~/.elan` — one
+pool per machine, shared with your own checkouts. Left inside the per-worker
+`$HOME`, five workers downloaded the same Mathlib revision five times over.
+Lake's artifact cache lives under the toolchain directory and follows
+`$ELAN_HOME`. Set either variable yourself to override, and see
+`scripts/share-build-caches` for folding pre-existing per-worker copies into the
+pool without re-downloading them.
+
 On macOS, `$HOME` stays unchanged because both Claude Code and GitHub CLI use the
 login Keychain. `tauceti` redirects `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME`, which
 isolates Codex, but host workers still share the login user's Claude account.

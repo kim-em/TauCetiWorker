@@ -137,6 +137,8 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = strict `used% < elapsed%`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
+| `MATHLIB_CACHE_DIR` | login user's `~/.cache/mathlib` | Mathlib's `.ltar` cache. Pooled across workers rather than following the isolated `$HOME`; set it to keep a worker's downloads private, or to move the pool to another volume. |
+| `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, and the Lake artifact cache that lives under them. Pooled for the same reason. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
 | `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |

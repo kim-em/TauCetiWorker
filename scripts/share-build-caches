@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Fold pre-existing per-worker Lean build caches into the machine-wide pool.
+
+`share_build_caches()` points `$MATHLIB_CACHE_DIR` and `$ELAN_HOME` at the login user's home, so from
+the next round on every worker downloads into one pool. Workers that ran before that still hold a
+private copy of everything they ever fetched — on the fleet this was written for, five copies of
+Mathlib's `.ltar` cache (32 GB) and 22 toolchain installs of 6 distinct toolchains (63 GB). This
+script moves those copies into the pool by HARDLINK, so nothing is re-downloaded and nothing is
+duplicated: the pool and the per-worker directory then name the same bytes on disk.
+
+    scripts/share-build-caches                 # report only; touches nothing
+    scripts/share-build-caches --link          # link the per-worker copies into the pool
+    scripts/share-build-caches --link --prune  # ... then drop the per-worker copies
+
+`--prune` removes a per-worker file only where the pool already holds that exact path — as the same
+inode (the hardlink this script just made), as a symlink to the same target, or as a separate file of
+the same size. Names are identities in both caches: a `.ltar` is named by the hash of its contents, and
+an elan toolchain directory is named by its exact release, so a matching name is a matching artifact and
+a size that DISAGREES means one side is truncated. Mismatches and anything missing from the pool are
+reported and left in place, so the worst case is that nothing is deleted.
+
+Disk comes back only from the copies the pool already had under its own inode — pruning a hardlink
+frees nothing, since the pool still names those bytes. So `--link` is the half that stops the
+re-downloading and `--prune` is the half that returns the disk, and neither can lose data. Run
+`--prune` with the fleet stopped (`tauceti workers stop --all`): a round mid-`lake exe cache get`, or
+running `lake` out of a toolchain being pruned, is entitled to its files.
+
+Hardlinks need one filesystem. If a worker home and the pool live on different devices the script says
+so and skips that worker rather than silently copying and doubling the disk cost.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Per-worker source -> pool destination, as (label, subpath of the worker home, subpath of the login
+# home, subdirectories to pool). An empty subdirectory tuple means the whole tree. For elan only the
+# immutable, per-toolchain trees are pooled: `settings.toml` is that elan's own config and
+# `tmp`/`known-projects` are scratch, none of which is shareable content.
+CACHES = (
+    ("mathlib", Path(".cache/mathlib"), Path(".cache/mathlib"), ()),
+    ("elan", Path(".elan"), Path(".elan"), ("toolchains", "update-hashes")),
+)
+
+
+def human(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024.0
+    return f"{n} B"
+
+
+def walk(root: Path):
+    """Every path under *root*, files and symlinks, relative to it. Symlinks are never descended."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        for name in sorted(dirnames + filenames):
+            p = here / name
+            if p.is_symlink() or p.is_file():
+                yield p.relative_to(root)
+
+
+def same_device(a: Path, b: Path) -> bool:
+    """Do *a* and *b* live on one filesystem? Walks up to the nearest existing ancestor of each."""
+
+    def dev(p: Path) -> int:
+        for candidate in (p, *p.parents):
+            if candidate.exists():
+                return candidate.stat().st_dev
+        return -1
+
+    return dev(a) == dev(b) != -1
+
+
+def link_into(src: Path, dst: Path) -> tuple[int, int, int]:
+    """Hardlink every file under *src* into *dst*, leaving anything already there alone.
+
+    Returns (linked, already present, bytes now shared). A symlink is recreated rather than followed:
+    hardlinking through it would pull the target into the pool under the wrong name."""
+    linked = present = shared = 0
+    for rel in walk(src):
+        source, target = src / rel, dst / rel
+        if target.exists() or target.is_symlink():
+            present += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if source.is_symlink():
+                os.symlink(os.readlink(source), target)
+            else:
+                os.link(source, target)
+                shared += source.stat().st_size
+            linked += 1
+        except FileExistsError:  # a concurrent worker got there first; that is a win, not an error
+            present += 1
+        except OSError as e:
+            print(f"    ! {rel}: {e}", file=sys.stderr)
+    return linked, present, shared
+
+
+def pool_status(src: Path, dst: Path) -> tuple[list[Path], list[Path], int]:
+    """What the pool is missing, what disagrees with it, and the bytes `--prune` would release.
+
+    A path is held by the pool when it is there as the same inode (our hardlink), as a symlink to the
+    same target, or as a separate file of the same size — see the module docstring on why a matching
+    name is a matching artifact in both caches. A same-name file of a DIFFERENT size is reported
+    separately: one of the two is truncated, and neither the pool nor the worker should lose it
+    silently. Only a separate inode releases anything; dropping one of two hardlinks to the same
+    inode leaves the bytes exactly where they were."""
+    missing: list[Path] = []
+    mismatched: list[Path] = []
+    reclaimable = 0
+    for rel in walk(src):
+        source, target = src / rel, dst / rel
+        if source.is_symlink():
+            if not (target.is_symlink() and os.readlink(target) == os.readlink(source)):
+                missing.append(rel)
+            continue
+        try:
+            a, b = source.stat(follow_symlinks=False), target.stat(follow_symlinks=False)
+        except OSError:
+            missing.append(rel)
+            continue
+        if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+            continue
+        if a.st_size == b.st_size:
+            reclaimable += a.st_size
+        else:
+            mismatched.append(rel)
+    return missing, mismatched, reclaimable
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pool per-worker Lean build caches by hardlink.")
+    ap.add_argument("--link", action="store_true", help="hardlink per-worker copies into the pool")
+    ap.add_argument("--prune", action="store_true", help="then delete per-worker copies the pool holds")
+    ap.add_argument("--state", type=Path, default=REPO / "state", help="worker state root (default: <repo>/state)")
+    ap.add_argument("--home", type=Path, default=None, help="the pool's home (default: this user's)")
+    args = ap.parse_args()
+
+    login_home = args.home or Path(os.path.expanduser("~"))
+    homes = sorted(p for p in args.state.glob("*/home") if p.is_dir())
+    if not homes:
+        print(f"no worker homes under {args.state}")
+        return 0
+    print(f"pool: {login_home}   workers: {len(homes)}\n")
+
+    total_linked = total_shared = total_reclaimable = 0
+    blocked: list[str] = []
+    for home in homes:
+        wid = home.parent.name
+        for label, src_rel, dst_rel, subdirs in CACHES:
+            src, dst = home / src_rel, login_home / dst_rel
+            if not src.is_dir() or src.resolve() == dst.resolve():
+                continue
+            for sub in subdirs or (Path("."),):
+                s, d = src / sub, dst / sub
+                if not s.is_dir():
+                    continue
+                name = f"{wid}/{label}" + (f"/{sub}" if subdirs else "")
+                if not same_device(s, d):
+                    blocked.append(name)
+                    print(f"  {name}: SKIPPED — {s} and {d} are on different filesystems")
+                    continue
+                if args.link:
+                    linked, present, shared = link_into(s, d)
+                    total_linked += linked
+                    total_shared += shared
+                    print(f"  {name}: linked {linked}, already pooled {present} ({human(shared)} now shared)")
+                missing, mismatched, reclaimable = pool_status(s, d)
+                for label_, paths in (("not in the pool", missing), ("size disagrees with the pool", mismatched)):
+                    if paths:
+                        print(f"  {name}: {len(paths)} path(s) {label_}, e.g. {paths[0]}")
+                if args.prune:
+                    if missing or mismatched:
+                        print(f"  {name}: NOT pruned — the pool does not hold all of it")
+                    else:
+                        shutil.rmtree(s)
+                        total_reclaimable += reclaimable
+                        print(f"  {name}: pruned ({human(reclaimable)} released)")
+                else:
+                    total_reclaimable += reclaimable
+                    if not args.link:
+                        print(f"  {name}: {human(reclaimable)} would be released by --prune")
+
+    verb = "released" if args.prune else "recoverable"
+    print(f"\nlinked {total_linked} path(s), {human(total_shared)} newly shared; {human(total_reclaimable)} {verb}")
+    if blocked:
+        print(f"skipped (different filesystem): {', '.join(blocked)}")
+    if not (args.link or args.prune):
+        print("report only — pass --link (safe, additive) and then --prune with the fleet stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
