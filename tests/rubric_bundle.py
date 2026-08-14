@@ -76,6 +76,13 @@ def main():
         for a in ANGLES:
             check(f"{a} is present and labelled", f"# rubrics/{a}.md" in text and f"ANGLE {a}" in text)
 
+        # 1b) the preface says whose instructions these are. _common.md assigns its reader the role
+        # of a review agent and demands a JSON verdict; an author told to read it in full, first,
+        # must be told not to adopt either.
+        head = text[: text.index("# rubrics/_common.md")]
+        check("the preface disclaims the reviewer role", "ADDRESS THE REVIEWERS" in head)
+        check("...and the verdict output format", "output is a pull request" in head)
+
         # 2) the reference documents are NOT inlined.
         check("the naming reference is excluded", "REFERENCE" not in text)
         check("the human README is excluded", "for humans" not in text)
