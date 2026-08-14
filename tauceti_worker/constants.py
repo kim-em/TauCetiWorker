@@ -28,6 +28,14 @@ MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an
 # matched the transient patterns, an uncapped refund would retry it until a human noticed.
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without posting a verdict
 
+# The tauceti-review engine's exit status for "I stopped because the provider is unusable, and I
+# posted nothing" (TauCetiReview `runner/review.py: PROVIDER_DOWN_EXIT`). It is a separate status
+# precisely so this side can tell an outage from a review that failed on its own merits, and decline
+# to charge a PR for it. Kept distinct from the numbers the engine returns for ordinary failure; if
+# the engine ever renumbers, do_review would simply stop recognising the carve-out and go back to
+# charging, which is the pre-existing behaviour rather than a new failure mode.
+REVIEW_PROVIDER_DOWN_EXIT = 3
+
 # Progress reporting (TauCetiProgress). Pinned by SHA, not a branch: the worker's generator and the
 # merge gate in TauCetiRoadmap must run the SAME version, or the worker can emit headers the gate does
 # not recognise and every report wedges. Bump this together with the two pins in

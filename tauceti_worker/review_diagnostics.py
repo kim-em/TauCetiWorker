@@ -68,7 +68,26 @@ def classify_failure(summary: str) -> str:
         return "missing-tool"
     if "expected" in low and "head" in low:
         return "stale-head"
-    if any(s in low for s in ("rate limit", "too many requests", "429", "overloaded", "529")):
+    # "subscription window is exhausted" is how the engine's provider-down abort names an exhausted
+    # plan, and the subscription CLIs' own wording ("You've hit your session limit · resets 9:30pm")
+    # carries no status code at all, so neither matches the rate-limit vocabulary above. Both are the
+    # provider declining to serve, which is what this category means and what it publishes.
+    if any(
+        s in low
+        for s in (
+            "rate limit",
+            "too many requests",
+            "429",
+            "overloaded",
+            "529",
+            "subscription window",
+            "hit your session limit",
+            "hit your weekly limit",
+            "hit your monthly",
+            "usage limit",
+            "spend limit",
+        )
+    ):
         return "provider-unavailable"
     if any(s in low for s in ("git clone", "git fetch", "could not resolve host", "connection reset")):
         return "checkout-or-network"
