@@ -13,6 +13,7 @@ import time
 
 from .config import Config, Die, log
 from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
+from .github import claims_repo
 from .paths import CLAIM_SH, self_argv, self_env
 
 # ============================================================================
@@ -178,16 +179,19 @@ class Claims:
         self.cfg = cfg
         self.ctx = ctx
         self.held: tuple[str, str] | None = None
-        # Capture an operator override once so a skipped fork candidate cannot affect the next one.
-        self._claim_repo_override = os.environ.get("CLAIM_REPO") or None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
-        (caller skips this PR — dedup). A claim error is non-fatal: proceed unclaimed (CAS still protects)."""
+        (caller skips this PR — dedup). A claim error is non-fatal: proceed unclaimed (CAS still protects).
+
+        The claim goes to the worker's claim namespace, NOT to the PR's head repository: `branch/<pr>`
+        is keyed on the canonical PR number, so two workers contend for it wherever they are, whereas a
+        claim in someone else's fork is one only its owner can push. `owner`/`repo` still name the head
+        repo, because that is where the push arbiter's branch CAS runs."""
         key = f"branch/{pr}"
-        claim_repo = self._claim_repo_override or f"{owner}/{repo}"
+        claim_repo = claims_repo()
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
@@ -205,7 +209,11 @@ class Claims:
             self.ctx.add_cleanup(self.release)
             self.start_heartbeat(key, claim_repo)
         else:
-            log(f"claim acquire #{pr} errored (rc={rc}) — proceeding unclaimed (branch CAS still protects)")
+            log(
+                f"claim acquire #{pr} errored (rc={rc}) against {claim_repo} — proceeding unclaimed "
+                f"(branch CAS still protects). If this repeats, this account cannot push there; set "
+                f"CLAIM_REPO=<a repo your whole fleet can push to> to pick the namespace yourself."
+            )
             os.environ.pop("TAUCETI_CLAIM_KEY", None)
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
         return True

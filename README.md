@@ -17,6 +17,12 @@ fixes there, and opens PRs from it, so you do **not** need write access to the
 canonical repo. (A fine-grained token scoped only to the canonical repo is not
 enough.) Set `TAUCETI_FORK=<owner>/<repo>` to use an existing fork instead.
 
+Run as many workers as you like: they take a lease on each job so two of them
+never write the same report or fix the same PR, and that needs no setup and no
+write access either. Your fleet coordinates through your fork from the start,
+and joins the shared namespace every operator uses once you have had a PR
+merged. See [the claim namespace](docs/reference.md#the-claim-namespace).
+
 ## Quickstart
 
 You need `gh`, `git`, `uv`, and `jq`. Log `gh` in as the account the worker should

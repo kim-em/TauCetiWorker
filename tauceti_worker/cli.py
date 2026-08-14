@@ -53,8 +53,8 @@ from .config import (
     set_log_file,
     warn_red,
 )
-from .constants import AGENTS, ALLOWED_TASKS, EX_NOPROGRESS, OPENROUTER_MODELS, TAUCETI, WORK_TASKS
-from .github import GitHub
+from .constants import AGENTS, ALLOWED_TASKS, CLAIMS, EX_NOPROGRESS, OPENROUTER_MODELS, TAUCETI, WORK_TASKS
+from .github import GitHub, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
@@ -811,6 +811,18 @@ def cmd_doctor(args) -> int:
     rows.append(("jq", _have("jq"), "claim.sh needs it"))
     gh_auth = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0
     rows.append(("gh auth", gh_auth, "the worker acts as this account; its PRs are the ones it tends"))
+    # Which claim namespace this account gets, and therefore how far its de-duplication reaches. The
+    # row is not a failure: the fork always works, it just does not coordinate beyond your own fleet.
+    # Deliberately does not resolve the fork, so `doctor` never creates one as a side effect.
+    if gh_auth:
+        override = os.environ.get("CLAIM_REPO", "").strip()
+        if override:
+            note = f"$CLAIM_REPO={override} (operator override; every worker pointed here coordinates)"
+        elif shared_claims_granted():
+            note = f"{CLAIMS} — shared, so you de-duplicate against every operator"
+        else:
+            note = f"your fork — de-duplicates within your fleet; {CLAIMS} opens on your first merged PR"
+        rows.append(("claims", True, note))
     rows.append(("bubble", _have("bubble"), "stable install required for real --bubble rounds"))
     rows.append(("incus", _have("incus"), "bubble's container runtime — only needed for --bubble"))
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))

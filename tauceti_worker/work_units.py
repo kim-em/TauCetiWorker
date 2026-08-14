@@ -55,7 +55,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, ensure_fork, gh_run, me
+from .github import GitHub, GitHubError, claims_repo, ensure_fork, gh_run, me
 from .intentions import claimed_avoid_list
 from .paths import CLAIM_SH, HERE
 from .quota import Quota, _unavail_reason, mirror_creds
@@ -766,18 +766,25 @@ def do_progress(w, sv, c, opts, bubble) -> int | None:
     # — `plan` refuses an area with an open progress PR, and the branch name is a pure function of the
     # window so `apply` reconciles with whatever already exists. The claim just stops two workers paying
     # a model for the same report in the same minute, so a claim error proceeds rather than aborting.
-    rc_claim = subprocess.run([CLAIM_SH, "acquire", "progress", str(CLAIM_TTL_S)], capture_output=True).returncode
+    claim_env = {**os.environ, "CLAIM_REPO": claims_repo()}
+    rc_claim = subprocess.run(
+        [CLAIM_SH, "acquire", "progress", str(CLAIM_TTL_S)], capture_output=True, env=claim_env
+    ).returncode
     if rc_claim == 1:
         log("progress: another worker holds the progress claim — skipping (COOP dedup)")
         return None
     claimed = rc_claim == 0
     if not claimed:
-        log(f"progress: claim acquire errored (rc={rc_claim}) — proceeding unclaimed")
+        log(
+            f"progress: claim acquire errored (rc={rc_claim}) against {claim_env['CLAIM_REPO']} — proceeding "
+            f"unclaimed. If this repeats, this account cannot push there; set CLAIM_REPO=<a repo your whole "
+            f"fleet can push to> to pick the namespace yourself."
+        )
     try:
         return _do_progress_inner(w, opts)
     finally:
         if claimed:
-            subprocess.run([CLAIM_SH, "release", "progress"], capture_output=True)
+            subprocess.run([CLAIM_SH, "release", "progress"], capture_output=True, env=claim_env)
 
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")

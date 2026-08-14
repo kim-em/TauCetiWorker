@@ -68,6 +68,14 @@ The options are appended to `tauceti work --loop`. Edit or remove the line and r
 `docker compose up -d` again to change or clear them; credentials and worker data are
 retained.
 
+Several containers on one machine (or across machines) need no coordination
+setup: each resolves the same claim namespace and they de-duplicate their work
+automatically, so they will not all pick the same job. See
+[the claim namespace](reference.md#the-claim-namespace) for how that is resolved
+and when to override it with `CLAIM_REPO`. If you are running containers under
+two different `gh` accounts and want them treated as one fleet, give them the
+same `CLAIM_REPO=<a repo both accounts can push to>` in `.env`.
+
 For headless Kiro auth, set `KIRO_API_KEY` in `.env` instead of running the Kiro
 login command. Compose also forwards `OPENROUTER_API_KEY` and
 `OPENROUTER_MANAGEMENT_KEY` from `.env` for credit telemetry (and for an
