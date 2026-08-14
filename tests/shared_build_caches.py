@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
-"""The Lean build caches are pooled per machine, not per worker.
+"""How the Lean build caches are shared between workers, and how they are deliberately not.
 
-Mathlib's cache tool resolves `~/.cache/mathlib` and elan resolves `~/.elan` through $HOME, so the
-per-worker $HOME that isolate_home() creates for CREDENTIALS also gave every worker its own copy of
-the same public, content-addressed downloads: on a five-worker fleet, half of one week's 10.2 GB of
-`.ltar` traffic was a file another worker on the same disk had already fetched, and 22 toolchain
-installs covered 6 distinct toolchains. share_build_caches() redirects both back to the login user's
-home. These assertions pin the redirect (it must escape the per-worker home and honour an operator's
-own value) and, crucially, that the ALREADY-ISOLATED path asserts it too — that path is what a round
-child runs, so without it the pooling would only take effect after every loop was restarted.
+The per-worker $HOME that isolate_home() creates for CREDENTIALS also made Mathlib's `.ltar` cache and
+the elan toolchain directory per-worker, so on a five-worker fleet half of one week's 10.2 GB of
+`.ltar` traffic was a file another worker on the same disk already had, and 22 toolchain installs
+covered 6 distinct toolchains. Two different fixes, because the two caches are written differently:
+
+  * toolchains are shared outright (`ELAN_HOME`), since an install takes a lock and lands by rename;
+  * Mathlib's cache is NOT, because `lake exe cache get` takes no lock and older checkouts write
+    fixed-name temporaries, so two workers in one directory can leave a corrupt `.ltar` under a name
+    every later run trusts. It is pooled by hardlinking COMPLETE files instead, before the agent runs.
+  * Lake's own store stays per-worker: it is written throughout a build, not once at install.
+
+These assertions pin that split, the sentinel path a round child takes, and the pool exchange itself
+(promote then hydrate, transient files never pooled, an existing name never redefined).
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
+from tauceti_worker import build_caches
 
 fails = 0
 
 LOGIN_HOME = Path("/home/pretend-operator")
-CACHE_VARS = [var for var, _ in tc.agents.SHARED_BUILD_CACHES]
+CACHE_VARS = ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR")
 
 
 def check(name, cond):
@@ -34,65 +41,100 @@ def check(name, cond):
 
 
 def clear(env):
-    for var in (*CACHE_VARS, "TAUCETI_DATA_HOME"):
+    for var in (*CACHE_VARS, "TAUCETI_DATA_HOME", "TAUCETI_MATHLIB_POOL", "XDG_CACHE_HOME"):
         env.pop(var, None)
 
 
 def main():
     env = tc.agents.os.environ
-    orig = {k: env.get(k) for k in (*CACHE_VARS, "TAUCETI_DATA_HOME", "HOME")}
+    saved = {
+        k: env.get(k) for k in (*CACHE_VARS, "TAUCETI_DATA_HOME", "TAUCETI_MATHLIB_POOL", "XDG_CACHE_HOME", "HOME")
+    }
     orig_host_home, orig_platform = tc.agents._host_home, tc.agents.sys.platform
     tc.agents._host_home = lambda: LOGIN_HOME
+    data_home = Path("/srv/tauceti/state/worker1/home")
     try:
-        # --- the redirect itself ---
+        # --- what is shared, and what is not -------------------------------------------------------
         clear(env)
-        resolved = tc.agents.share_build_caches()
-        check(
-            "MATHLIB_CACHE_DIR is the login user's ~/.cache/mathlib",
-            env["MATHLIB_CACHE_DIR"] == "/home/pretend-operator/.cache/mathlib",
-        )
-        check("ELAN_HOME is the login user's ~/.elan", env["ELAN_HOME"] == "/home/pretend-operator/.elan")
+        resolved = tc.agents.share_build_caches("worker1", data_home)
+        check("toolchains are pooled at the login user's ~/.elan", env["ELAN_HOME"] == "/home/pretend-operator/.elan")
+        check("the Mathlib download target stays per-worker", Path(env["MATHLIB_CACHE_DIR"]).is_relative_to(data_home))
+        check("Lake's own store stays per-worker", Path(env["LAKE_CACHE_DIR"]).is_relative_to(data_home))
         check("returns the resolved mapping (for the log line)", resolved == {v: env[v] for v in CACHE_VARS})
-        # The whole point: neither may land under the per-worker home, whose whole subtree is what the
-        # duplication came from. Checked against every worker home shape, not just this platform's.
-        for platform in ("linux", "darwin"):
-            tc.agents.sys.platform = platform
-            worker_home = tc.agents._worker_iso_home("worker1")
-            for var in CACHE_VARS:
-                path = Path(env[var])
-                check(
-                    f"{var} is outside the {platform} per-worker home ({worker_home})",
-                    not path.is_relative_to(worker_home),
-                )
-        tc.agents.sys.platform = orig_platform
 
-        # --- an operator's own value wins (the opt-out for caches on another volume, and for tests) ---
+        # An operator's own values win — the opt-out for a host with caches elsewhere, and for tests.
         clear(env)
+        env["ELAN_HOME"] = "/mnt/big/elan"
         env["MATHLIB_CACHE_DIR"] = "/mnt/big/mathlib"
-        tc.agents.share_build_caches()
+        tc.agents.share_build_caches("worker1", data_home)
+        check("operator ELAN_HOME preserved", env["ELAN_HOME"] == "/mnt/big/elan")
         check("operator MATHLIB_CACHE_DIR preserved", env["MATHLIB_CACHE_DIR"] == "/mnt/big/mathlib")
-        check("ELAN_HOME still defaulted alongside it", env["ELAN_HOME"] == "/home/pretend-operator/.elan")
 
-        # --- the already-isolated path (what a round child of an older loop runs) ---
-        # isolate_home() returns early on the completion sentinel without touching the filesystem;
-        # it must still assert the cache redirects, or the pooling waits for a fleet restart.
+        # The pool follows the same order Mathlib's own tool uses, so it is the directory the
+        # operator's interactive `cache get` already fills.
+        check(
+            "pool honours XDG_CACHE_HOME",
+            build_caches.mathlib_pool(LOGIN_HOME, {"XDG_CACHE_HOME": "/xdg"}) == Path("/xdg/mathlib"),
+        )
+        check(
+            "pool falls back to the login home",
+            build_caches.mathlib_pool(LOGIN_HOME, {}) == LOGIN_HOME / ".cache" / "mathlib",
+        )
+        check(
+            "an explicit pool override wins",
+            build_caches.mathlib_pool(LOGIN_HOME, {"TAUCETI_MATHLIB_POOL": "/p"}) == Path("/p"),
+        )
+
+        # --- the already-isolated path, which is what a round child runs ---------------------------
         clear(env)
         tc.agents.sys.platform = "linux"
         home = tc.agents._worker_iso_home("worker1")
         env["TAUCETI_DATA_HOME"] = str(home)
         env["HOME"] = str(home)
-        returned = tc.agents.isolate_home("worker1")
-        check("already-isolated path returns the same home", returned == home)
-        for var, parts in tc.agents.SHARED_BUILD_CACHES:
-            check(f"already-isolated path sets {var}", env.get(var) == str(LOGIN_HOME.joinpath(*parts)))
-            check(f"already-isolated {var} is outside the worker home", not Path(env[var]).is_relative_to(home))
+        check("already-isolated path returns the same home", tc.agents.isolate_home("worker1") == home)
+        check("already-isolated path pools the toolchains", env.get("ELAN_HOME") == str(LOGIN_HOME / ".elan"))
+        check(
+            "already-isolated path keeps the download target private",
+            Path(env["MATHLIB_CACHE_DIR"]).is_relative_to(home),
+        )
     finally:
         tc.agents._host_home, tc.agents.sys.platform = orig_host_home, orig_platform
-        for k, v in orig.items():
-            if v is None:
-                env.pop(k, None)
-            else:
-                env[k] = v
+        for k, v in saved.items():
+            env.pop(k, None) if v is None else env.__setitem__(k, v)
+
+    # --- the pool exchange -------------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        private, pool = root / "worker/mathlib", root / "pool/mathlib"
+        private.mkdir(parents=True)
+        pool.mkdir(parents=True)
+        (private / "mine.ltar").write_bytes(b"mine")
+        (private / "half.ltar.7.part").write_bytes(b"incomplete")  # a download in flight
+        (private / "curl.cfg").write_bytes(b"url = ...")  # another process's file list
+        (private / "curl-7.88.1").write_bytes(b"ELF")  # the tool's own static curl
+        (pool / "theirs.ltar").write_bytes(b"theirs")
+        promoted, hydrated = build_caches.sync_pool(private, pool)
+        check("a finished artifact is promoted", (pool / "mine.ltar").exists())
+        check("the pool's artifact is hydrated", (private / "theirs.ltar").exists())
+        check("counts are reported", (promoted, hydrated) == (1, 1))
+        for scratch in ("half.ltar.7.part", "curl.cfg", "curl-7.88.1"):
+            check(f"{scratch} is never pooled", not (pool / scratch).exists())
+        check(
+            "pooling is by hardlink, not copy",
+            (pool / "mine.ltar").stat().st_ino == (private / "mine.ltar").stat().st_ino,
+        )
+        # An existing name is never redefined: that is what stops one worker from replacing an
+        # artifact another worker or the operator is already using, and it makes concurrent syncs safe.
+        (private / "theirs.ltar").unlink()
+        (private / "theirs.ltar").write_bytes(b"different bytes, same name")
+        build_caches.sync_pool(private, pool)
+        check("an existing pool entry is left alone", (pool / "theirs.ltar").read_bytes() == b"theirs")
+        # A worker whose own copy differs keeps its own; the pool does not overwrite it either.
+        check("the worker keeps its own divergent copy", (private / "theirs.ltar").read_bytes() != b"theirs")
+        # Idempotent: a second sync of an unchanged pair does nothing.
+        check("a repeated sync is a no-op", build_caches.sync_pool(private, pool) == (0, 0))
+        # Different filesystems cannot be hardlinked; report nothing rather than silently copying.
+        check("a cross-device pair links nothing", build_caches.link_into(private, Path("/proc/self")) == (0, 0))
 
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
     return 1 if fails else 0

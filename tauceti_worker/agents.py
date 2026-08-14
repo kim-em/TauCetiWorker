@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotations only; importing at runtime would invert the layer order
     from .work_units import RoundOpts, Worker
 
+from . import build_caches
 from .config import Config, Die, NoProgress, log
 from .constants import (
     AUTHORING_DEFAULTS,
@@ -406,8 +407,31 @@ def fill_prompt(path: Path, **subs) -> str:
     return out
 
 
+def sync_mathlib_pool(cfg: Config) -> None:
+    """Exchange finished `.ltar`s with the machine pool before the agent runs.
+
+    This is how the Mathlib cache is shared without pointing two unlocked downloaders at one
+    directory: the worker promotes what it fetched last round, then takes a link to everything the
+    pool has that it lacks, so `lake exe cache get` downloads only what nobody here has and still
+    writes nowhere another process can see. Best effort — a worker that cannot reach the pool
+    downloads more, which is slow rather than wrong. It must run before the agent starts, since the
+    worker's own directory is only quiescent until then."""
+    private = Path(os.environ.get("MATHLIB_CACHE_DIR") or (cfg.data_home / ".cache" / "mathlib"))
+    pool = build_caches.mathlib_pool(_host_home(), {k: v for k, v in os.environ.items() if k != "MATHLIB_CACHE_DIR"})
+    if private.resolve() == pool.resolve():
+        return  # operator pointed this worker straight at the pool; nothing to exchange
+    try:
+        promoted, hydrated = build_caches.sync_pool(private, pool)
+    except OSError as e:
+        log(f"mathlib cache pool: skipped ({e})")
+        return
+    if promoted or hydrated:
+        log(f"mathlib cache pool: promoted {promoted}, hydrated {hydrated} ({pool})")
+
+
 def prepare_checkout(cfg: Config) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
+    sync_mathlib_pool(cfg)
     co = cfg.checkout
     if not (co / ".git").is_dir():
         co.parent.mkdir(parents=True, exist_ok=True)
@@ -993,7 +1017,7 @@ def ensure_bubble_home(cfg: Config) -> dict:
     # Host cache paths mean nothing inside the container, and Bubble supplies the in-container Lake and
     # Mathlib cache configuration itself (through its own download-only proxy and a per-round overlay,
     # below). Drop the host redirects so they cannot reach the container if Bubble ever forwards them.
-    for var, _ in SHARED_BUILD_CACHES:
+    for var in ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR"):
         env.pop(var, None)
     home.mkdir(parents=True, exist_ok=True)
 
@@ -1482,33 +1506,33 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
     return root / f"{wid[:keep]}-{digest}"
 
 
-# The Lean build caches every worker reads, and where each tool looks for its own by default. Both are
-# addressed by environment variable, so the redirect is all it takes; Lake's artifact/output cache needs
-# no entry because it lives under the toolchain directory and so follows ELAN_HOME.
-SHARED_BUILD_CACHES = (("MATHLIB_CACHE_DIR", (".cache", "mathlib")), ("ELAN_HOME", (".elan",)))
+def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
+    """Settle where this worker's Lean build caches live: what it shares, and what stays its own.
 
+    Toolchains are shared. Every worker installs the same ones, an install takes a per-toolchain lock
+    and lands by rename, and 22 installs covering 6 distinct toolchains is 46 GB of duplicate disk and
+    a redundant download per worker per bump. So `ELAN_HOME` points at the login user's `~/.elan`,
+    where the operator's own toolchains already are.
 
-def share_build_caches() -> dict[str, str]:
-    """Point the machine-wide Lean build caches at the login user's home, not the per-worker one.
+    Lake's cache is NOT shared, even though it normally sits under the toolchain directory and would
+    otherwise follow `ELAN_HOME` there. It is written throughout a build rather than once at install,
+    and that its concurrent writers are safe is not established; `LAKE_CACHE_DIR` therefore stays in
+    the worker's own data root. That also keeps a per-worker experiment with `LAKE_ARTIFACT_CACHE`
+    honest, since the store it fills is then that worker's alone.
 
-    Mathlib's cache tool resolves `~/.cache/mathlib` and elan resolves `~/.elan` through $HOME, so
-    moving $HOME for credential isolation silently gave every worker a private copy of the same
-    immutable, content-addressed downloads. Measured on a five-worker fleet: of one week's 10.2 GB of
-    `.ltar` traffic, 5.2 GB was a file another worker had already fetched from Mathlib's cache server,
-    and 22 toolchain installs covered 6 distinct toolchains. Nothing in either cache is a credential —
-    a `.ltar` is public and content-addressed, a toolchain is immutable — so there is nothing for the
-    isolation to protect, and pooling them is the configuration Mathlib and elan assume anyway (both
-    defaults are per-login-user, shared across a user's checkouts).
+    Mathlib's `.ltar` cache also stays per-worker — as the download target. `lake exe cache get` takes
+    no lock and, in any checkout older than mathlib4#42752, writes fixed-name temporaries, so pointing
+    two workers at one directory risks a corrupt `.ltar` under a name every later run trusts. It is
+    pooled instead by hardlink, before the agent starts; see `tauceti_worker.build_caches`.
 
-    Resolves the target through `_host_home()` (pwd, not $HOME) so it computes the same paths whether
-    or not $HOME has already moved. isolate_home() therefore calls it on both its fresh and its
-    already-isolated path, which is what lets a round child of an older loop pick the caches up without
-    the whole fleet restarting. An operator-supplied value always wins; that is also how a host whose
-    caches live on another volume, or a test, opts out. Returns the resolved mapping, for logging."""
+    Called on both isolate_home() paths, so a round child of a loop that predates this still gets it,
+    and resolved through `_host_home()` (pwd, not $HOME) so it computes the same answer either way. An
+    operator-supplied value always wins. Returns the resolved mapping, for logging."""
     host = _host_home()
-    for var, parts in SHARED_BUILD_CACHES:
-        os.environ.setdefault(var, str(host.joinpath(*parts)))
-    return {var: os.environ[var] for var, _ in SHARED_BUILD_CACHES}
+    os.environ.setdefault("ELAN_HOME", str(build_caches.elan_pool(host)))
+    os.environ.setdefault("MATHLIB_CACHE_DIR", str(data_home / ".cache" / "mathlib"))
+    os.environ.setdefault("LAKE_CACHE_DIR", str(data_home / ".cache" / "lake"))
+    return {var: os.environ[var] for var in ("ELAN_HOME", "MATHLIB_CACHE_DIR", "LAKE_CACHE_DIR")}
 
 
 def isolate_home(wid: str) -> Path:
@@ -1548,7 +1572,7 @@ def isolate_home(wid: str) -> Path:
         # resolves through, and a child that lost one would silently use the operator's account.
         # The build caches are asserted here too, so a round child running this code under a loop
         # parent that predates it still pools its downloads.
-        share_build_caches()
+        share_build_caches(wid, home)
         os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
         os.environ["CODEX_HOME"] = str(iso_codex)
         os.environ["TAUCETI_KIRO_HOME"] = str(iso_kiro_home)
@@ -1638,10 +1662,10 @@ def isolate_home(wid: str) -> Path:
         os.environ["TAUCETI_KIRO_PROCESS_HOME"] = str(home)
     else:
         os.environ["TAUCETI_KIRO_XDG_DATA_HOME"] = str(iso_kiro_data.parent)
-    # Immutable, public build artifacts are pooled per machine rather than per worker; see
+    # Which build caches this worker shares with the machine and which stay its own; see
     # share_build_caches(). Set on both platforms, and before the sentinel below.
-    caches = share_build_caches()
-    log("shared build caches: " + ", ".join(f"{var}={path}" for var, path in caches.items()))
+    caches = share_build_caches(wid, home)
+    log("build caches: " + ", ".join(f"{var}={path}" for var, path in caches.items()))
     # The worker's data root, wherever $HOME ends up pointing. Config.resolve hangs the review store,
     # the bubble home and the claim scratch off this, so those stay per-worker and stay put on macOS
     # even though $HOME no longer moves. Written last: it doubles as the completion sentinel above.

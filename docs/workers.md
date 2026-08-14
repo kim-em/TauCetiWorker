@@ -223,16 +223,37 @@ Claude and Codex credential copies. GitHub CLI and Git configuration remain
 shared so the worker still acts as the operator's `gh` account. `--isolate-home`
 applies the same isolation when the id is literally `default`.
 
-The Lean build caches are deliberately outside that isolation. Mathlib's `.ltar`
-cache and the elan toolchain directory hold public, immutable, content-addressed
-artifacts that every worker fetches identically, so `$MATHLIB_CACHE_DIR` and
-`$ELAN_HOME` point at the login user's `~/.cache/mathlib` and `~/.elan` — one
-pool per machine, shared with your own checkouts. Left inside the per-worker
-`$HOME`, five workers downloaded the same Mathlib revision five times over.
-Lake's artifact cache lives under the toolchain directory and follows
-`$ELAN_HOME`. Set either variable yourself to override, and see
-`scripts/share-build-caches` for folding pre-existing per-worker copies into the
-pool without re-downloading them.
+The Lean build caches are handled outside that isolation, in two different
+ways, because they are written differently.
+
+Toolchains are shared outright: `$ELAN_HOME` points at the login user's
+`~/.elan`, so one install serves every worker and your own checkouts. Installing
+a toolchain takes a per-toolchain lock and lands by rename, so workers racing for
+the same one is safe. Left per-worker, 22 installs covered 6 distinct toolchains.
+
+Mathlib's `.ltar` cache is *not* shared as a download target. `lake exe cache
+get` takes no lock, and in any checkout older than
+https://github.com/leanprover-community/mathlib4/pull/42752 it writes fixed-name
+temporary files, so two workers downloading into one directory can leave a
+corrupt `.ltar` under a name every later run trusts — including yours. Each
+worker therefore downloads into its own `$MATHLIB_CACHE_DIR` under its state
+directory, and before each round it exchanges *finished* files with the pool by
+hardlink: it promotes what it fetched last round and takes a link to everything
+the pool has that it lacks. A hardlink is atomic and an existing name is never
+replaced, so the pool only ever gains complete artifacts, costs no extra disk,
+and a worker downloads only what nobody on the machine has. Left per-worker
+entirely, half of one week's 10.2 GB of `.ltar` traffic was a file another worker
+already had.
+
+`$LAKE_CACHE_DIR` stays per-worker too. It normally sits under the toolchain
+directory, and would otherwise follow `$ELAN_HOME` into the pool, but unlike an
+install it is written throughout every build. That also keeps a per-worker
+`LAKE_ARTIFACT_CACHE` experiment honest, since the store it fills is that
+worker's alone.
+
+Setting any of the three yourself overrides this. `scripts/share-build-caches`
+folds the private copies an already-running fleet accumulated into the pool
+without re-downloading them.
 
 On macOS, `$HOME` stays unchanged because both Claude Code and GitHub CLI use the
 login Keychain. `tauceti` redirects `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME`, which
