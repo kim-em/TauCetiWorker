@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 TOOL_INPUT_LIMIT = 4 * 1024
@@ -89,6 +90,43 @@ def _diagnostic_json(value: Any) -> str:
         return "[unrenderable event omitted]"
 
 
+# Shell forms that CREATE or MODIFY a file. A codex round writes most of its Lean through one of
+# these rather than through apply_patch, and the command carrying it is truncated at
+# TOOL_INPUT_LIMIT — so of 159 codex rounds that opened a PR, only 15 recorded a file modification
+# anywhere in their transcript. A log could not answer "what did this round write" or "did it build
+# after its last edit". Naming the paths costs a line and survives the truncation.
+_PATH = r"[^\s|;&<>()'\"]+"
+_WRITE_FORMS = (
+    re.compile(r"(?<![0-9&])>>?\s*(?P<p>" + _PATH + r")"),  # cat > f, ... >> f (but not 2>&1)
+    re.compile(r"\btee\b(?:\s+-\w+)*\s+(?P<p>" + _PATH + r")"),  # ... | tee f
+    re.compile(r"\bsed\b[^|;&\n]*?\s-i\b[^|;&\n]*?\s(?P<p>" + _PATH + r")"),  # sed -i ... f
+    re.compile(r"open\(\s*['\"](?P<p>[^'\"]+)['\"]\s*,\s*['\"][wax]"),  # python open(f, "w")
+    re.compile(r"Path\(\s*['\"](?P<p>[^'\"]+)['\"]\s*\)\s*\.write_(?:text|bytes)\("),
+)
+# Sinks that carry no information, and fd duplications the redirect pattern would otherwise pick up.
+_WRITE_NOISE = ("/dev/null", "/dev/stderr", "/dev/stdout", "&1", "&2")
+_MAX_WRITTEN = 12
+
+
+def _written_paths(command: str) -> list[str]:
+    """Paths a shell command appears to write, deduplicated in first-seen order.
+
+    Best effort and deliberately conservative: this annotates a transcript and gates nothing, so a
+    missed path costs a little audit detail and a spurious one costs a misleading line. Bare words
+    with neither a slash nor an extension are dropped, being usually not files at all."""
+    seen: list[str] = []
+    for pattern in _WRITE_FORMS:
+        for match in pattern.finditer(command):
+            path = match.group("p").strip("'\"")
+            if not path or path in _WRITE_NOISE or path.startswith("&"):
+                continue
+            if "/" not in path and "." not in path:
+                continue
+            if path not in seen:
+                seen.append(path)
+    return seen[:_MAX_WRITTEN]
+
+
 def _command_input(command: str) -> str:
     """Render a shell command without reproducing an embedded apply_patch body."""
     if "apply_patch" in command and "*** Begin Patch" in command:
@@ -101,7 +139,13 @@ def _command_input(command: str) -> str:
         if paths:
             summary += "\n" + "\n".join(f"- {path}" for path in paths)
         return _utf8_prefix(summary, TOOL_INPUT_LIMIT)
-    return _utf8_prefix(command, TOOL_INPUT_LIMIT)
+    # The annotation goes FIRST, because it is the part that has to survive the truncation below —
+    # which is exactly what hides a heredoc's target today.
+    written = _written_paths(command)
+    if not written:
+        return _utf8_prefix(command, TOOL_INPUT_LIMIT)
+    head = "writes:\n" + "\n".join(f"- {path}" for path in written) + "\n"
+    return head + _utf8_prefix(command, max(0, TOOL_INPUT_LIMIT - len(head.encode("utf-8"))))
 
 
 def _tool_input(name: str, value: Any) -> str:

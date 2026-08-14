@@ -76,6 +76,7 @@ RUN_STDLIB=(
   ssl_cert_file.py
   status_labels.py
   tend_bot_permissions.py
+  transcript_writes.py
   worker_claude_config.py
   worker_manager.py
 )
