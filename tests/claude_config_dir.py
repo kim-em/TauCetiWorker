@@ -49,7 +49,11 @@ try:
     iso_home = tc.isolate_home(wid)
     iso_claude = iso_home / ".claude"
     check("isolation copies creds from the config dir", (iso_claude / ".credentials.json").exists(), True)
-    check("isolation symlinks the config surface", (iso_claude / "CLAUDE.md").is_symlink(), True)
+    # The credential is seeded; the operator's instruction surface deliberately is NOT — the round
+    # must not depend on whose CLAUDE.md/skills happen to sit in the real config dir. Details and
+    # the migration of already-seeded homes are in tests/worker_claude_config.py.
+    check("isolation leaves the operator's CLAUDE.md behind", (iso_claude / "CLAUDE.md").exists(), False)
+    check("isolation writes its own settings.json", (iso_claude / "settings.json").is_file(), True)
     check("isolation repoints $CLAUDE_CONFIG_DIR at the copy", os.environ["CLAUDE_CONFIG_DIR"], str(iso_claude))
     check("claude_dir agrees with the spawned claude", tc.claude_dir(iso_home), iso_claude)
     creds = json.loads((tc.claude_dir(iso_home) / ".credentials.json").read_text())

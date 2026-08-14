@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""The worker's Claude config dir carries its own instruction surface, not the operator's.
+
+isolate_home used to symlink `CLAUDE.md`, `settings.json` and `skills` out of the operator's real
+config dir, so every authoring round loaded whatever that operator keeps there — on the fleet this
+was measured on, a 7 KB personal CLAUDE.md and 63 personal skills (~5,500 tokens per round), several
+of whose rules contradict the task prompt. seed_worker_claude_config replaces that with the same
+clean room the review engine already builds for a reviewer.
+
+Pinned here:
+
+  1. A fresh config dir gets no operator CLAUDE.md, no operator settings.json, and no operator skills
+     shelf — but does get the worker's own settings.json and the single `pi` skill $PI_RUN resolves.
+  2. Tooling the worker shells out to (swap-account, bin, config.json) is still symlinked: none of it
+     reaches a prompt.
+  3. An existing worker home is migrated — a symlink WE created into the operator's dir is removed —
+     while anything the operator put there by hand (a real file, a symlink elsewhere) survives, and a
+     settings.json already written is not overwritten.
+  4. $TAUCETI_INHERIT_CLAUDE_CONFIG=1 restores the old wholesale mirroring.
+
+Exit 0 = all assertions hold; 1 = a mismatch.
+"""
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
+
+seed = tc.agents.seed_worker_claude_config
+fails = 0
+
+
+def check(name, cond):
+    global fails
+    fails += not cond
+    print(f"[{'OK ' if cond else 'BAD'}] {name}")
+
+
+def operator_dir(root: Path) -> Path:
+    """A stand-in for the operator's ~/.claude, with the surface that used to be inherited."""
+    d = root / "real-claude"
+    (d / "skills" / "pi" / "scripts").mkdir(parents=True)
+    (d / "skills" / "pi" / "scripts" / "run.sh").write_text("#!/bin/sh\n")
+    for personal in ("kindle", "whatsapp", "ripping-cds"):
+        (d / "skills" / personal).mkdir()
+        (d / "skills" / personal / "SKILL.md").write_text("---\nname: %s\n---\n" % personal)
+    (d / "CLAUDE.md").write_text("# Kim uses she/her pronouns.\n")
+    (d / "settings.json").write_text(json.dumps({"hooks": {"Notification": []}, "theme": "dark"}))
+    (d / "swap-account").write_text("#!/bin/sh\n")
+    return d
+
+
+def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        real = operator_dir(root)
+
+        # --- 1/2) a fresh isolated dir ---
+        iso = root / "iso1" / ".claude"
+        iso.mkdir(parents=True)
+        seed(real, iso)
+        check("no operator CLAUDE.md", not (iso / "CLAUDE.md").exists() and not (iso / "CLAUDE.md").is_symlink())
+        check("skills is not a link to the operator's shelf", not (iso / "skills").is_symlink())
+        check("only the worker's own skill is exposed", sorted(p.name for p in (iso / "skills").iterdir()) == ["pi"])
+        check("the pi skill resolves", (iso / "skills" / "pi" / "scripts" / "run.sh").is_file())
+        check("swap-account is still symlinked (worker tooling)", (iso / "swap-account").is_symlink())
+        written = json.loads((iso / "settings.json").read_text())
+        check("settings.json is ours, not the operator's", "hooks" not in written and "theme" not in written)
+        check("settings.json keeps transcripts", written.get("cleanupPeriodDays") == 36500)
+        check("settings.json disables artifacts", written.get("enableArtifact") is False)
+        check("settings.json is not a symlink", not (iso / "settings.json").is_symlink())
+
+        # --- 3) migration of a home seeded by the old code ---
+        iso2 = root / "iso2" / ".claude"
+        iso2.mkdir(parents=True)
+        for item in ("skills", "settings.json", "CLAUDE.md"):
+            (iso2 / item).symlink_to(real / item)
+        seed(real, iso2)
+        check("stale CLAUDE.md symlink is removed", not (iso2 / "CLAUDE.md").is_symlink())
+        check("stale settings.json symlink is replaced by ours", not (iso2 / "settings.json").is_symlink())
+        check("stale skills symlink is replaced by the one-skill dir", not (iso2 / "skills").is_symlink())
+        check("migrated dir exposes only pi", sorted(p.name for p in (iso2 / "skills").iterdir()) == ["pi"])
+
+        # --- 3b) operator-owned entries survive ---
+        iso3 = root / "iso3" / ".claude"
+        iso3.mkdir(parents=True)
+        (iso3 / "CLAUDE.md").write_text("worker-specific note\n")  # a real file the operator wrote
+        elsewhere = root / "elsewhere.json"
+        elsewhere.write_text("{}")
+        (iso3 / "settings.json").symlink_to(elsewhere)  # a symlink to somewhere that isn't real_claude
+        seed(real, iso3)
+        check("an operator's real CLAUDE.md survives", (iso3 / "CLAUDE.md").read_text() == "worker-specific note\n")
+        check(
+            "a symlink pointing elsewhere survives",
+            (iso3 / "settings.json").is_symlink() and Path(os.readlink(iso3 / "settings.json")) == elsewhere,
+        )
+
+        # --- 3c) our settings.json is not rewritten on the next round ---
+        iso4 = root / "iso4" / ".claude"
+        iso4.mkdir(parents=True)
+        seed(real, iso4)
+        (iso4 / "settings.json").write_text(json.dumps({"effortLevel": "low"}))
+        seed(real, iso4)
+        check(
+            "an edited settings.json is left alone",
+            json.loads((iso4 / "settings.json").read_text()) == {"effortLevel": "low"},
+        )
+
+        # --- 4) the escape hatch, on a fresh home AND on one already seeded the clean way ---
+        for label, prepare in (("fresh", lambda p: None), ("already seeded", lambda p: seed(real, p))):
+            iso5 = root / f"iso5-{label.replace(' ', '-')}" / ".claude"
+            iso5.mkdir(parents=True)
+            prepare(iso5)
+            os.environ["TAUCETI_INHERIT_CLAUDE_CONFIG"] = "1"
+            try:
+                seed(real, iso5)
+            finally:
+                del os.environ["TAUCETI_INHERIT_CLAUDE_CONFIG"]
+            check(f"opt-in ({label}) restores the CLAUDE.md symlink", (iso5 / "CLAUDE.md").is_symlink())
+            check(f"opt-in ({label}) restores the skills symlink", (iso5 / "skills").is_symlink())
+            check(f"opt-in ({label}) restores the settings symlink", (iso5 / "settings.json").is_symlink())
+
+        # An operator who EDITED the generated settings has made it theirs: opt-in preserves it
+        # rather than silently discarding their edit.
+        iso6 = root / "iso6" / ".claude"
+        iso6.mkdir(parents=True)
+        seed(real, iso6)
+        (iso6 / "settings.json").write_text(json.dumps({"effortLevel": "low"}))
+        os.environ["TAUCETI_INHERIT_CLAUDE_CONFIG"] = "1"
+        try:
+            seed(real, iso6)
+        finally:
+            del os.environ["TAUCETI_INHERIT_CLAUDE_CONFIG"]
+        check(
+            "opt-in keeps an edited settings.json rather than discarding it",
+            json.loads((iso6 / "settings.json").read_text()) == {"effortLevel": "low"},
+        )
+
+        # --- 5) a home seeded from a DIFFERENT config dir (a relaunched worker id) ---
+        # $CLAUDE_CONFIG_DIR moved, so `real` no longer names where the old symlinks point. The
+        # recorded creds source is the only thing that does, and a stale link into the ORIGINAL
+        # directory would otherwise keep feeding that operator's instructions to every round.
+        other = operator_dir(root / "second")
+        iso7 = root / "iso7" / ".claude"
+        iso7.mkdir(parents=True)
+        for item in ("skills", "settings.json", "CLAUDE.md"):
+            (iso7 / item).symlink_to(other / item)
+        (iso7 / ".tauceti-creds-source").write_text(str(other))
+        seed(real, iso7)
+        check("a stale link into the ORIGINAL config dir is migrated", not (iso7 / "CLAUDE.md").is_symlink())
+        check("its skills shelf is migrated too", not (iso7 / "skills").is_symlink())
+
+        # --- 6) the early-return path has no real_claude and must still migrate ---
+        iso8 = root / "iso8" / ".claude"
+        iso8.mkdir(parents=True)
+        for item in ("skills", "settings.json", "CLAUDE.md"):
+            (iso8 / item).symlink_to(real / item)
+        (iso8 / ".tauceti-creds-source").write_text(str(real))
+        seed(None, iso8)  # what a loop child of an old parent calls
+        check("a loop child migrates from the recorded source alone", not (iso8 / "CLAUDE.md").is_symlink())
+        check("and gets the worker settings", (iso8 / "settings.json").is_file())
+        check("and the one skill", sorted(p.name for p in (iso8 / "skills").iterdir()) == ["pi"])
+
+    print("FAIL" if fails else "PASS")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
