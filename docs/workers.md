@@ -131,8 +131,18 @@ mysterious.
 [[workers]]
 id = "worker5"
 enabled = true
-env = { LAKE_ARTIFACT_CACHE = "1" }   # share Lake's build outputs across checkouts
+# Restore a previously built module from Lake's local store instead of recompiling it.
+env = { LAKE_ARTIFACT_CACHE = "1", LAKE_RESTORE_ARTIFACTS = "1" }
 ```
+
+`LAKE_RESTORE_ARTIFACTS` belongs with that first variable rather than being
+optional: with the artifact cache writable, Lake may keep a build product in its
+store instead of the build directory, and TauCeti's audits (`lake exe axioms`,
+`lake exe module-system`) resolve `.olean`s through the Lean search path. Asking
+for the copy keeps them working, and measured on a 1500-declaration module,
+returning to a previously built state still fell from 4s of recompilation to 0s
+of restore. The trade is disk: the store holds a second copy of what it caches,
+and `lake cache clean` empties it all or nothing.
 
 ## `workers add` flags
 
