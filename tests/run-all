@@ -68,6 +68,7 @@ RUN_STDLIB=(
   roadmap_backpressure.py
   roadmap_claims.py
   round_group_sweep.py
+  rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py
   shared_build_caches.py

@@ -240,7 +240,12 @@ def test_roadmap():
     tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
     no_source_prompt = cap.get("prompt", "")
     check("roadmap: absent source adds no guidance", "Supplementary source material" not in no_source_prompt)
-    check("roadmap: absent source keeps one bullet list", "deprecation.\n- Before writing" in no_source_prompt)
+    # __SOURCE_GUIDANCE__ sits between two bullets, so an absent source must leave them contiguous
+    # rather than opening a hole in the list.
+    check(
+        "roadmap: absent source keeps one bullet list",
+        "name the rubrics you read.\n- Before writing" in no_source_prompt,
+    )
     tc.work_units.fetch_git_source = saved_fetch_source
 
 

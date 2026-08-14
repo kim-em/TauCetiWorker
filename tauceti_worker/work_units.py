@@ -1015,6 +1015,43 @@ def _do_progress_inner(w, opts) -> int | None:
     return 0
 
 
+# The rubric text an author is judged against, concatenated into one file. Eleven separate reads is a
+# turn of orientation the round pays every time, and it is the step the measurements show being
+# skipped: of 230 rounds that opened a PR, codex named a rubric file in 90% and claude in 4%. The
+# reference documents under rubrics/references/ are deliberately left out — the engine splices those
+# into a single rubric's prompt, and the largest is bigger than every rubric combined.
+RUBRIC_BUNDLE = "rubrics.md"
+
+
+def stage_rubrics(review_dir: Path, out_dir: Path) -> Path | None:
+    """Write the concatenated rubrics beside the review checkout; return its path, or None.
+
+    NOT inside `review_dir`: fetch_ref resets that checkout hard and cleans it on every round, so a
+    file written there would be deleted before the agent could read it. `_common.md` leads because it
+    is the shared protocol every angle is read against; the rest follow in a stable alphabetical
+    order so the bundle is byte-identical between rounds that fetched the same rubrics."""
+    src = review_dir / "rubrics"
+    try:
+        angles = sorted(p for p in src.glob("*.md") if p.name not in ("_common.md", "README.md"))
+        if not angles:
+            return None
+        parts = []
+        common = src / "_common.md"
+        if common.is_file():
+            parts.append(f"# rubrics/_common.md\n\n{common.read_text()}")
+        parts += [f"# rubrics/{p.name}\n\n{p.read_text()}" for p in angles]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / RUBRIC_BUNDLE
+        out.write_text(
+            "# The Tau Ceti review rubrics\n\n"
+            "Every rubric your PR will be judged against, concatenated. Read it in full before you\n"
+            "write any Lean, and audit your own diff against it before you push.\n\n" + "\n\n---\n\n".join(parts)
+        )
+        return out
+    except OSError:
+        return None
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
@@ -1040,6 +1077,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         raise Die(f"fetch {ROADMAP} failed")
     if not fetch_ref(REVIEW, refs / "review"):
         raise Die(f"fetch {REVIEW} failed")
+    bundle = stage_rubrics(refs / "review", refs / "rubrics")
     os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
     # Author from the contributor's OWN fork: push the new branch there and open the PR from it, so the
     # worker never needs write access to canonical (and canonical stays free of WIP branches). The agent
@@ -1074,6 +1112,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
 """
     if bubble:
         mounts = [f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"]
+        if bundle is not None:
+            mounts.append(f"{refs / 'rubrics'}:/opt/rubrics:ro")
         if source_dir is not None:
             mounts.append(f"{source_dir}:/opt/source:ro")
         return run_in_bubble(
@@ -1089,6 +1129,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 WORKERID=w.cfg.wid,
                 ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
                 REVIEW_DIR="/opt/review",
+                RUBRICS=(f"/opt/rubrics/{RUBRIC_BUNDLE}" if bundle is not None else "/opt/review/rubrics/*.md"),
                 SOURCE_GUIDANCE=source_guidance,
                 BIN=wrapper_bin(bubble=True),
             ),
@@ -1108,6 +1149,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         WORKERID=w.cfg.wid,
         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
         REVIEW_DIR=str(refs / "review"),
+        RUBRICS=str(bundle) if bundle is not None else str(refs / "review" / "rubrics" / "*.md"),
         SOURCE_GUIDANCE=source_guidance,
         BIN=wrapper_bin(),
     )
