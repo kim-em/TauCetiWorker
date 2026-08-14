@@ -49,6 +49,7 @@ from .constants import (
     PROGRESS_TOOL_TAIL,
     REVIEW,
     REVIEW_DAILY_CAP,
+    REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
     SANDBOX_DEFAULT,
     TAUCETI,
@@ -506,6 +507,23 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
+        elif rc == REVIEW_PROVIDER_DOWN_EXIT:
+            # The engine stopped because the reviewer's provider is unusable — a revoked credential or
+            # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
+            # That is MACHINE-WIDE in exactly the sense the TauCetiData carve-out below means: the next
+            # PR the loop picks would abort identically, so charging it to whichever PR happened to be
+            # this round's candidate is charging a PR for someone else's outage. Three of them strand
+            # that PR at MAX_REVIEW_ERRORS: dropped from review candidacy and given a public "Review
+            # stuck" issue, for a condition it had nothing to do with. A review worker running
+            # --ignore-quota does not pace, so it keeps launching into an exhausted window and would
+            # spread those strikes across unrelated PRs. Warn loudly and back off instead.
+            warn_red(
+                f"review #{pr}: the reviewer's provider is unavailable, so the round stopped without "
+                f"posting anything. This is machine-wide (every PR's review would stop the same way), "
+                f"so it is NOT charged to any PR's review-error budget. Check the reviewer credential "
+                f"and its remaining quota; the loop resumes on its own once it clears."
+            )
+            raise NoProgress(f"review #{pr}: reviewer provider unavailable — machine-wide, not charged to the PR")
         else:
             if not runtime_snapshot().get("failure_reason"):
                 report_failure(f"review #{pr} exited with status {rc}", code=rc)

@@ -138,14 +138,17 @@ try:
     check("publish ok -> ledger busted", w.rs.busted, [726])
     check("publish ok -> no red warning", len(warns), 0)
 
-    # 3) the engine ITSELF errors (rc!=0) -> that IS per-PR, so the errkey is bumped (unchanged behaviour).
-    wu.run_to_logfile = lambda argv, logf, label: 3
+    # 3) the engine ITSELF errors (rc!=0) -> that IS per-PR, so the errkey is bumped (unchanged
+    # behaviour). Any status EXCEPT REVIEW_PROVIDER_DOWN_EXIT, which the engine reserves for "the
+    # provider is unusable and I posted nothing" and which do_review treats as machine-wide the same
+    # way as the publish failure above (tests/review_provider_down.py).
+    wu.run_to_logfile = lambda argv, logf, label: 4
     wu._sync_review_outbox = lambda w, pr: 0
     w = FakeWorker()
     w.counters.write("review-err-726", 2)
     warns.clear()
     rc = wu.do_review(w, None, CAND, opts(), bubble=False)
-    check("engine errors -> rc propagated", rc, 3)
+    check("engine errors -> rc propagated", rc, 4)
     check("engine errors -> errkey bumped to 3", w.counters.read("review-err-726"), 3)
 finally:
     for k, v in _saved.items():
