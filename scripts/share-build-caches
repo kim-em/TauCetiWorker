@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Fold the caches an already-running fleet accumulated into the machine pool.
+
+From this version on, a worker downloads Mathlib artifacts into its own directory and exchanges
+finished files with the pool by hardlink before each round (see `tauceti_worker.build_caches`), and
+every worker shares one `ELAN_HOME`. Workers that ran before that still hold private copies of
+everything they ever fetched — on the fleet this was written for, five copies of Mathlib's `.ltar`
+cache (32 GB) and 22 toolchain installs covering 6 distinct toolchains (63 GB).
+
+    scripts/share-build-caches                 # report only; touches nothing
+    scripts/share-build-caches --link          # link the per-worker copies into the pool
+    scripts/share-build-caches --link --prune  # ... then drop per-worker copies the pool holds
+
+`--link` only ever ADDS names to the pool, and a hardlink is atomic, so it is safe alongside a live
+fleet. `--prune` is not: it deletes, and it must not race a round that is reading or writing what it
+deletes. Stop the fleet first (`tauceti workers stop --all`).
+
+What `--prune` will delete is decided per file, never per tree:
+
+  * the pool holds the same inode — our own link, so dropping this one loses nothing;
+  * both are symlinks with the same target;
+  * both are regular files of the same size and mode whose CONTENTS compare equal.
+
+The third case is the expensive one and it is a real byte comparison, because a name is not a proof.
+A Mathlib `.ltar` is named by a hash of the build INPUTS, not of the archive bytes, and an elan
+toolchain is named by its release rather than its contents; equal names with unequal bytes are
+possible, and quietly keeping the pool's copy would be a silent choice about which artifact wins.
+Anything that does not match is reported and left alone, along with the directory holding it.
+
+Hardlinks need one filesystem. If a worker home and the pool are on different devices the script says
+so and skips that worker rather than silently copying and doubling the disk cost.
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import os
+import stat
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from tauceti_worker.build_caches import link_into, same_device, walk  # noqa: E402
+
+# Per-worker source -> pool destination: (label, subpath of the worker home, subpath of the pool,
+# subdirectories to pool). For elan only the immutable per-toolchain payload is pooled:
+# `settings.toml` is that elan's own configuration, `tmp` and `known-projects` are scratch, and
+# `toolchains/*/lake/cache` is Lake's own mutable store, which stays per-worker.
+CACHES = (
+    ("mathlib", Path(".cache/mathlib"), Path(".cache/mathlib"), ()),
+    ("elan", Path(".elan"), Path(".elan"), ("toolchains", "update-hashes")),
+)
+# Relative-path components that are never pooled, even inside a pooled subtree.
+EXCLUDED = ("lake/cache",)
+
+
+def human(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size) < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return f"{size} B"
+
+
+def poolable(rel: Path) -> bool:
+    """Is this path one the pool should hold at all? Excludes Lake's mutable per-toolchain store."""
+    text = rel.as_posix()
+    return not any(part in text for part in EXCLUDED)
+
+
+def classify(src: Path, dst: Path) -> tuple[list[Path], list[Path], int]:
+    """Split *src* into (held by the pool and prunable, not held, bytes a prune would release).
+
+    See the module docstring for what "held" means. Only a separate inode releases anything: dropping
+    one of two links to the same inode leaves the bytes exactly where they were."""
+    prunable: list[Path] = []
+    unmatched: list[Path] = []
+    reclaimable = 0
+    for rel in walk(src, skip=lambda rel: not poolable(rel)):
+        source, target = src / rel, dst / rel
+        try:
+            a = source.lstat()
+            b = target.lstat()
+        except OSError:
+            unmatched.append(rel)
+            continue
+        if stat.S_IFMT(a.st_mode) != stat.S_IFMT(b.st_mode):
+            unmatched.append(rel)  # a file where the pool has a directory or a symlink, or vice versa
+            continue
+        if stat.S_ISLNK(a.st_mode):
+            if os.readlink(source) == os.readlink(target):
+                prunable.append(rel)
+            else:
+                unmatched.append(rel)
+            continue
+        if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+            prunable.append(rel)  # our own hardlink; frees nothing, but safe to drop
+            continue
+        same = a.st_size == b.st_size and stat.S_IMODE(a.st_mode) == stat.S_IMODE(b.st_mode)
+        if same and filecmp.cmp(source, target, shallow=False):
+            prunable.append(rel)
+            reclaimable += a.st_size
+        else:
+            unmatched.append(rel)
+    return prunable, unmatched, reclaimable
+
+
+def prune(src: Path, prunable: list[Path]) -> None:
+    """Delete exactly the verified paths, then the directories they emptied. Never a whole tree: a
+    tree contains files this pass did not look at (scratch, an in-flight download, whatever a
+    concurrent process just made), and deleting those on the strength of their neighbours would be
+    the data loss the verification is supposed to prevent."""
+    for rel in prunable:
+        try:
+            (src / rel).unlink()
+        except OSError as e:
+            print(f"    ! {rel}: {e}", file=sys.stderr)
+    for dirpath, _, _ in sorted(os.walk(src, topdown=False), reverse=True):
+        try:
+            os.rmdir(dirpath)  # fails harmlessly while anything remains
+        except OSError:
+            pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pool per-worker Lean build caches by hardlink.")
+    ap.add_argument("--link", action="store_true", help="hardlink per-worker copies into the pool")
+    ap.add_argument("--prune", action="store_true", help="then delete per-worker copies the pool verifiably holds")
+    ap.add_argument("--state", type=Path, default=REPO / "state", help="worker state root (default: <repo>/state)")
+    ap.add_argument("--home", type=Path, default=None, help="the pool's home (default: this user's)")
+    args = ap.parse_args()
+
+    login_home = args.home or Path(os.path.expanduser("~"))
+    homes = sorted(p for p in args.state.glob("*/home") if p.is_dir())
+    if not homes:
+        print(f"no worker homes under {args.state}")
+        return 0
+    print(f"pool: {login_home}   workers: {len(homes)}\n")
+
+    total_linked = total_reclaimable = 0
+    for home in homes:
+        wid = home.parent.name
+        for label, src_rel, dst_rel, subdirs in CACHES:
+            src, dst = home / src_rel, login_home / dst_rel
+            if not src.is_dir() or src.resolve() == dst.resolve():
+                continue
+            for sub in subdirs or (Path("."),):
+                s, d = src / sub, dst / sub
+                if not s.is_dir():
+                    continue
+                name = f"{wid}/{label}" + (f"/{sub}" if subdirs else "")
+                if not same_device(s, d):
+                    print(f"  {name}: SKIPPED — {s} and {d} are on different filesystems")
+                    continue
+                if args.link:
+                    linked, present = link_into(s, d, skip=lambda rel: not poolable(rel))
+                    total_linked += linked
+                    print(f"  {name}: linked {linked}, already pooled {present}")
+                prunable, unmatched, reclaimable = classify(s, d)
+                if unmatched:
+                    print(f"  {name}: {len(unmatched)} path(s) the pool does not hold, e.g. {unmatched[0]}")
+                if args.prune:
+                    prune(s, prunable)
+                    total_reclaimable += reclaimable
+                    print(f"  {name}: pruned {len(prunable)} path(s), {human(reclaimable)} released")
+                else:
+                    total_reclaimable += reclaimable
+                    if not args.link:
+                        print(f"  {name}: {len(prunable)} prunable, {human(reclaimable)} would be released")
+
+    verb = "released" if args.prune else "recoverable"
+    print(f"\nlinked {total_linked} path(s); {human(total_reclaimable)} {verb}")
+    if not (args.link or args.prune):
+        print("report only — pass --link (safe beside a live fleet) and then --prune with it stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
