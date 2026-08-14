@@ -33,6 +33,7 @@ from .agents import (
     run_to_logfile,
     take_last_agent_infra_failure,
     validate_kiro_model_access,
+    wrapper_bin,
 )
 from .config import Config, Die, NoProgress, is_git_url, log, respect_claims, roadmap_areas, roadmap_skip, warn_red
 from .constants import (
@@ -678,7 +679,7 @@ def _do_fixlike(
         return None
     if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
         return None  # claimed elsewhere → caller tries the next candidate
-    prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name)
+    prompt = fill_prompt(HERE / "prompts" / prompt_file, PR=pr, AGENT=opts.agent_name, BIN=wrapper_bin(bubble))
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
@@ -1089,6 +1090,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
                 ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
                 REVIEW_DIR="/opt/review",
                 SOURCE_GUIDANCE=source_guidance,
+                BIN=wrapper_bin(bubble=True),
             ),
             opts,
             mounts=mounts,
@@ -1107,5 +1109,6 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         ROADMAP_DIR=str(refs / "roadmap" / "TauCetiRoadmap"),
         REVIEW_DIR=str(refs / "review"),
         SOURCE_GUIDANCE=source_guidance,
+        BIN=wrapper_bin(),
     )
     return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir)
