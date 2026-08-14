@@ -15,6 +15,7 @@ from .config import Die, log
 from .constants import (
     _GH_PRIMARY_RE,
     _GH_SECONDARY_RE,
+    CLAIMS,
     CONTEST_CLAIM_EMOJI,
     GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
@@ -41,6 +42,76 @@ def can_push(repo: str) -> bool | None:
         return None
     out = (r.stdout or "").strip()
     return True if out == "true" else False if out == "false" else None
+
+
+def claims_repo() -> str:
+    """Where this worker publishes its cooperative claim leases (`refs/tauceti-claims/<key>`).
+
+    `$CLAIM_REPO` overrides everything, verbatim: that is how a fleet pins one namespace of its own
+    (`CLAIM_REPO=<you>/TauCeti` in every container) without asking anyone for access. It is read on
+    every call rather than cached, so a worker can be repointed without a restart. Everything else is
+    resolved once per process (two API calls at most) by `_resolve_claims_repo`."""
+    return os.environ.get("CLAIM_REPO", "").strip() or _resolve_claims_repo()
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_claims_repo() -> str:
+    """The claim namespace this account can actually push to: CLAIMS if it has been granted, else the
+    contributor's own fork.
+
+    Canonical is deliberately not a candidate. Nobody outside the org can push there, and a claim repo
+    you cannot push to is worse than no claim at all: every `acquire` errors, every worker proceeds
+    unclaimed, and a fleet of four spends four subscriptions on one report. The fork always works, so
+    a brand-new operator de-duplicates within their own fleet on day one; CLAIMS then widens that to
+    every operator, and is granted automatically on their first merged PR.
+
+    `can_push` returning None (network, rate limit, or a private CLAIMS we cannot see) picks the fork:
+    guessing "shared" and being wrong costs a failed claim on every task for the rest of the round,
+    while the fork is right whenever we can tell at all."""
+    if shared_claims_granted():
+        log(f"claims: {CLAIMS} (shared namespace — de-duplicating against every operator)")
+        return CLAIMS
+    try:
+        fork = ensure_fork()
+    except Die as e:
+        # Claims are [COOP]: never fail a round over one. Naming a repo we cannot push to leaves
+        # `acquire` erroring and every task proceeding unclaimed, which is exactly the old behaviour.
+        log(f"claims: no writable claim namespace ({e}) — rounds will proceed unclaimed")
+        return CLAIMS
+    log(
+        f"claims: {fork} (your fork — de-duplicating within your own fleet; the shared namespace "
+        f"{CLAIMS} opens on your first merged {TAUCETI} PR)"
+    )
+    return fork
+
+
+def shared_claims_granted() -> bool:
+    """Can this account push to the shared claim namespace? Accepts a pending invitation first, so an
+    operator whose grant landed between rounds does not have to do anything by hand."""
+    if can_push(CLAIMS) is True:
+        return True
+    return accept_claims_invitation() and can_push(CLAIMS) is True
+
+
+def accept_claims_invitation() -> bool:
+    """Accept a pending collaborator invitation to CLAIMS, and to nothing else. True if one was accepted.
+
+    Access to the shared namespace is granted automatically, but GitHub grants it as an *invitation*:
+    left unaccepted it sits in the operator's email while their workers keep colliding, and repository
+    invitations expire after seven days. So the worker accepts its own. The `full_name` match is exact
+    and no other invitation is ever touched — this must not become an "accept whatever GitHub offers"
+    button. Best-effort: any failure just means we fall through to the fork."""
+    jq = f'[.[] | select(.repository.full_name == "{CLAIMS}") | .id] | first // empty'
+    p = gh_run(["gh", "api", "/user/repository_invitations", "--jq", jq])
+    invitation = (p.stdout or "").strip()
+    if p.returncode != 0 or not invitation:
+        return False
+    accepted = gh_run(["gh", "api", "-X", "PATCH", f"/user/repository_invitations/{invitation}"])
+    if accepted.returncode != 0:
+        log(f"claims: could not accept the invitation to {CLAIMS} ({(accepted.stderr or '').strip()})")
+        return False
+    log(f"claims: accepted the collaborator invitation to {CLAIMS}")
+    return True
 
 
 def _find_fork() -> str | None:

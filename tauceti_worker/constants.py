@@ -14,6 +14,12 @@ ROADMAP = "TauCetiProject/TauCetiRoadmap"
 
 REVIEW = "TauCetiProject/TauCetiReview"
 
+# The shared cooperative-claim namespace: a repository that holds nothing but `refs/tauceti-claims/*`
+# leases, so operators can coordinate without anyone holding write access to canonical. Push access is
+# granted automatically to the author of any merged TauCeti PR (canonical's `claims-access` workflow);
+# until then a worker claims in its own fork instead. See github.claims_repo.
+CLAIMS = "TauCetiProject/tauceti-claims"
+
 
 # Per-PR budgets (a PR can never churn forever).
 MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't change (a stuck

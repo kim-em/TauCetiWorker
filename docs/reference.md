@@ -40,7 +40,43 @@ PRs, and PRs for roadmaps outside the selected scope do not consume its authorin
 limit. An open roadmap PR whose area is temporarily unknown counts conservatively
 in every scope until its area label resolves.
 
+## The claim namespace
+
+Two workers must not spend two subscriptions writing the same report or fixing
+the same PR. They avoid it by taking a lease before they start: a custom git ref
+`refs/tauceti-claims/<key>` in some repository both of them can push to, acquired
+with an atomic compare-and-swap (see `scripts/claim.sh`). Which repository that
+is decides how far de-duplication reaches, and the worker picks it like this:
+
+1. `$CLAIM_REPO`, verbatim, if you set it.
+2. `TauCetiProject/tauceti-claims`, the shared namespace, if your account can
+   push there. Then you de-duplicate against every other operator.
+3. Otherwise your own fork, which you can always push to. Then you de-duplicate
+   across your own workers, and only those.
+
+Push access to the shared namespace is granted automatically once you have had a
+pull request merged into TauCeti, and the worker accepts the invitation itself
+(that repository, and no other). Until then your fleet coordinates in your fork,
+so nothing waits on anybody. The shared repository holds nothing but leases: no
+code, no Actions, and no relationship to write access on the canonical repo,
+which no worker ever needs.
+
+If you run several workers on one host or in several containers, they get the
+same answer and coordinate with no configuration. Set `CLAIM_REPO` when you want
+to pin a namespace of your own anyway, for instance to keep two fleets under
+different `gh` accounts from contending with each other.
+
+Claims are cooperative and fail-open. Honouring one only avoids duplicate work;
+the guarantee that two workers cannot clobber each other's branch is the
+`--force-with-lease` CAS in `git-safe-push`, which does not depend on claims at
+all. So a claim that cannot be acquired (a namespace this account cannot push to,
+a GitHub outage) is logged and the round proceeds unclaimed.
+
 ## Claims on the intentions board
+
+These are a different mechanism from the leases above: a coarse, human-visible
+statement of intent rather than a per-task lock.
+
 
 Within an area, roadmap workers respect finer-grained claims registered by other
 contributors on the [intentions board](https://github.com/leanprover-community/intentions):
@@ -167,7 +203,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
-| `CLAIM_REPO` | automatic | Override the GitHub repository used for all cooperative claims. Without an override, maintenance branch claims use the PR head repository while roadmap and progress claims use the canonical repository. |
+| `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 
 Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,
