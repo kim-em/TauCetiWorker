@@ -144,8 +144,14 @@ try:
     assert wm._decode_spec(wm._encode_spec(envd)) == envd, "env survives the runner handoff"
     assert wm.WorkerSpec(id="plain").as_dict().get("env") is None, "absent unless configured"
     # Order in the file must not restart a worker; a changed value must.
-    assert envd.fingerprint() == wm.WorkerSpec.from_dict({"id": "exp", "env": {"A": "b", "LAKE_ARTIFACT_CACHE": "1"}}, 0).fingerprint()
-    assert envd.fingerprint() != wm.WorkerSpec.from_dict({"id": "exp", "env": {"A": "c", "LAKE_ARTIFACT_CACHE": "1"}}, 0).fingerprint()
+    assert (
+        envd.fingerprint()
+        == wm.WorkerSpec.from_dict({"id": "exp", "env": {"A": "b", "LAKE_ARTIFACT_CACHE": "1"}}, 0).fingerprint()
+    )
+    assert (
+        envd.fingerprint()
+        != wm.WorkerSpec.from_dict({"id": "exp", "env": {"A": "c", "LAKE_ARTIFACT_CACHE": "1"}}, 0).fingerprint()
+    )
     assert envd.fingerprint() != wm.WorkerSpec(id="exp").fingerprint()
     # Rejections: a non-string value (TOML's `1` where the consumer wants `"1"`), an unrepresentable
     # name, and any variable the manager sets itself.

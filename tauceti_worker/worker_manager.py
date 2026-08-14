@@ -198,7 +198,7 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
         if name in _RESERVED_ENV:
             raise WorkersError(f"{where}.{name} is set by the manager and cannot be overridden")
         if not isinstance(item, str):
-            raise WorkersError(f"{where}.{name} must be a string (quote it, e.g. \"1\")")
+            raise WorkersError(f'{where}.{name} must be a string (quote it, e.g. "1")')
         pairs.append((name, item))
     return tuple(sorted(pairs))
 
