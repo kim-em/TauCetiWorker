@@ -47,7 +47,10 @@ def main():
         # --- the redirect itself ---
         clear(env)
         resolved = tc.agents.share_build_caches()
-        check("MATHLIB_CACHE_DIR is the login user's ~/.cache/mathlib", env["MATHLIB_CACHE_DIR"] == "/home/pretend-operator/.cache/mathlib")
+        check(
+            "MATHLIB_CACHE_DIR is the login user's ~/.cache/mathlib",
+            env["MATHLIB_CACHE_DIR"] == "/home/pretend-operator/.cache/mathlib",
+        )
         check("ELAN_HOME is the login user's ~/.elan", env["ELAN_HOME"] == "/home/pretend-operator/.elan")
         check("returns the resolved mapping (for the log line)", resolved == {v: env[v] for v in CACHE_VARS})
         # The whole point: neither may land under the per-worker home, whose whole subtree is what the

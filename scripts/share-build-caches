@@ -57,13 +57,24 @@ def human(n: int) -> str:
     return f"{n} B"
 
 
+def transient(rel: Path) -> bool:
+    """Is this one of a live `cache get`'s scratch files rather than a cached artifact?
+
+    A `.part` is a download in flight and a `curl*.cfg` is the file list handed to curl; both belong to
+    whichever process is running right now. Pooling them would leave another worker's half-finished
+    bytes under a name the pool treats as real, so they are skipped on both sides: not linked in, and
+    not counted against a prune."""
+    name = rel.name
+    return name.endswith(".part") or (name.startswith("curl") and name.endswith(".cfg"))
+
+
 def walk(root: Path):
-    """Every path under *root*, files and symlinks, relative to it. Symlinks are never descended."""
+    """Every poolable path under *root*, relative to it. Symlinks are never descended."""
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
         for name in sorted(dirnames + filenames):
             p = here / name
-            if p.is_symlink() or p.is_file():
+            if (p.is_symlink() or p.is_file()) and not transient(p.relative_to(root)):
                 yield p.relative_to(root)
 
 
