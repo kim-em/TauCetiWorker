@@ -115,10 +115,24 @@ other top-level key is an error, as is any unrecognized field inside a
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
 | `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
 | `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
+| `env` | table of strings | `{}` | Extra environment for this worker's process tree, for settings with no flag of their own. Values must be quoted strings. The four variables the manager sets itself (`TAUCETI_MANAGED`, `TAUCETI_LOG_FILE`, `TAUCETI_PARENT_PIPE_FD`, and the runtime-status path) are rejected |
 
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
 without disturbing unchanged workers.
+
+`env` exists for running one worker differently from its peers when the
+difference has no flag: an A/B of a build setting, for instance. It is part of
+the fingerprint, so editing it restarts that worker and leaves the others alone,
+and `workers status` prints it, so the odd worker out is visible rather than
+mysterious.
+
+```toml
+[[workers]]
+id = "worker5"
+enabled = true
+env = { LAKE_ARTIFACT_CACHE = "1" }   # share Lake's build outputs across checkouts
+```
 
 ## `workers add` flags
 

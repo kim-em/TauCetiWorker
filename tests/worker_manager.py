@@ -134,6 +134,35 @@ try:
     assert wm.WorkerSpec.from_dict({"id": "plain"}, 0).auto_refresh is False
     assert wm.WorkerSpec.from_dict({"id": "opted", "auto_refresh": True}, 0).as_dict()["auto_refresh"] is True
 
+    # --- per-worker environment ---------------------------------------------------------------
+    # It reaches the worker's process tree (so a build setting can be A/B'd on one worker), survives
+    # the encode/decode the manager uses to hand a spec to its runner, and is part of the fingerprint
+    # so editing it restarts that worker and nothing else.
+    envd = wm.WorkerSpec.from_dict({"id": "exp", "env": {"LAKE_ARTIFACT_CACHE": "1", "A": "b"}}, 0)
+    assert envd.env == (("A", "b"), ("LAKE_ARTIFACT_CACHE", "1")), "normalized to sorted pairs"
+    assert envd.as_dict()["env"] == {"A": "b", "LAKE_ARTIFACT_CACHE": "1"}
+    assert wm._decode_spec(wm._encode_spec(envd)) == envd, "env survives the runner handoff"
+    assert wm.WorkerSpec(id="plain").as_dict().get("env") is None, "absent unless configured"
+    # Order in the file must not restart a worker; a changed value must.
+    assert envd.fingerprint() == wm.WorkerSpec.from_dict({"id": "exp", "env": {"A": "b", "LAKE_ARTIFACT_CACHE": "1"}}, 0).fingerprint()
+    assert envd.fingerprint() != wm.WorkerSpec.from_dict({"id": "exp", "env": {"A": "c", "LAKE_ARTIFACT_CACHE": "1"}}, 0).fingerprint()
+    assert envd.fingerprint() != wm.WorkerSpec(id="exp").fingerprint()
+    # Rejections: a non-string value (TOML's `1` where the consumer wants `"1"`), an unrepresentable
+    # name, and any variable the manager sets itself.
+    for bad, why in (
+        ({"env": {"LAKE_ARTIFACT_CACHE": 1}}, "non-string value"),
+        ({"env": {"": "x"}}, "empty name"),
+        ({"env": {"A=B": "x"}}, "name containing ="),
+        ({"env": {"TAUCETI_MANAGED": "0"}}, "manager-owned variable"),
+        ({"env": {"TAUCETI_PARENT_PIPE_FD": "3"}}, "manager-owned variable"),
+        ({"env": ["A=b"]}, "array instead of a table"),
+    ):
+        try:
+            wm.WorkerSpec.from_dict({"id": "exp", **bad}, 0)
+            raise AssertionError(f"{why} should have been rejected: {bad}")
+        except wm.WorkersError:
+            pass
+
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
         wm.status_path("snapshot"),
@@ -389,6 +418,49 @@ worker3 — backing off
     manager = None
     wait_for(lambda: not wm.runner_status("never").get("alive"))
     assert wm.cmd_workers(bare_workers) == 1  # the shorthand runs status against the stopped manager
+    # End to end through the real runner: the configured variable must be in the environment of the
+    # process the runner spawns, which is the only place it does any good. `restart = "never"` lets the
+    # runner exit once its one child has finished.
+    probe = root / "env-probe.txt"
+    probe_spec = wm.WorkerSpec(id="envprobe", restart="never", env=(("LAKE_ARTIFACT_CACHE", "1"),))
+    runner_env = worker_paths.self_env()
+    runner_env["TAUCETI_MANAGER_TEST_COMMAND"] = shlex.join(
+        [
+            sys.executable,
+            "-c",
+            "import os, pathlib, sys; pathlib.Path(sys.argv[1]).write_text("
+            "os.environ.get('LAKE_ARTIFACT_CACHE', '<unset>'))",
+            str(probe),
+        ]
+    )
+    runner = subprocess.Popen(
+        worker_paths.self_argv(
+            "_managed-run",
+            "--spec",
+            wm._encode_spec(probe_spec),
+            "--state-dir",
+            str(wm.workers_state_dir()),
+            "--runtime-dir",
+            str(wm.workers_runtime_dir()),
+        ),
+        env=runner_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not probe.exists():
+            time.sleep(0.1)
+        assert probe.exists(), "the runner never started its worker child"
+        assert probe.read_text() == "1", f"worker child saw LAKE_ARTIFACT_CACHE={probe.read_text()!r}"
+    finally:
+        runner.terminate()
+        try:
+            runner.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            runner.kill()
+
     print("worker manager: OK")
 finally:
     if manager is not None and manager.poll() is None:

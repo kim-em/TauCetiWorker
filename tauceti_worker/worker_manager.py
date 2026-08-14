@@ -56,6 +56,7 @@ _WORKER_KEYS = {
     "stream",
     "isolate_home",
     "restart",
+    "env",
 }
 
 WORKERS_EPILOG = """\
@@ -176,6 +177,32 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+# Names the manager sets on every worker itself. Letting the config overwrite one would break the
+# thing it configures (which state file the worker heartbeats into, whether it knows it is managed),
+# and the failure would look like a worker bug rather than a configuration error.
+_RESERVED_ENV = frozenset({STATUS_ENV, "TAUCETI_MANAGED", "TAUCETI_LOG_FILE", "TAUCETI_PARENT_PIPE_FD"})
+
+
+def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
+    """A table of environment variables for one worker, normalized to sorted (name, value) pairs.
+
+    Values must be strings: TOML would happily give us `1` for a variable whose consumer expects
+    `"1"`, and silently stringifying it hides the mistake in the one place it matters. Empty and
+    `=`-bearing names are rejected because the OS cannot represent them."""
+    if not isinstance(value, dict):
+        raise WorkersError(f"{where} must be a table of environment variables")
+    pairs = []
+    for name, item in value.items():
+        if not name or "=" in name or name != name.strip():
+            raise WorkersError(f"{where} has an invalid variable name: {name!r}")
+        if name in _RESERVED_ENV:
+            raise WorkersError(f"{where}.{name} is set by the manager and cannot be overridden")
+        if not isinstance(item, str):
+            raise WorkersError(f"{where}.{name} must be a string (quote it, e.g. \"1\")")
+        pairs.append((name, item))
+    return tuple(sorted(pairs))
+
+
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
@@ -196,6 +223,9 @@ class WorkerSpec:
     stream: bool = False
     isolate_home: bool = False
     restart: str = "always"
+    # Extra environment for this worker's process tree, as sorted (name, value) pairs so the spec stays
+    # hashable and its fingerprint is order-independent.
+    env: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
     def from_dict(raw: dict, index: int) -> WorkerSpec:
@@ -243,6 +273,7 @@ class WorkerSpec:
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
+            env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
         if spec.source is not None and ("roadmap" not in spec.only or not spec.roadmap_only):
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
@@ -280,6 +311,8 @@ class WorkerSpec:
             value["isolate_home"] = True
         if self.restart != "always":
             value["restart"] = self.restart
+        if self.env:
+            value["env"] = dict(self.env)
         return value
 
     def fingerprint(self) -> str:
@@ -594,6 +627,9 @@ def cmd_managed_runner(args) -> int:
         old_int = signal.signal(signal.SIGINT, stop)
         try:
             env = self_env()
+            # Per-worker configuration first, so the manager's own variables below still win: those
+            # four are reserved (see _RESERVED_ENV) and a config cannot name them anyway.
+            env.update(dict(spec.env))
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
@@ -1125,6 +1161,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         options.append(f"restart: {spec['restart']}")
     if options:
         lines.extend(_status_field("options", options, width))
+    # Show extra environment: a worker configured differently from its peers is otherwise
+    # indistinguishable in the status output, and that is exactly when it matters (an A/B of a build
+    # setting, a one-worker experiment).
+    if isinstance(spec.get("env"), dict) and spec["env"]:
+        lines.extend(_status_field("env", [f"{k}={v}" for k, v in sorted(spec["env"].items())], width))
     return lines
 
 
