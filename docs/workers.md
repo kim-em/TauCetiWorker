@@ -115,7 +115,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
 | `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
 | `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
-| `env` | table of strings | `{}` | Extra environment for this worker's process tree, for settings with no flag of their own. Values must be quoted strings. The four variables the manager sets itself (`TAUCETI_MANAGED`, `TAUCETI_LOG_FILE`, `TAUCETI_PARENT_PIPE_FD`, and the runtime-status path) are rejected |
+| `env` | table of strings | `{}` | Extra environment for this worker's process tree, for settings with no flag of their own. Values must be quoted strings, names POSIX-portable, and the table at most 16 KB. The variables the worker sets itself (`TAUCETI_MANAGED`, `TAUCETI_LOG_FILE`, `TAUCETI_PARENT_PIPE_FD`, `TAUCETI_DATA_HOME`, and the runtime-status path) are rejected. **Not a secret store** — see below |
 
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
@@ -124,8 +124,15 @@ without disturbing unchanged workers.
 `env` exists for running one worker differently from its peers when the
 difference has no flag: an A/B of a build setting, for instance. It is part of
 the fingerprint, so editing it restarts that worker and leaves the others alone,
-and `workers status` prints it, so the odd worker out is visible rather than
-mysterious.
+and both `workers status` and the dashboard name the variables it sets, so the
+odd worker out is visible rather than mysterious.
+
+Put no secrets in it. The values are stored in plain `workers.toml`, and the
+whole worker definition is handed to its runner on a command line, where any
+process running as you can read it. Credentials belong in the provider
+mechanisms `tauceti` already uses (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+`KIRO_API_KEY`), which keep them in files rather than argv. Status output prints
+only the variable names for the same reason.
 
 ```toml
 [[workers]]
