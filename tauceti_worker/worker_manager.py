@@ -56,6 +56,7 @@ _WORKER_KEYS = {
     "stream",
     "isolate_home",
     "restart",
+    "env",
 }
 
 WORKERS_EPILOG = """\
@@ -176,6 +177,53 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+# Names the manager or the worker's own bootstrap owns. Setting one from the config would break the
+# thing it configures, and the failure would read as a worker bug rather than a configuration error:
+# the first four decide which state file the worker heartbeats into, whether it knows it is managed,
+# where its log goes, and which fd is its parent pipe. TAUCETI_DATA_HOME is worse than broken —
+# isolate_home() reads it as an "isolation completed" sentinel, so presetting it would silently skip
+# credential isolation and run the worker on the operator's own account.
+_RESERVED_ENV = frozenset(
+    {STATUS_ENV, "TAUCETI_MANAGED", "TAUCETI_LOG_FILE", "TAUCETI_PARENT_PIPE_FD", "TAUCETI_DATA_HOME"}
+)
+
+# A POSIX-portable variable name, which is also what a shell can refer to. `execve` accepts more, but
+# a name like `1A` or `A-B` can only be reached by contortion, so it is far likelier to be a typo.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+# Aggregate cap on one worker's table. The spec reaches the runner as a single command-line argument,
+# so an unbounded table becomes E2BIG at launch; refuse it while it is still a configuration error the
+# operator can see. Generous next to anything a build setting needs.
+_ENV_MAX_BYTES = 16 * 1024
+
+
+def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
+    """A table of environment variables for one worker, normalized to sorted (name, value) pairs.
+
+    Values must be strings: TOML would happily give us `1` for a variable whose consumer expects
+    `"1"`, and silently stringifying it hides the mistake in the one place it matters. Names must be
+    POSIX-portable, and a value may not contain a NUL — TOML accepts `\\u0000`, `execve` does not, and
+    the resulting launch failure would surface as an unexplained restart loop rather than as a
+    rejected configuration. This table is not a secret store; see the field's documentation."""
+    if not isinstance(value, dict):
+        raise WorkersError(f"{where} must be a table of environment variables")
+    pairs = []
+    for name, item in value.items():
+        if not isinstance(name, str) or not _ENV_NAME.match(name):
+            raise WorkersError(f"{where} has an invalid variable name: {name!r}")
+        if name in _RESERVED_ENV:
+            raise WorkersError(f"{where}.{name} is set by the worker itself and cannot be overridden")
+        if not isinstance(item, str):
+            raise WorkersError(f'{where}.{name} must be a string (quote it, e.g. "1")')
+        if "\0" in item:
+            raise WorkersError(f"{where}.{name} must not contain a NUL byte")
+        pairs.append((name, item))
+    total = sum(len(name) + len(item) + 2 for name, item in pairs)
+    if total > _ENV_MAX_BYTES:
+        raise WorkersError(f"{where} is too large ({total} bytes; the limit is {_ENV_MAX_BYTES})")
+    return tuple(sorted(pairs))
+
+
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
@@ -196,6 +244,9 @@ class WorkerSpec:
     stream: bool = False
     isolate_home: bool = False
     restart: str = "always"
+    # Extra environment for this worker's process tree, as sorted (name, value) pairs so the spec stays
+    # hashable and its fingerprint is order-independent.
+    env: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
     def from_dict(raw: dict, index: int) -> WorkerSpec:
@@ -243,6 +294,7 @@ class WorkerSpec:
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
+            env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
         if spec.source is not None and ("roadmap" not in spec.only or not spec.roadmap_only):
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
@@ -280,6 +332,8 @@ class WorkerSpec:
             value["isolate_home"] = True
         if self.restart != "always":
             value["restart"] = self.restart
+        if self.env:
+            value["env"] = dict(self.env)
         return value
 
     def fingerprint(self) -> str:
@@ -593,7 +647,12 @@ def cmd_managed_runner(args) -> int:
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
         try:
-            env = self_env()
+            # Per-worker configuration goes UNDER self_env, not over it: self_env derives PYTHONPATH
+            # and the CA bundle from what it is given, so a configured NIX_SSL_CERT_FILE takes part in
+            # that discovery while the PYTHONPATH the child needs to import itself is still prepended
+            # rather than replaced. The manager's own variables are assigned last and are reserved, so
+            # nothing here can shadow them.
+            env = self_env({**os.environ, **dict(spec.env)})
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
@@ -857,7 +916,17 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         and prior.get("stopped_at")
                     ):
                         continue
-                    if not forced and spec.restart == "on-failure" and prior.get("exit_code") == 0:
+                    # As for `never` above, a clean exit is only terminal for the generation that
+                    # produced it: editing the definition (env, model, phases) must launch the new one,
+                    # which is what "the manager restarts an enabled worker when any field changes"
+                    # promises. Without the fingerprint test, an `on-failure` worker that exited 0
+                    # could never be reconfigured without an explicit restart.
+                    if (
+                        not forced
+                        and spec.restart == "on-failure"
+                        and prior.get("spec_hash") == spec.fingerprint()
+                        and prior.get("exit_code") == 0
+                    ):
                         continue
                     failures = int(prior.get("restart_count", 0))
                     delay = min(5 * (2 ** min(failures, 6)), 300) if prior.get("state") == "failed" else 0
@@ -1125,6 +1194,12 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         options.append(f"restart: {spec['restart']}")
     if options:
         lines.extend(_status_field("options", options, width))
+    # Show extra environment: a worker configured differently from its peers is otherwise
+    # indistinguishable in the status output, and that is exactly when it matters (an A/B of a build
+    # setting, a one-worker experiment). Names only — the values are in workers.toml, and printing
+    # them onto a shared terminal or into a pasted bug report earns nothing.
+    if isinstance(spec.get("env"), dict) and spec["env"]:
+        lines.extend(_status_field("env", [", ".join(sorted(spec["env"]))], width))
     return lines
 
 
