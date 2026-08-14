@@ -422,19 +422,27 @@ _PLACEHOLDER_RE = re.compile(r"__[A-Z][A-Z0-9_]*__")
 
 
 def fill_prompt(path: Path, **subs) -> str:
+    """Render a prompt template, substituting `__KEY__` for each keyword argument.
+
+    One pass over the TEMPLATE, never over what was substituted into it. Several values are
+    untrusted: `__CLAIMED__` is text copied from other contributors' intention issues, and
+    `__SOURCE_GUIDANCE__` names an operator-supplied repository. Substituting sequentially let a
+    claim that happened to contain `__BIN__` be rewritten by a later pass, and validating the
+    RENDERED text would let a claim containing any `__WORD__` abort the round — turning a mechanism
+    documented as cooperative and fail-open into a way to stop a roadmap worker."""
     path = Path(path)
-    out = path.read_text()
-    for k, v in subs.items():
-        out = out.replace(f"__{k}__", str(v))
+    text = path.read_text()
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
     # to a scratch file), and its placeholder set is that repo's business, not ours.
     if path.parent == HERE / "prompts":
-        left = sorted(set(_PLACEHOLDER_RE.findall(out)))
-        if left:
-            raise Die(f"{path.name}: unfilled prompt placeholder(s) {', '.join(left)}")
-    return out
+        missing = sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text)} - {f"__{k}__" for k in subs})
+        if missing:
+            raise Die(f"{path.name}: unfilled prompt placeholder(s) {', '.join(missing)}")
+    # A function replacement is taken literally, so a value containing a backslash escape or a
+    # `\g<name>` group reference cannot be reinterpreted either.
+    return _PLACEHOLDER_RE.sub(lambda m: str(subs.get(m.group(0)[2:-2], m.group(0))), text)
 
 
 def sync_mathlib_pool(cfg: Config) -> None:

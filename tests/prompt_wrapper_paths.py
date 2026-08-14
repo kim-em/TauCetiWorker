@@ -82,12 +82,12 @@ def main():
         bare = [
             line.strip()
             for line in text.splitlines()
-            if any(re.match(rf"^\s*{re.escape(w)}\b", line) for w in WRAPPERS)
+            if any(re.match(rf"^\s*\"?{re.escape(w)}\b", line) for w in WRAPPERS)
         ]
         check(f"{p.name}: no bare wrapper invocation", not bare)
         for w in WRAPPERS:
             if w in text:
-                check(f"{p.name}: {w} is invoked through __BIN__", f"__BIN__/{w}" in text)
+                check(f"{p.name}: {w} is invoked through a quoted __BIN__", f'"__BIN__/{w}"' in text)
 
     # 3) Every bundled prompt renders clean with its call site's keys, and the wrapper lines come
     # out as absolute paths.
@@ -97,13 +97,30 @@ def main():
         check(f"{name}: renders with no placeholder left", not left)
         invocations = [ln.strip() for ln in out.splitlines() if any(f"/{w}" in ln for w in WRAPPERS)]
         check(f"{name}: at least one wrapper invocation", bool(invocations))
+        # Quoted, so an install directory containing a space stays one word.
         check(
-            f"{name}: every wrapper invocation is absolute",
-            all(ln.startswith("/") or not ln.split()[0].endswith(WRAPPERS) for ln in invocations),
+            f"{name}: every wrapper invocation is absolute and quoted",
+            all(ln.startswith(f'"{subs["BIN"]}/') for ln in invocations),
         )
     check("every bundled prompt has a call site", {p.name for p in PROMPTS.glob("*.md")} == set(CALL_SITES))
 
-    # 4) The guard fires for our prompts and stays out of the way for a foreign one.
+    # 4) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
+    # copied from other contributors' intention issues, which is untrusted and documented as
+    # fail-open: a claim containing a `__WORD__` must not abort the round, and one containing a real
+    # placeholder must not be rewritten by a later substitution.
+    hostile = dict(CALL_SITES["roadmap.md"], CLAIMED="avoid the __FOO__ lemma and __BIN__ helpers")
+    try:
+        out = fill_prompt(PROMPTS / "roadmap.md", **hostile)
+        check("an untrusted claim containing __WORD__ does not abort the round", True)
+        check("that claim survives verbatim", "avoid the __FOO__ lemma and __BIN__ helpers" in out)
+        check("a claim's __BIN__ is not rewritten", out.count(hostile["BIN"] + "/git-safe-push") == 1)
+    except tc.config.Die:
+        check("an untrusted claim containing __WORD__ does not abort the round", False)
+    # A value carrying a regex replacement escape is taken literally.
+    esc = dict(CALL_SITES["roadmap.md"], CLAIMED=r"\g<0> and \1 and \\")
+    check("a claim with regex escapes is literal", r"\g<0> and \1 and \\" in fill_prompt(PROMPTS / "roadmap.md", **esc))
+
+    # 5) The guard fires for our prompts and stays out of the way for a foreign one.
     try:
         fill_prompt(PROMPTS / "fix.md", PR=1, AGENT="x")  # BIN omitted
         check("fill_prompt rejects an unfilled bundled placeholder", False)

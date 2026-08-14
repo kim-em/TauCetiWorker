@@ -21,7 +21,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
 - **Target id:** `<slug>` = the target's most identifying phrase (its declaration name if it has one, else the key noun phrase of its statement/docstring), lowercased with every run of non-alphanumeric characters replaced by a single `-`. Keep it short and deterministic — another agent picking the *same* target should produce the *same* slug. Example: "the Galois group of a multiquadratic field is (ℤ/2)ⁿ" → `galois-group-multiquadratic-z2n`.
 - **Claim it:**
   ```
-  __BIN__/claim.sh acquire "author/<target-roadmap>/<slug>"
+  "__BIN__/claim.sh" acquire "author/<target-roadmap>/<slug>"
   ```
   Exit `0` = it's yours, proceed. Exit `1` = another agent already holds it — pick a DIFFERENT target and claim that instead. Exit `2` = the claim could not be registered; proceed anyway. (This cooperative claim writes to the canonical repo, so without write access there it simply no-ops at exit 2 — that is expected and fine; your real duplicate-avoidance is the open-PR scan above + the intentions claims, and the duplicate sweeper is the backstop.)
 - **Record it in the PR body** (required — the PR will be rejected without it): include the exact line
@@ -57,12 +57,12 @@ You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`)
 - Create a branch `roadmap/<short-slug>-__WORKERID__` off `main` (the `-__WORKERID__` suffix keeps concurrent workers on one account from colliding). Commit (message `feat: <subject>`; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push the new branch to your fork with the project's safe wrapper — and ONLY the wrapper:
   ```
-  __BIN__/git-safe-push roadmap/<short-slug>-__WORKERID__
+  "__BIN__/git-safe-push" roadmap/<short-slug>-__WORKERID__
   ```
   This create-only-pushes the branch to your fork (it fails closed if that branch name already exists, so two agents can't collide). Do NOT run a raw `git push`.
 - Open the PR with the project's safe wrapper — and ONLY the wrapper, passing your fork as the head with an explicit `--head` (note the `__FORK__:` prefix, and no `--fill` / interactive prompts):
   ```
-  __BIN__/gh-safe-pr-create --repo TauCetiProject/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
+  "__BIN__/gh-safe-pr-create" --repo TauCetiProject/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
   ```
   Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, includes a standalone `Roadmap: <target-roadmap>` line (using the canonical top-level directory, never `any`), and, after an upstream switch, a standalone `Consumer roadmap: <designated-roadmap>` line plus the explicit dependency edge. It **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 
