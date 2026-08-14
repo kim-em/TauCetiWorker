@@ -159,8 +159,18 @@ try:
         ({"env": {"LAKE_ARTIFACT_CACHE": 1}}, "non-string value"),
         ({"env": {"": "x"}}, "empty name"),
         ({"env": {"A=B": "x"}}, "name containing ="),
+        ({"env": {" A": "x"}}, "name with whitespace"),
+        ({"env": {"1A": "x"}}, "name starting with a digit"),
         ({"env": {"TAUCETI_MANAGED": "0"}}, "manager-owned variable"),
         ({"env": {"TAUCETI_PARENT_PIPE_FD": "3"}}, "manager-owned variable"),
+        # Presetting the isolation sentinel would make isolate_home() return early and leave the
+        # worker on the operator's own credentials.
+        ({"env": {"TAUCETI_DATA_HOME": "/tmp/whatever"}}, "credential-isolation sentinel"),
+        # TOML accepts a literal NUL escape; execve does not, so a NUL must fail as configuration rather than as an
+        # unexplained restart loop at launch.
+        ({"env": {"LAKE_ARTIFACT_CACHE": "1\0"}}, "NUL in a value"),
+        # The whole spec travels as one command-line argument, so an unbounded table becomes E2BIG.
+        ({"env": {"BIG": "x" * (16 * 1024 + 1)}}, "oversized table"),
         ({"env": ["A=b"]}, "array instead of a table"),
     ):
         try:
@@ -427,15 +437,23 @@ worker3 — backing off
     # End to end through the real runner: the configured variable must be in the environment of the
     # process the runner spawns, which is the only place it does any good. `restart = "never"` lets the
     # runner exit once its one child has finished.
+    # Its own state and runtime directories: a status file for this probe left in the shared ones
+    # would shift the index-based snapshot assertions above the next time someone adds a case there.
+    probe_state, probe_runtime = root / "probe-state", root / "probe-run"
+    probe_state.mkdir(parents=True, exist_ok=True)
+    probe_runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     probe = root / "env-probe.txt"
     probe_spec = wm.WorkerSpec(id="envprobe", restart="never", env=(("LAKE_ARTIFACT_CACHE", "1"),))
     runner_env = worker_paths.self_env()
+    # Write the value to a temporary file and rename it into place: `probe.exists()` must not become
+    # true between creating the file and writing its contents, or this reads an empty string.
     runner_env["TAUCETI_MANAGER_TEST_COMMAND"] = shlex.join(
         [
             sys.executable,
             "-c",
-            "import os, pathlib, sys; pathlib.Path(sys.argv[1]).write_text("
-            "os.environ.get('LAKE_ARTIFACT_CACHE', '<unset>'))",
+            "import os, pathlib, sys; tmp = pathlib.Path(sys.argv[1] + '.tmp'); "
+            "tmp.write_text(os.environ.get('LAKE_ARTIFACT_CACHE', '<unset>')); "
+            "os.replace(tmp, sys.argv[1])",
             str(probe),
         ]
     )
@@ -445,9 +463,9 @@ worker3 — backing off
             "--spec",
             wm._encode_spec(probe_spec),
             "--state-dir",
-            str(wm.workers_state_dir()),
+            str(probe_state),
             "--runtime-dir",
-            str(wm.workers_runtime_dir()),
+            str(probe_runtime),
         ),
         env=runner_env,
         stdin=subprocess.DEVNULL,
@@ -459,13 +477,15 @@ worker3 — backing off
         while time.monotonic() < deadline and not probe.exists():
             time.sleep(0.1)
         assert probe.exists(), "the runner never started its worker child"
-        assert probe.read_text() == "1", f"worker child saw LAKE_ARTIFACT_CACHE={probe.read_text()!r}"
+        seen = probe.read_text()
+        assert seen == "1", f"worker child saw LAKE_ARTIFACT_CACHE={seen!r}"
     finally:
         runner.terminate()
         try:
             runner.wait(timeout=30)
         except subprocess.TimeoutExpired:
             runner.kill()
+            runner.wait(timeout=10)
 
     print("worker manager: OK")
 finally:

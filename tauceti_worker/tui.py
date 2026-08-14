@@ -616,6 +616,12 @@ def _dashboard_app(cfg, loader=None):
                 status.append("[space] enable/disable   [ctrl+r] restart   [enter] follow log", style="bold")
                 if item.get("detail"):
                     status.append(f"\n{item['detail']}")
+                # A worker carrying extra environment is running a different experiment from its
+                # peers; without this the dashboard shows it as identical to them. Names only, as in
+                # the CLI status — the values live in workers.toml.
+                configured = (item.get("spec") or {}).get("env") or {}
+                if configured:
+                    status.append(f"\nenv: {', '.join(sorted(configured))}")
                 if item.get("log_file"):
                     status.append(f"   log: {item['log_file']}")
             self.query_one("#status", Static).update(status)
