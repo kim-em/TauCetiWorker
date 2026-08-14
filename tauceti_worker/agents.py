@@ -1556,10 +1556,47 @@ _WORKER_CLAUDE_SETTINGS = {
     # An unattended round has no one to show an artifact to, and publishing one is outward-facing.
     "enableArtifact": False,
     "alwaysThinkingEnabled": True,
+    # host_agent_argv already passes --dangerously-skip-permissions, and a clean home was verified to
+    # run a tool-using headless round without this. Set anyway: it is the documented setting for
+    # accepting that mode without a human, it costs nothing, and the alternative failure — every
+    # claude round stopping at an acceptance prompt nobody can answer — is not one to discover in
+    # production.
+    "skipDangerousModePermissionPrompt": True,
 }
 
 
-def seed_worker_claude_config(real_claude: Path, iso_claude: Path) -> None:
+def _config_sources(real_claude: Path | None, iso_claude: Path) -> tuple[Path, ...]:
+    """Every config dir a symlink in `iso_claude` could have been created from, newest first.
+
+    The current one, plus the one recorded in `.tauceti-creds-source` when this home was first
+    seeded. They differ when a worker id is relaunched against a different `$CLAUDE_CONFIG_DIR`, and
+    without the recorded one a stale symlink into the ORIGINAL directory would survive the migration
+    and keep feeding that operator's instructions to the round. `real_claude` is None on the
+    early-return path, where `$CLAUDE_CONFIG_DIR` has already been repointed at `iso_claude` and the
+    marker is the only surviving record of where the credential came from."""
+    out = [] if real_claude is None else [real_claude]
+    try:
+        recorded = (iso_claude / ".tauceti-creds-source").read_text().strip()
+    except OSError:
+        recorded = ""
+    if recorded and Path(recorded) not in out:
+        out.append(Path(recorded))
+    return tuple(out)
+
+
+def _ours(dst: Path, item: str, sources: tuple[Path, ...]) -> bool:
+    """True when `dst` is a symlink WE created into one of the operator's config dirs. A real file,
+    or a symlink the operator pointed somewhere else, is theirs and is never touched."""
+    if not dst.is_symlink():
+        return False
+    try:
+        target = Path(os.readlink(dst))
+    except OSError:
+        return False
+    return any(target == src / item for src in sources)
+
+
+def seed_worker_claude_config(real_claude: Path | None, iso_claude: Path) -> None:
     """Give the worker's Claude config dir its own instruction surface, not the operator's.
 
     isolate_home used to symlink `CLAUDE.md`, `settings.json` and `skills` from the operator's real
@@ -1575,46 +1612,58 @@ def seed_worker_claude_config(real_claude: Path, iso_claude: Path) -> None:
     is still symlinked (none of it reaches a prompt), and so is the single `pi` skill $PI_RUN
     resolves through.
 
-    Existing worker homes are migrated: a symlink pointing into the operator's real config dir is
-    removed, because it is one we created. Anything the operator put there by hand — a real file, or
-    a symlink somewhere else — is left exactly as found, and so is a settings.json we already wrote.
-    `$TAUCETI_INHERIT_CLAUDE_CONFIG=1` restores the old wholesale mirroring."""
+    Idempotent, and safe to call on both isolate_home paths — which it must be, because a round child
+    of a loop parent started before this code exists reaches only the early-return one, and would
+    otherwise keep the operator's config until the whole fleet restarts.
+
+    What we created, we may replace: a symlink into any config dir this home was seeded from
+    (_config_sources), and a `settings.json` still byte-identical to the one we generated. Anything
+    the operator put there by hand — a real file, a symlink somewhere else, an edited settings.json —
+    is left exactly as found, in both directions. `$TAUCETI_INHERIT_CLAUDE_CONFIG=1` goes back to
+    mirroring the operator's config, including from a home already seeded the clean way."""
+    sources = _config_sources(real_claude, iso_claude)
+    src_dir = sources[0] if sources else None
+
+    for item in _MIRRORED_TOOLING:
+        dst = iso_claude / item
+        if src_dir is not None and _safe_exists(src_dir / item) and not dst.exists():
+            try:
+                dst.symlink_to(src_dir / item)
+            except OSError:
+                pass
+
     if os.environ.get("TAUCETI_INHERIT_CLAUDE_CONFIG") == "1":
-        for item in ("skills", "settings.json", "CLAUDE.md", *_MIRRORED_TOOLING):
-            src, dst = real_claude / item, iso_claude / item
-            if _safe_exists(src) and not dst.exists():
+        # Undo our own generated surface first, or the escape hatch silently does nothing on a home
+        # that has already run once the clean way: the entries exist, so a plain "link if absent"
+        # never replaces them.
+        _discard_generated(iso_claude)
+        for item in ("skills", "settings.json", "CLAUDE.md"):
+            dst = iso_claude / item
+            if src_dir is not None and _safe_exists(src_dir / item) and not dst.exists():
                 try:
-                    dst.symlink_to(src)
+                    dst.symlink_to(src_dir / item)
                 except OSError:
                     pass
         return
 
-    for item in _MIRRORED_TOOLING:
-        src, dst = real_claude / item, iso_claude / item
-        if _safe_exists(src) and not dst.exists():
-            try:
-                dst.symlink_to(src)
-            except OSError:
-                pass
-
-    # Drop the inherited instruction surface. Only ever our own symlink into the operator's dir.
+    # Drop the inherited instruction surface. Only ever a symlink we created.
     for item in ("CLAUDE.md", "settings.json", "skills"):
         dst = iso_claude / item
-        if dst.is_symlink():
+        if _ours(dst, item, sources):
             try:
-                if Path(os.readlink(dst)) == real_claude / item:
-                    dst.unlink()
+                dst.unlink()
             except OSError:
                 pass
 
     # One skill, not the operator's shelf. A pre-existing real skills dir is left alone.
     skills = iso_claude / "skills"
     if not skills.exists() and not skills.is_symlink():
-        src = real_claude / "skills" / _WORKER_SKILL
         try:
             skills.mkdir(parents=True, exist_ok=True)
-            if _safe_exists(src):
-                (skills / _WORKER_SKILL).symlink_to(src)
+            for src in sources:
+                if _safe_exists(src / "skills" / _WORKER_SKILL):
+                    (skills / _WORKER_SKILL).symlink_to(src / "skills" / _WORKER_SKILL)
+                    break
         except OSError:
             pass
 
@@ -1625,6 +1674,31 @@ def seed_worker_claude_config(real_claude: Path, iso_claude: Path) -> None:
             _write_json_atomic(settings, _WORKER_CLAUDE_SETTINGS)
         except OSError:
             pass
+
+
+def _discard_generated(iso_claude: Path) -> None:
+    """Remove the entries this module generates, and only while they are still exactly as generated.
+
+    An operator who edited the settings.json we wrote has made it theirs; it is preserved and the
+    inherit symlink is simply not created over it, which is visible rather than silent. The skills
+    directory counts as generated only while it holds nothing but our own single symlink."""
+    settings = iso_claude / "settings.json"
+    try:
+        if settings.is_file() and not settings.is_symlink():
+            if json.loads(settings.read_text()) == _WORKER_CLAUDE_SETTINGS:
+                settings.unlink()
+    except (OSError, ValueError):
+        pass
+    skills = iso_claude / "skills"
+    try:
+        if skills.is_dir() and not skills.is_symlink():
+            entries = list(skills.iterdir())
+            if all(e.name == _WORKER_SKILL and e.is_symlink() for e in entries):
+                for e in entries:
+                    e.unlink()
+                skills.rmdir()
+    except OSError:
+        pass
 
 
 def isolate_home(wid: str) -> Path:
@@ -1666,6 +1740,12 @@ def isolate_home(wid: str) -> Path:
         # The build caches are asserted here too, so a round child running this code under a loop
         # parent that predates it still pools its downloads.
         share_build_caches(wid, home)
+        # Same reason, same shape: a round child of a loop parent started before this code exists
+        # would otherwise keep the operator's CLAUDE.md/settings/skills until the whole fleet is
+        # restarted, and this is the one place such a child runs. Idempotent, a few stat calls.
+        seed_worker_claude_config(
+            None, iso_claude
+        )  # $CLAUDE_CONFIG_DIR already repoints here; the marker knows the source
         os.environ["CLAUDE_CONFIG_DIR"] = str(iso_claude)
         os.environ["CODEX_HOME"] = str(iso_codex)
         os.environ["TAUCETI_KIRO_HOME"] = str(iso_kiro_home)

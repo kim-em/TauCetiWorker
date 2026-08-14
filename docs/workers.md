@@ -299,7 +299,9 @@ the one `pi` skill the worker itself dispatches through, so a round behaves the
 same whoever ran it and your personal instructions cannot contradict the task
 prompt. Edit that generated `settings.json` in place to tune a worker; it is
 written once and never overwritten. `TAUCETI_INHERIT_CLAUDE_CONFIG=1` restores
-the previous behaviour of sharing your own `CLAUDE.md`, settings, and skills.
+the previous behaviour of sharing your own `CLAUDE.md`, settings, and skills,
+including on a worker already seeded the clean way; a `settings.json` you have
+edited is kept rather than replaced.
 
 ## State on disk
 
