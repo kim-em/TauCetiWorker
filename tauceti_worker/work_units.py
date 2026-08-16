@@ -105,6 +105,10 @@ class RoundOpts:
     authoring_profile: AuthoringProfile | None = None
     # --account: the Codex account this round is REQUIRED to spend under. Checked, never switched to.
     account: str | None = None
+    # The two UNDOCUMENTED review throttles (see throttle_review). 0 = off, which is the default and
+    # what every documented configuration gets.
+    review_min_queue: int = 0  # review only when at least this many PRs are awaiting review
+    review_min_age: int = 0  # minutes a PR must have been awaiting review before this worker takes it
 
     @property
     def agent_name(self) -> str:
@@ -136,6 +140,58 @@ def _bubble(stage: str, opts: RoundOpts) -> bool:
     if not SANDBOX_DEFAULT.get(stage, False):
         return False
     return not opts.sandbox_host
+
+
+def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
+    """Apply the two review throttles to this round's review queue, in place.
+
+    UNDOCUMENTED — expert use only. `--review-min-queue N` / `--review-min-age M` (and their
+    `$TAUCETI_REVIEW_MIN_QUEUE` / `$TAUCETI_REVIEW_MIN_AGE` equivalents, which is how a managed
+    worker gets them, through its `env` table) are deliberately absent from `--help`, the README and
+    docs/reference.md. They exist for an operator hand-tuning how a fleet spends its review budget —
+    batching reviews until a queue has piled up, or leaving a freshly-green PR alone for a while so a
+    human (or a peer worker with different pacing) can take it first. A default worker must never
+    need them, and an undocumented flag is one we can change or retire without a deprecation.
+
+    Both default to 0 (off) and can only ever REMOVE candidates: they change WHEN a reviewer fires,
+    never what it reviews, how it reviews, or any other stage. `status` and the dashboard survey
+    deliberately do not apply them — they report the queue as it is, not what this worker's throttles
+    would pick from it.
+
+    The queue depth is measured BEFORE the age filter, so `--review-min-queue 3` means "three PRs are
+    awaiting review", the quantity the operator sees, rather than "three are old enough yet".
+    A PR whose `build` status carries no readable timestamp has no known waiting time and is left
+    alone (fail-open): the alternative is a worker that silently never reviews it.
+    """
+    min_queue = getattr(opts, "review_min_queue", 0) or 0
+    min_age = getattr(opts, "review_min_age", 0) or 0
+    if not (min_queue or min_age):
+        return
+    queue = sv.reviewable.actionable
+    if min_queue and len(queue) < min_queue:
+        log(
+            f"  review: {len(queue)} PR(s) awaiting review, below the requested minimum of "
+            f"{min_queue} — not reviewing this round (--review-min-queue)"
+        )
+        sv.reviewable.actionable = []
+        return
+    if not min_age:
+        return
+    ready_at = {p.number: p.build_status_at for p in sv.open_prs}
+    stamp = time.time() if now is None else now
+    cutoff = stamp - min_age * 60
+    kept = []
+    for c in queue:
+        since = ready_at.get(c.pr)
+        if since is not None and since > cutoff:
+            waited = max(0, int((stamp - since) // 60))
+            log(
+                f"  review #{c.pr}: awaiting review {waited}m, below the requested minimum of "
+                f"{min_age}m — skipping (--review-min-age)"
+            )
+            continue
+        kept.append(c)
+    sv.reviewable.actionable = kept
 
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
@@ -196,6 +252,13 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
     # unchanged — and the real de-contention (marker / branch claim) remains the authority and backstop.
     for stage in AUTO_STAGES:
         sv.kind(stage).actionable = spread_candidates(sv.kind(stage).actionable)
+
+    # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
+    # in survey() so they steer only what this round PICKS: the survey (and so `status`, the dashboard,
+    # and every other stage) keeps reporting the queue as it really is. Skipped outright when this
+    # worker isn't reviewing anyway, so a `--only fix` round never logs a review it was not going to do.
+    if want(opts.only, "review"):
+        throttle_review(sv, opts)
 
     # The cascade: first actionable stage wins, does ONE unit, returns its rc. A candidate that is
     # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its

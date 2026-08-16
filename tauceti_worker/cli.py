@@ -279,6 +279,13 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    # UNDOCUMENTED, expert use only: two throttles on WHEN a worker reviews (see throttle_review in
+    # work_units.py). Suppressed from --help, and left out of the README and docs/reference.md on
+    # purpose — a default worker must never need them, and an undocumented flag can be retired
+    # without a deprecation. $TAUCETI_REVIEW_MIN_QUEUE / $TAUCETI_REVIEW_MIN_AGE give a managed
+    # worker the same control through its `env` table, since workers.toml has a closed schema.
+    p.add_argument("--review-min-queue", dest="review_min_queue", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--review-min-age", dest="review_min_age", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--quota-cmd",
         default=os.environ.get("TAUCETI_QUOTA_CMD"),
@@ -350,6 +357,23 @@ def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
     if not tasks:
         raise SystemExit("--only/--skip leave no work units enabled")
     return tasks
+
+
+def resolve_review_throttle(cli_value: int | None, env: str, flag: str) -> int:
+    """One of the undocumented review throttles, as an effective non-negative integer: the flag wins,
+    else the environment variable, else 0 (off). A malformed value fails loudly rather than silently
+    reading as 'off' — a throttle that quietly does nothing is worse than no throttle."""
+    if cli_value is None:
+        raw = (os.environ.get(env) or "").strip()
+        if not raw:
+            return 0
+        try:
+            cli_value = int(raw)
+        except ValueError:
+            raise Die(f"${env} must be a non-negative integer (got {raw!r})") from None
+    if cli_value < 0:
+        raise Die(f"{flag} must be a non-negative integer (got {cli_value})")
+    return cli_value
 
 
 def resolve_agent(args) -> str:
@@ -652,6 +676,17 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # children inherit it.
     if getattr(args, "stream", False):
         os.environ["TAUCETI_STREAM"] = "1"
+    # The undocumented review throttles. Resolve them here — before the loop branch below, which never
+    # builds a RoundOpts of its own — and pin the effective values in the env, which is how each
+    # `_round` child (and a managed worker's process tree) inherits them.
+    review_min_queue = resolve_review_throttle(
+        getattr(args, "review_min_queue", None), "TAUCETI_REVIEW_MIN_QUEUE", "--review-min-queue"
+    )
+    review_min_age = resolve_review_throttle(
+        getattr(args, "review_min_age", None), "TAUCETI_REVIEW_MIN_AGE", "--review-min-age"
+    )
+    os.environ["TAUCETI_REVIEW_MIN_QUEUE"] = str(review_min_queue)
+    os.environ["TAUCETI_REVIEW_MIN_AGE"] = str(review_min_age)
     # Resolve the worker id. An explicit --worker-id (or $TAUCETI_WORKER_ID, which loop children inherit)
     # pins it; with neither, auto-assign the lowest free slot (worker1, worker2, ...) so several
     # `work --loop` terminals on one host don't collide without the operator hand-numbering them. Pinning
@@ -762,6 +797,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             claude_bootstrap=pending_init or getattr(args, "claude_bootstrap", False),
             authoring_profile=authoring_profile,
             account=getattr(args, "account", None),
+            review_min_queue=review_min_queue,
+            review_min_age=review_min_age,
         )
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
         # so it is the one run that most needs to answer "am I on the right account?". The check is a
