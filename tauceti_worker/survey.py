@@ -38,7 +38,7 @@ from .constants import (
     TAUCETI,
     TAUCETI_OWNER,
 )
-from .github import GitHub, GitHubError, can_push, me
+from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
 from .review_state import Meta, ReviewState
 
 # ============================================================================
@@ -108,6 +108,11 @@ class PRInfo:
     title: str = ""
     target_focuses: tuple[str, ...] = ()  # synchronous fallback while the derived roadmap label is pending
     labels: tuple[str, ...] = ()  # label names carried by the PR (the status pipeline + roadmap area)
+    # When the authoritative `build` status was posted for THIS head (epoch seconds), i.e. the instant
+    # the PR became reviewable — so "awaiting review since" is exactly this, and a new push resets it
+    # with the head's new status. None when no `build` status carries a readable timestamp. Read off
+    # the rollup we already fetch, so it costs no extra GitHub call.
+    build_status_at: int | None = None
 
     @staticmethod
     def from_json(d: dict) -> PRInfo:
@@ -123,6 +128,9 @@ class PRInfo:
         # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
         # neither success nor failed — and simply waits for the trusted build to post.
         build_states = [c.get("state") for c in rollup if c.get("context") == "build"]
+        # `gh` normalizes a StatusContext's createdAt to `startedAt`, so this is when the build status
+        # was posted. With several `build` contexts the LATEST is when the head became fully green.
+        posted = [_parse_iso8601(c.get("startedAt")) for c in rollup if c.get("context") == "build"]
         return PRInfo(
             number=d["number"],
             title=d.get("title", ""),
@@ -138,6 +146,7 @@ class PRInfo:
             build_success=bool(build_states) and all(s == "SUCCESS" for s in build_states),
             build_failed=any(s in BUILD_FAIL for s in build_states),
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
+            build_status_at=max([t for t in posted if t is not None], default=None),
         )
 
 
