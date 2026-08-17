@@ -8,6 +8,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
   ```
   lake exe cache get
+  if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py --fail-on-available; fi
   lake build
   lake exe axioms
   lake exe module-system
@@ -18,7 +19,8 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
-- If the failure is genuinely transient/infra (e.g. cache fetch timeout) and the code builds clean locally, do NOT hack the code — push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so in your report.
+- If the shim-expiry command fails, its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. A base registry obligation remains until its tracked source is deleted or re-homed, so never make the check green by merely deleting or weakening a live source's probes.
+- If the failure is genuinely transient/infra (e.g. cache fetch timeout), the code and shim-expiry command are green locally, and the failed logs contain no actionable migration, do NOT hack the code — push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so in your report.
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if almost nothing survives, stop and report that rather than pushing an empty shell.
 
 ## Rules of the repo (hard constraints)
@@ -30,6 +32,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
 ```
 lake exe cache get
+if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py --fail-on-available; fi
 lake build
 lake exe axioms
 lake exe module-system
@@ -50,4 +53,4 @@ fails on an axiom-audit, module-system, or lint-env violation (e.g. a missing do
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: what was failing, the root cause, what you changed (or that you only re-triggered transient CI), and the exact shim-expiry / `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.

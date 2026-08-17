@@ -16,7 +16,8 @@ This harness pins the four properties that keep that true:
   2. Every prompt that invokes a wrapper invokes it through `__BIN__`, never bare.
   3. Every bundled prompt renders with no placeholder left, using exactly the keys its call site
      passes — a leaked `__BIN__/git-safe-push` is the very failure being fixed.
-  4. `fill_prompt` raises on an unfilled placeholder in a bundled prompt, and stays quiet for a
+  4. The bump and CI-repair prompts run the expired-shim gate and tell the worker how to migrate.
+  5. `fill_prompt` raises on an unfilled placeholder in a bundled prompt, and stays quiet for a
      prompt served from elsewhere (TauCetiProgress owns the progress prompt's placeholder set).
 
 Exit 0 = all assertions hold; 1 = a mismatch.
@@ -104,7 +105,16 @@ def main():
         )
     check("every bundled prompt has a call site", {p.name for p in PROMPTS.glob("*.md")} == set(CALL_SITES))
 
-    # 4) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
+    # 4) Shim expiry is an autonomous repair input, not a notification-only dead end. Both workers
+    # reproduce and verify the gate, and both know the registry is part of the source-only fix.
+    shim_command = "python3 scripts/check-expired-mathlib-shims.py --fail-on-available"
+    for name in ("bump.md", "fix-ci.md"):
+        prompt = (PROMPTS / name).read_text()
+        check(f"{name}: reproduces and verifies shim expiry", prompt.count(shim_command) == 2)
+        check(f"{name}: migrates the AI-owned registry", "TauCeti/mathlib-shims.json" in prompt)
+        check(f"{name}: forbids weakening live probes", "never make the check green" in prompt)
+
+    # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as
     # fail-open: a claim containing a `__WORD__` must not abort the round, and one containing a real
     # placeholder must not be rewritten by a later substitution.
@@ -120,7 +130,7 @@ def main():
     esc = dict(CALL_SITES["roadmap.md"], CLAIMED=r"\g<0> and \1 and \\")
     check("a claim with regex escapes is literal", r"\g<0> and \1 and \\" in fill_prompt(PROMPTS / "roadmap.md", **esc))
 
-    # 5) The guard fires for our prompts and stays out of the way for a foreign one.
+    # 6) The guard fires for our prompts and stays out of the way for a foreign one.
     try:
         fill_prompt(PROMPTS / "fix.md", PR=1, AGENT="x")  # BIN omitted
         check("fill_prompt rejects an unfilled bundled placeholder", False)
