@@ -7,6 +7,7 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 ## Reproduce and adapt
 ```
 lake exe cache get
+git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"
 if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
@@ -28,6 +29,7 @@ lake exe axioms
 ## Verify before pushing (all three MUST pass)
 ```
 lake exe cache get
+git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"
 if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi

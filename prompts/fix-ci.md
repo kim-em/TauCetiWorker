@@ -8,9 +8,11 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   the sandboxed build, the audits, and the lint, so run the WHOLE suite, not just `lake build`:
   ```
   lake exe cache get
+  git fetch -q origin main
   shim_args=(--fail-on-available); base_shims="$(mktemp)"; have_base=0
   if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); have_base=1; fi
-  if [ "$have_base" = 1 ] && git diff --quiet origin/main -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
+  base_ref="$(git merge-base origin/main HEAD)"
+  if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
   if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
   rm -f "$base_shims"
   lake build
@@ -36,9 +38,11 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Verify before pushing (ALL of these MUST pass — they are exactly what the `build` check runs)
 ```
 lake exe cache get
+git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"; have_base=0
 if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); have_base=1; fi
-if [ "$have_base" = 1 ] && git diff --quiet origin/main -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
+base_ref="$(git merge-base origin/main HEAD)"
+if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"
 lake build

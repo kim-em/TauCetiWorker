@@ -113,10 +113,13 @@ def main():
         check(f"{name}: reproduces and verifies shim expiry", prompt.count(shim_command) == 2)
         check(f"{name}: uses strict shim expiry mode", prompt.count("--fail-on-available") == 2)
         check(f"{name}: validates the base registry ratchet", prompt.count("--base-manifest") == 2)
+        check(f"{name}: refreshes the base ref", prompt.count("git fetch -q origin main") == 2)
         check(f"{name}: migrates the AI-owned registry", "TauCeti/mathlib-shims.json" in prompt)
         check(f"{name}: forbids weakening exact targets", "never make the check green" in prompt)
-    check("fix-ci.md: source PRs probe only changed obligations",
-          (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 2)
+    check(
+        "fix-ci.md: source PRs probe only changed obligations",
+        (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 2,
+    )
 
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as
