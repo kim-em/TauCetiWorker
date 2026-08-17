@@ -7,12 +7,18 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 ## Reproduce and adapt
 ```
 lake exe cache get
+git fetch -q origin main
+shim_args=(--fail-on-available); base_shims="$(mktemp)"
+if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
+if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
+rm -f "$base_shims"
 lake build
 lake exe axioms
 ```
 - Read the build failures. The usual cause is a renamed/moved/retyped Mathlib lemma or a changed signature. Fix each by updating the `TauCeti/` proof or statement to the new Mathlib API. Prefer the smallest correct change.
+- The shim-expiry command may be the only failing check even when `lake build` succeeds. Its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. A base registry obligation remains until its registered local declarations are gone (or a file-wide module shim is deleted/re-homed), so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
 - For a failing check's logs: `gh pr checks __PR__ --repo TauCetiProject/TauCeti`, then `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed`.
-- If the failure is genuinely transient infra (e.g. a cache fetch timeout) and the code builds clean locally, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
+- If the failure is genuinely transient infra (e.g. a cache fetch timeout), both `lake build` and the shim-expiry command succeed locally, and the failed logs contain no actionable migration, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`) and say so.
 
 ## Rules of the repo (hard constraints)
 - Adapt code under `TauCeti/`. Do NOT edit the root `TauCeti.lean`: it is intentionally empty, and the lakefile's glob (`TauCeti.*`) builds every module under `TauCeti/` without it. The only files outside `TauCeti/` you may leave changed are the pins the bot already bumped. Do NOT touch `Scripts/`, `.github/`, or the lakefile (`lakefile.toml`/`lakefile.lean`).
@@ -23,6 +29,11 @@ lake exe axioms
 ## Verify before pushing (all three MUST pass)
 ```
 lake exe cache get
+git fetch -q origin main
+shim_args=(--fail-on-available); base_shims="$(mktemp)"
+if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
+if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
+rm -f "$base_shims"
 lake build
 lake exe axioms
 ```
@@ -40,4 +51,4 @@ Iterate until green. Never push red.
 - Do NOT open a new PR; do NOT touch files outside `TauCeti/` (and the already-bumped pins).
 
 ## Report
-End with a concise summary: which Mathlib changes broke `TauCeti/`, how you adapted each, and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: which Mathlib changes broke or superseded `TauCeti/`, how you adapted each, and the exact shim-expiry / `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
