@@ -120,6 +120,12 @@ def main():
         "fix-ci.md: source PRs probe only changed obligations",
         (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 2,
     )
+    for name in ("bump.md", "fix-ci.md"):
+        prompt = (PROMPTS / name).read_text()
+        check(
+            f"{name}: shim baseline is the PR merge base",
+            prompt.count('git show "$base_ref":TauCeti/mathlib-shims.json') == 2,
+        )
 
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as
