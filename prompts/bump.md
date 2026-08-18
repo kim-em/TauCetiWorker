@@ -9,7 +9,8 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 lake exe cache get
 git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"
-if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
+base_ref="$(git merge-base origin/main HEAD)"
+if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"
 lake build
@@ -31,7 +32,8 @@ lake exe axioms
 lake exe cache get
 git fetch -q origin main
 shim_args=(--fail-on-available); base_shims="$(mktemp)"
-if git show origin/main:TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
+base_ref="$(git merge-base origin/main HEAD)"
+if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then shim_args+=(--base-manifest "$base_shims"); fi
 if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
 rm -f "$base_shims"
 lake build
