@@ -126,6 +126,10 @@ def main():
             f"{name}: shim baseline is the PR merge base",
             prompt.count('git show "$base_ref":TauCeti/mathlib-shims.json') == 2,
         )
+        check(
+            f"{name}: shim ratchet reads merge-base sources",
+            prompt.count('--base-root "$base_root"') == 2,
+        )
 
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as
