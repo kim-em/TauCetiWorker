@@ -74,11 +74,36 @@ check(
     round(q._codex_from_payload(*served).windows[0].resets_at - at),
     600,
 )
-# Wind the same entry past the window it describes: it must stop being served, TTL notwithstanding.
-rolled = time.time() - 700
-q._store_raw("codex", codex_payload, fp_gmail, tc._codex_valid_until(codex_payload, rolled), rolled)
-check("past its window's reset ⇒ miss, well inside the TTL", q._cached_codex(fp_gmail), None)
-# A payload whose window cannot be placed in time is never pinned, so nothing to serve.
+# Wind the same entry past the window it describes: it must stop being served. The entry is still WELL
+# inside codex's 10-minute TTL, so only the payload's own expiry can reject it.
+short = {
+    "rate_limit": {
+        "limit_reached": False,
+        "primary_window": {"used_percent": 20, "limit_window_seconds": 5 * 3600, "reset_after_seconds": 30},
+        "secondary_window": None,
+    }
+}
+rolled = time.time() - 60  # 60s ago, describing a window that had 30s left ⇒ rolled 30s ago
+check("the entry is nowhere near the TTL", time.time() - rolled < tc.QUOTA_TTL["codex"], True)
+q._store_raw("codex", short, fp_gmail, tc._codex_valid_until(short, rolled), rolled)
+check("past its window's reset ⇒ miss", q._cached_codex(fp_gmail), None)
+# ...and an entry written before this rule existed carries no expiry at all, which is exactly the
+# population whose window may already have rolled. The expiry is re-derived, not trusted.
+legacy = {"fetched_at": rolled, "fp": fp_gmail, "payload": short}
+(q.cache_dir / "quota-codex.json").write_text(tc.json.dumps(legacy))
+check("a legacy entry with no stored expiry is revalidated", q._cached_codex(fp_gmail), None)
+check("...though the raw TTL layer would have served it", q._cached_raw("codex", fp_gmail) is not None, True)
+
+# A payload whose window cannot be placed in time is never pinned, so there is nothing to serve — and
+# the same clock check decides both, so a window too broken to cache is too broken to pace against.
+for junk in (-1, True, float("nan"), "600", None, 5 * 3600 + 1):
+    bad = {
+        "rate_limit": {
+            "primary_window": {"used_percent": 1, "limit_window_seconds": 5 * 3600, "reset_after_seconds": junk}
+        }
+    }
+    check(f"reset_after_seconds={junk!r} ⇒ not cacheable", tc._codex_valid_until(bad, at), None)
+    check("...and reads as unknown, not available", q._codex_from_payload(bad, at).windows[0].status, "unknown")
 check("an unplaceable codex payload has no expiry to store", tc._codex_valid_until({"rate_limit": {}}, at), None)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
