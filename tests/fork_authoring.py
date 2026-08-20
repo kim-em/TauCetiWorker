@@ -155,7 +155,17 @@ def test_roadmap():
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     os.environ["TAUCETI_PUSH_EXPECT"] = "stale"  # must be popped by do_roadmap (create-only on the fork)
     tc.work_units.ensure_fork = lambda: FORK
-    tc.work_units.fetch_ref = lambda *a, **k: True
+
+    # A real review checkout, so the round exercises the BUNDLED path rather than the fallback:
+    # stage_rubrics only produces a bundle when it finds rubrics to concatenate.
+    def fake_fetch_ref(repo, dest):
+        if repo == tc.constants.REVIEW:
+            (Path(dest) / "rubrics").mkdir(parents=True, exist_ok=True)
+            (Path(dest) / "rubrics" / "_common.md").write_text("SHARED PROTOCOL\n")
+            (Path(dest) / "rubrics" / "api-design.md").write_text("ANGLE api-design\n")
+        return True
+
+    tc.work_units.fetch_ref = fake_fetch_ref
     saved_fetch_source = tc.work_units.fetch_git_source
     materialized = {}
 
@@ -240,7 +250,20 @@ def test_roadmap():
     tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
     no_source_prompt = cap.get("prompt", "")
     check("roadmap: absent source adds no guidance", "Supplementary source material" not in no_source_prompt)
-    check("roadmap: absent source keeps one bullet list", "deprecation.\n- Before writing" in no_source_prompt)
+    # The bundle must reach BOTH the prompt and the sandbox, or the prompt names a path the agent
+    # cannot open. rubric_bundle.py proves the file is built; this proves it is delivered.
+    check("roadmap: bubble prompt names the bundle", "/opt/rubrics/rubrics.md" in no_source_prompt)
+    check(
+        "roadmap: bubble mounts the bundle read-only",
+        any(m.endswith(":/opt/rubrics:ro") for m in cap.get("mounts", [])),
+    )
+    check("roadmap: the bundle is really written", (tmp / "refs" / "rubrics" / "rubrics.md").is_file())
+    # __SOURCE_GUIDANCE__ sits between two bullets, so an absent source must leave them contiguous
+    # rather than opening a hole in the list.
+    check(
+        "roadmap: absent source keeps one bullet list",
+        "rubrics you read.\n- Before writing" in no_source_prompt,
+    )
     tc.work_units.fetch_git_source = saved_fetch_source
 
 

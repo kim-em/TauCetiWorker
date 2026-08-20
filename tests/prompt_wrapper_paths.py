@@ -54,6 +54,7 @@ CALL_SITES = {
         WORKERID="worker5",
         ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
         REVIEW_DIR="/opt/review",
+        RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
         BIN="/bin",
     ),
