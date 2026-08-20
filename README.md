@@ -293,9 +293,11 @@ every action, the credential isolation rules, and the tmux viewer.
 limits with no setup beyond logging in with the official CLIs. A provider is
 available only while its used percentage is strictly below the budget for the
 elapsed fraction of every reported window; `--agent auto` prefers Codex, to spare
-the scarcer Opus, falls back to Claude, and sleeps when neither has room. Usage
-it cannot read counts as unavailable rather than free. The dashboard and
-`tauceti status` show current usage and why a provider is waiting.
+the scarcer Opus, falls back to Claude, and sleeps when neither has room. A
+provider held back by the pace line wakes when the rising budget overtakes its
+usage, which is normally well before the window resets. Usage it cannot read
+counts as unavailable rather than free. The dashboard and `tauceti status` show
+current usage and why a provider is waiting.
 
 | Control | Effect |
 | --- | --- |

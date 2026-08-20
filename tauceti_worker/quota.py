@@ -183,6 +183,35 @@ def pace_budget(curve: list[tuple[float, float]], elapsed: float) -> float:
     return curve[-1][1]
 
 
+def pace_recovery(curve: list[tuple[float, float]], used: float, elapsed: float) -> float | None:
+    """The earliest elapsed% at or after `elapsed` where the budget REACHES `used` — the moment a window
+    stuck at/over the pace line stops being stuck, given that nothing else spends. None when the budget
+    never gets there before the window ends, which is the honest answer for a flat or falling curve: only
+    the reset frees that window.
+
+        60:40, used 30, elapsed 20 → 45   (the budget passes 30% at 45% elapsed)
+        60:40, used 30, elapsed 50 → 50   (already above: the current instant)
+        0:50,100:50, used 60, ...  → None (a flat 50% budget never reaches 60% used)
+
+    It returns the EQUALITY point, and equality is still a block (`under-pace` means strictly under), so
+    a caller waiting on this must ease past it — see _pace_free_at."""
+    e0 = max(0.0, min(100.0, elapsed))
+    if pace_budget(curve, e0) > used:
+        return e0
+    prev_t, prev_b = curve[0]
+    for t, b in curve:
+        if t > e0 and b > used:
+            # The first segment ending strictly above `used`. The budget at e0 is at or below it, so this
+            # segment rises through it; interpolate the crossing and never report a moment already past.
+            # A segment that somehow does not rise cannot be solved, so take its end, where the budget is
+            # above `used` by inspection.
+            span, rise = t - prev_t, b - prev_b
+            hit = t if span <= 0 or rise <= 0 else prev_t + (used - prev_b) / rise * span
+            return max(hit, e0)
+        prev_t, prev_b = t, b
+    return None
+
+
 def pace_zero_plateau(curve: list[tuple[float, float]]) -> float:
     """τ₀ = sup{t : the budget is 0 across the whole of [0, t]} — how long a fresh window stays
     completely unspendable under this curve. 0 means the budget is positive at (or immediately after)
@@ -202,6 +231,14 @@ def pace_zero_plateau(curve: list[tuple[float, float]]) -> float:
             break
         plateau = t
     return plateau
+
+
+# How far past the crossing a pace-blocked window is worth waking for. pace_recovery returns the moment
+# the budget REACHES current usage, and equality is still a block (`under-pace` is strict), so waking
+# exactly there would find the window still held. The reset clock the elapsed% comes from can also be a
+# few seconds stale. A couple of minutes settles both; it costs nothing, since the loop's poll floor
+# (POLL, 5 minutes by default) is longer anyway.
+PACE_EASE_S = 180
 
 
 def _idle_init_block(curve: list[tuple[float, float]] | None = None) -> str | None:
@@ -307,7 +344,8 @@ class Provider:
     model: str | None  # gpt-5 | opus | None
     windows: list[Window] = field(default_factory=list)
     error: str | None = None
-    next_eligible: float | None = None  # epoch when a blocking window should free
+    next_eligible: float | None = None  # epoch when a blocking window should free (a pace-blocked one
+    # against the curve, an exhausted one at its reset); see Quota._next_eligible
     retry_after: float | None = None  # seconds the endpoint asked us to back off (HTTP 429); NOT a
     # quota reset — must not be classified as exhausted/next_eligible
     # The launch-stage bootstrap decision, computed PURELY (see Quota._claude_provider). True only when
@@ -351,6 +389,25 @@ def _classify_window(
     else:
         st = STATUS_OVER_PACE
     return Window(name, used, e, resets_at, st, thr)
+
+
+def _pace_free_at(window: Window, now: float) -> float | None:
+    """When a window held by the PACE line should have budget again, as an epoch — or None when nothing
+    but the reset will free it (a flat or falling curve, or a window we cannot measure).
+
+    The elapsed% is converted back to wall clock at the window's own rate, taken from its reset clock
+    rather than from an assumed window length: codex reports the length per payload, and both providers'
+    windows then read the same way."""
+    if window.used is None or window.elapsed is None or window.resets_at is None:
+        return None
+    left, remaining = window.resets_at - now, 100.0 - window.elapsed
+    if left <= 0 or remaining <= 0:  # rolling over right now; the reset is the answer
+        return None
+    at = pace_recovery(pace_curve(), window.used, window.elapsed)
+    if at is None:
+        return None
+    # Never later than the reset, which frees the window outright whatever the curve says.
+    return min(now + (at - window.elapsed) * (left / remaining) + PACE_EASE_S, window.resets_at)
 
 
 def _parse_iso(s: object) -> float | None:
@@ -1885,10 +1942,19 @@ class Quota:
 
     @staticmethod
     def _next_eligible(windows: list[Window]) -> float | None:
-        # Earliest reset among windows that are currently blocking on TIME (at budget, over pace, or
-        # exhausted) — the ones a wait actually fixes.
-        blocking = (STATUS_AT_BUDGET, STATUS_OVER_PACE, STATUS_EXHAUSTED)
-        blocked = [w.resets_at for w in windows if w.status in blocking and w.resets_at]
+        # Earliest moment a wait actually fixes something, over the windows currently blocking on TIME.
+        # An exhausted window needs its reset. A window held by the PACE line does not: its usage is
+        # fixed while we wait and the budget climbs, so it frees itself partway through the window (see
+        # _pace_free_at). Waiting for the reset there parks a worker with quota in hand.
+        soon: list[float | None] = []
+        now = time.time()
+        for w in windows:
+            if w.status in (STATUS_AT_BUDGET, STATUS_OVER_PACE):
+                paced = _pace_free_at(w, now)
+                soon.append(w.resets_at if paced is None else paced)
+            elif w.status == STATUS_EXHAUSTED:
+                soon.append(w.resets_at)
+        blocked = [t for t in soon if t]
         return min(blocked) if blocked else None
 
     # --- selection ---------------------------------------------------------

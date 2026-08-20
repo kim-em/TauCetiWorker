@@ -122,8 +122,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     verdict, pending_init = "run", True
                 if verdict == "wait":
                     why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
-                    # Honor the endpoint's Retry-After, else wait for the blocking window's reset
-                    # (capped), else poll. Never sooner than POLL, so we don't re-trip a 429.
+                    # Honor the endpoint's Retry-After, else wait until the blocking window is next
+                    # eligible (capped), else poll. Never sooner than POLL, so we don't re-trip a 429.
                     nap = max(POLL, int(prov.retry_after) if (prov and prov.retry_after) else 0)
                     if prov and not prov.retry_after and prov.next_eligible:
                         nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
@@ -149,7 +149,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                         if eligible:
                             # A forced refresh is valuable before a launch, not every five minutes
                             # throughout a known multi-hour wait. Recheck at least hourly so sibling
-                            # workers or operator activity are still observed reasonably promptly.
+                            # workers or operator activity are still observed reasonably promptly. A
+                            # pace-blocked window reports when the budget overtakes its usage, which is
+                            # usually well before its reset, so this sleeps to the line, not past it.
                             nap = max(nap, min(int(min(eligible) - time.time()) + 5, 3600))
                     # Neither destination renders Rich markup: log() writes to stderr and a file, and a
                     # runtime-status detail is read back as data.
