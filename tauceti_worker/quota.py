@@ -183,33 +183,46 @@ def pace_budget(curve: list[tuple[float, float]], elapsed: float) -> float:
     return curve[-1][1]
 
 
-def pace_recovery(curve: list[tuple[float, float]], used: float, elapsed: float) -> float | None:
-    """The earliest elapsed% at or after `elapsed` where the budget REACHES `used` — the moment a window
-    stuck at/over the pace line stops being stuck, given that nothing else spends. None when the budget
-    never gets there before the window ends, which is the honest answer for a flat or falling curve: only
-    the reset frees that window.
+def pace_recovery(curve: list[tuple[float, float]], used: float, elapsed: float) -> tuple[float, float] | None:
+    """The first stretch at or after `elapsed` where the budget stands above `used` — the window in which
+    a window stuck at/over the pace line is free again, given that nothing else spends. Returned as
+    (start, end) in elapsed%, or None when the budget never gets there at all, which is the honest answer
+    for a flat or falling curve: only the reset frees that window.
 
-        60:40, used 30, elapsed 20 → 45   (the budget passes 30% at 45% elapsed)
-        60:40, used 30, elapsed 50 → 50   (already above: the current instant)
-        0:50,100:50, used 60, ...  → None (a flat 50% budget never reaches 60% used)
+        60:40, used 30, elapsed 20 → (45, 100)   (the budget passes 30% at 45% elapsed, and stays past it)
+        60:40, used 30, elapsed 50 → (50, 100)   (already above: from the current instant)
+        0:50,100:50, used 60, ...  → None        (a flat 50% budget never reaches 60% used)
+        0:0,50:50,51:0, used 40    → (40, 50.2)  (a curve that gives budget back, briefly)
 
-    It returns the EQUALITY point, and equality is still a block (`under-pace` means strictly under), so
-    a caller waiting on this must ease past it — see _pace_free_at."""
+    `start` is the EQUALITY point, and equality is still a block (`under-pace` means strictly under), so a
+    caller must wait until strictly inside (start, end) — a fixed delay past `start` would step over a
+    short stretch entirely. See _pace_free_at."""
     e0 = max(0.0, min(100.0, elapsed))
-    if pace_budget(curve, e0) > used:
-        return e0
+    start = e0 if pace_budget(curve, e0) > used else None
+    if start is None:
+        prev_t, prev_b = curve[0]
+        for t, b in curve:
+            if t > e0 and b > used:
+                # The first segment ending above `used`. The budget at e0 is at or below it, so this
+                # segment rises through it; interpolate the crossing and never report a moment already
+                # past. A segment that somehow does not rise cannot be solved, so take its end, where the
+                # budget is above `used` by inspection.
+                span, rise = t - prev_t, b - prev_b
+                start = t if span <= 0 or rise <= 0 else max(prev_t + (used - prev_b) / rise * span, e0)
+                break
+            prev_t, prev_b = t, b
+    if start is None:
+        return None
+    # Where it drops back: the first segment after `start` ENDING at or below `used`. That segment must
+    # fall (it began above `used`, or `start` would be inside it), so the crossing solves the same way.
     prev_t, prev_b = curve[0]
     for t, b in curve:
-        if t > e0 and b > used:
-            # The first segment ending strictly above `used`. The budget at e0 is at or below it, so this
-            # segment rises through it; interpolate the crossing and never report a moment already past.
-            # A segment that somehow does not rise cannot be solved, so take its end, where the budget is
-            # above `used` by inspection.
-            span, rise = t - prev_t, b - prev_b
-            hit = t if span <= 0 or rise <= 0 else prev_t + (used - prev_b) / rise * span
-            return max(hit, e0)
+        if t > start and b <= used:
+            span, fall = t - prev_t, prev_b - b
+            end = t if span <= 0 or fall <= 0 else prev_t + (prev_b - used) / fall * span
+            return start, max(end, start)
         prev_t, prev_b = t, b
-    return None
+    return start, 100.0
 
 
 def pace_zero_plateau(curve: list[tuple[float, float]]) -> float:
@@ -233,11 +246,14 @@ def pace_zero_plateau(curve: list[tuple[float, float]]) -> float:
     return plateau
 
 
-# How far past the crossing a pace-blocked window is worth waking for. pace_recovery returns the moment
+# How far past the crossing a pace-blocked window is worth waking for. pace_recovery reports the moment
 # the budget REACHES current usage, and equality is still a block (`under-pace` is strict), so waking
-# exactly there would find the window still held. The reset clock the elapsed% comes from can also be a
-# few seconds stale. A couple of minutes settles both; it costs nothing, since the loop's poll floor
-# (POLL, 5 minutes by default) is longer anyway.
+# exactly there would find the window still held; the reset clock the elapsed% is derived from can also
+# be a few seconds stale. This is the allowance for both. It delays the wake by up to three minutes,
+# which is nothing against the multi-hour wait it replaces — but it is a clock-skew allowance, NOT a
+# quota margin: the headroom it buys depends on the curve's local slope (on a weekly window it is a
+# fraction of a budget point). What makes the wake worth taking is the forced re-read that follows it.
+# _pace_free_at shortens it rather than overshooting a brief stretch of budget.
 PACE_EASE_S = 180
 
 
@@ -395,19 +411,24 @@ def _pace_free_at(window: Window, now: float) -> float | None:
     """When a window held by the PACE line should have budget again, as an epoch — or None when nothing
     but the reset will free it (a flat or falling curve, or a window we cannot measure).
 
-    The elapsed% is converted back to wall clock at the window's own rate, taken from its reset clock
-    rather than from an assumed window length: codex reports the length per payload, and both providers'
-    windows then read the same way."""
+    Elapsed% converts back to wall clock at the rate the window's own reset clock implies, so a codex
+    window of whatever length its payload reports reads the same way as a Claude one."""
     if window.used is None or window.elapsed is None or window.resets_at is None:
         return None
     left, remaining = window.resets_at - now, 100.0 - window.elapsed
     if left <= 0 or remaining <= 0:  # rolling over right now; the reset is the answer
         return None
-    at = pace_recovery(pace_curve(), window.used, window.elapsed)
-    if at is None:
+    free = pace_recovery(pace_curve(), window.used, window.elapsed)
+    if free is None:
         return None
-    # Never later than the reset, which frees the window outright whatever the curve says.
-    return min(now + (at - window.elapsed) * (left / remaining) + PACE_EASE_S, window.resets_at)
+    start, end = free
+    per_pct = left / remaining  # seconds of wall clock per elapsed%
+    # Ease past the equality, but stay INSIDE the stretch that has budget: a curve may hand back only a
+    # brief one, and a fixed three minutes would step over it and wait for the reset instead.
+    ease = min(PACE_EASE_S, (end - start) * per_pct / 2)
+    # That bound also keeps the answer inside the window: the stretch ends at 100% elapsed at the latest,
+    # so easing to its midpoint cannot reach the reset. The min() is belt and braces.
+    return min(now + (start - window.elapsed) * per_pct + ease, window.resets_at)
 
 
 def _parse_iso(s: object) -> float | None:
