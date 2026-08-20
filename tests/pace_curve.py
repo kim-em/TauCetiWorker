@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """The pacer's under/over-pace threshold is a piecewise-linear budget curve from $TAUCETI_PACE
 (--pace), defaulting to `60:40`. Verify parsing (incl. endpoint fill and rejection of bad specs),
-interpolation, and that _classify_window actually honours the curve. Dependency-free; no network."""
+interpolation, that _classify_window actually honours the curve, and that a window the curve blocks
+reports when the curve frees it. Dependency-free; no network."""
 
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -145,6 +147,119 @@ for spec, want in (
 ):
     got = tc.pace_zero_plateau(tc.parse_pace_curve(spec))
     check(f"tau0({spec or 'default'}) == {want}", got == want)
+
+# --- pace_recovery: when a pace-blocked window's budget catches up with its usage -------------------
+# A window held by the pace line is not waiting for its reset: its usage is fixed while it waits and the
+# budget climbs. This is the stretch (start, end) over which the budget stands above that usage — start
+# being the EQUALITY point, which is still a block, so callers must wait strictly inside the stretch.
+D = tc.parse_pace_curve("")  # the default 60:40
+check("default: used 30 @ elapsed 20 -> from 45 to the end", tc.pace_recovery(D, 30, 20) == (45.0, 100.0))
+check("default: used 40 @ elapsed 10 -> the knee", tc.pace_recovery(D, 40, 10) == (60.0, 100.0))
+check("default: used 70 @ elapsed 10 -> past the knee", tc.pace_recovery(D, 70, 10) == (80.0, 100.0))
+check("already under pace -> now", tc.pace_recovery(D, 30, 50) == (50.0, 100.0))
+check("elapsed clamps below 0", tc.pace_recovery(D, 30, -10) == (45.0, 100.0))
+check("used 0 is free from the instant the budget lifts", tc.pace_recovery(D, 0, 0) == (0.0, 100.0))
+check("elapsed past 100 clamps", tc.pace_recovery(D, 30, 150) == (100.0, 100.0))
+flat = tc.parse_pace_curve("0:50,100:50")
+check("flat curve never reaches -> None", tc.pace_recovery(flat, 60, 10) is None)
+check("flat curve, equality is not recovery -> None", tc.pace_recovery(flat, 50, 10) is None)
+falling = tc.parse_pace_curve("0:60,100:40")
+check("falling curve below usage -> None", tc.pace_recovery(falling, 70, 10) is None)
+check("falling curve still above usage -> until it drops through", tc.pace_recovery(falling, 50, 10) == (10.0, 50.0))
+check("a budget over 100 is simply always above usage", tc.pace_recovery(tc.parse_pace_curve("0:250"), 99, 5)[0] == 5.0)
+# A flat stretch exactly AT current usage must not read as recovery, but the rise after it must.
+plateau = tc.parse_pace_curve("0:0,50:30,60:30,100:100")
+check("flat stretch at usage -> the rise after it", tc.pace_recovery(plateau, 30, 55) == (60.0, 100.0))
+check("the identity line meets usage at usage", tc.pace_recovery(ident, 37, 10) == (37.0, 100.0))
+# Rise, fall, rise: a curve may hand budget back briefly and take it away again. Both stretches count,
+# and the one reported is the one we are about to live through.
+hump = tc.parse_pace_curve("0:0,20:60,40:0,60:0,100:100")
+check("the near stretch is reported", tc.pace_recovery(hump, 30, 5) == (10.0, 30.0))
+check("...and after it closes, the next one", tc.pace_recovery(hump, 30, 35) == (72.0, 100.0))
+
+
+# --- _pace_free_at / _next_eligible: the wake-up instant ---------------------------------------------
+# The whole point: a window blocked by the CURVE reports when the curve frees it, not when the provider
+# does. Waiting for the reset parks a worker that has quota in hand. NOW is fixed so the arithmetic is
+# exact rather than racing the clock.
+NOW = 1_700_000_000.0
+HOUR = 3600
+
+
+def win(status, used, elapsed, resets_in, name="session"):
+    return tc.Window(name, used, elapsed, NOW + resets_in, status, None)
+
+
+def free_at(w):
+    return tc._pace_free_at(w, NOW)
+
+
+os.environ.pop("TAUCETI_PACE", None)
+# 5h window, 20% elapsed (4h left), used 30% under the default: the budget reaches 30% at 45% elapsed,
+# i.e. 25% of a 5-hour window = 1h15m away, plus the ease.
+check(
+    "over-pace frees when the budget catches up", free_at(win("over-pace", 30, 20, 4 * HOUR)) == NOW + 1.25 * HOUR + 180
+)
+check("...well before the reset it used to wait for", free_at(win("over-pace", 30, 20, 4 * HOUR)) < NOW + 4 * HOUR)
+check(
+    "at-budget frees at the ease past the equality",
+    free_at(win("at-budget", 20, 30, 3.5 * HOUR)) == NOW + tc.PACE_EASE_S,
+)
+# The ease is bounded by the stretch it eases into, and the stretch ends with the window, so a wake can
+# never land past the reset — right at the end of a window it is the ease that shrinks.
+check("never later than the reset", free_at(win("over-pace", 99, 99.9, 5)) <= NOW + 5)
+check("...by shortening the ease, not by clamping", free_at(win("over-pace", 99, 99.9, 5)) == NOW + 2.5)
+check("a window with no clock cannot be solved", free_at(tc.Window("session", 30, 20, None, "over-pace")) is None)
+check("nor one already rolling over", free_at(win("over-pace", 30, 20, -1)) is None)
+
+# The ease must not step OVER a brief stretch of budget: half of a narrow one, the full ease of a wide
+# one. Here the budget is above 49.9% for a tenth of a percent of the window — about 18 seconds.
+os.environ["TAUCETI_PACE"] = "0:0,50:50,50.2:0,100:0"
+brief = free_at(win("over-pace", 49.9, 49.8, 2.5 * HOUR))
+start, end = tc.pace_recovery(tc.pace_curve(), 49.9, 49.8)
+per_pct = 2.5 * HOUR / (100 - 49.8)
+check("the wake lands inside a brief stretch", NOW + (start - 49.8) * per_pct < brief < NOW + (end - 49.8) * per_pct)
+check(
+    "...and the budget there is genuinely above the usage",
+    tc.pace_budget(tc.pace_curve(), 49.8 + (brief - NOW) / per_pct) > 49.9,
+)
+
+os.environ["TAUCETI_PACE"] = "0:50,100:50"
+check(
+    "a curve that never catches up falls back to the reset",
+    tc.Quota._next_eligible([win("over-pace", 60, 20, 4 * HOUR)]) == NOW + 4 * HOUR,
+)
+os.environ.pop("TAUCETI_PACE", None)
+
+
+# _next_eligible reads the same as _pace_free_at, over whichever windows are actually blocking. It calls
+# time.time() itself, so rebase the fixtures onto the live clock and compare in seconds from now.
+def eligible_in(windows):
+    now = time.time()
+    live = [
+        tc.Window(w.name, w.used, w.elapsed, None if w.resets_at is None else now + (w.resets_at - NOW), w.status)
+        for w in windows
+    ]
+    got = tc.Quota._next_eligible(live)
+    return None if got is None else got - now
+
+
+check(
+    "it reports the paced instant, not the reset",
+    abs(eligible_in([win("over-pace", 30, 20, 4 * HOUR)]) - (1.25 * HOUR + tc.PACE_EASE_S)) < 1,
+)
+check(
+    "an exhausted window still waits for its reset",
+    abs(eligible_in([win("exhausted", 100, 20, 4 * HOUR)]) - 4 * HOUR) < 1,
+)
+both = [win("over-pace", 30, 20, 4 * HOUR), win("at-budget", 20, 30, 3.5 * HOUR, "weekly")]
+check("with several blockers, the earliest one", abs(eligible_in(both) - tc.PACE_EASE_S) < 1)
+check(
+    "a window with no clock contributes nothing",
+    eligible_in([tc.Window("session", 30, 20, None, "over-pace")]) is None,
+)
+check("under-pace windows are not blocking at all", eligible_in([win("under-pace", 5, 50, HOUR)]) is None)
+check("no windows -> None", tc.Quota._next_eligible([]) is None)
 
 os.environ["TAUCETI_PACE"] = "0:100"
 check("NaN elapsed -> unknown", tc._classify_window("session", 50, float("nan"), None, False).status == "unknown")
