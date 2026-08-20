@@ -140,6 +140,29 @@ case(
     ("claude", True),
 )
 case("...but an exhausted provider is never mistaken for one", "hard-blocked" in resolve(None, dead)[0], True)
+# A refusing round exits rather than waiting, so it has to say when to come back — or, where waiting is
+# not what fixes it, what does. An expired credential is the case this round used to repair by accident,
+# launching without looking so the agent CLI renewed on its way up; now it hands that back explicitly.
+expired = prov(error="claude usage HTTP 401 (access token expired or rejected; log in again)")
+case("a rejected credential is not a wait", "retry in" in resolve(None, expired)[0], False)
+case("...it names the command that fixes it", "Run `claude`" in resolve(None, expired)[0], True)
+case("...and the unattended alternative", "--auto-refresh" in resolve(None, expired)[0], True)
+codex_expired = tc.Provider("codex", False, None, [], "codex token expired; refresh left to the operator")
+case(
+    "codex phrases its own 401 differently and is still recognized",
+    "Run `codex login`" in resolve(None, codex_expired, agent="codex")[0],
+    True,
+)
+case(
+    "...without offering --auto-refresh, which codex does not have",
+    "--auto-refresh" in resolve(None, codex_expired, agent="codex")[0],
+    False,
+)
+case(
+    "a timed block says when instead",
+    "retry in ~10m" in resolve(None, prov(error="HTTP 429", retry_after=580))[0],
+    True,
+)
 # The guards either side of the new read: `auto` cannot be paced by hand, and --quota-cmd replaces the
 # pacer outright, so neither reaches the verdict.
 refused, calls = resolve(None, under, agent="auto")

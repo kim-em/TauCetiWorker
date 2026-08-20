@@ -301,6 +301,27 @@ def choose_model(
     return Quota(cfg).choose(None if agent == "auto" else agent, refresh=refresh, renew=renew)
 
 
+def _credential_hint(agent: str, prov: Provider | None) -> str:
+    """What to do about a provider that refused the credential, or "" when that is not what happened.
+
+    A 401 is not a quota condition and waiting does not fix it: something has to renew the token. The
+    worker will not do that behind the operator's back — refresh tokens are single-use, so rotating one
+    can log out an interactive session sharing it — which leaves two doors, and this says so rather than
+    reporting a wait that would never end."""
+    error = (prov.error if prov else None) or ""
+    # Each provider phrases its own refusal: claude names the status code, codex says what it means. Match
+    # both, since neither wording contains the other.
+    if "401" not in error and "token expired" not in error:
+        return ""
+    if agent != "claude":
+        return ". Run `codex login` to renew the credential"
+    # --auto-refresh is Claude-only, and a no-op on macOS where the Keychain is the store.
+    return (
+        ". Run `claude` to renew the credential, or --auto-refresh to let an unattended worker rotate it"
+        " (see docs/quota.md)"
+    )
+
+
 def _retry_hint(prov: Provider | None) -> str:
     """When it is worth coming back, for a round that is about to exit rather than wait: the endpoint's
     own Retry-After if it gave one, else the moment the blocking window frees. Empty when the snapshot
@@ -364,10 +385,14 @@ def resolve_work_model(
             prov = snap.get(agent)
             why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
             # This round exits rather than sleeping — a loop parent is what waits — so say when to come
-            # back rather than implying the round will hold the line itself.
+            # back rather than implying the round will hold the line itself. An expired credential is
+            # the case an operator can fix in one command, and this used to be that command: the round
+            # skipped the read, launched, and the agent CLI renewed on its way up. It no longer does, so
+            # the message has to hand the recovery back.
+            fix = _credential_hint(agent, prov)
             raise NoProgress(
                 f"{agent} hard-blocked ({why}) — --ignore-quota overrides pacing, not availability; "
-                f"not launching this round{_retry_hint(prov)}"
+                f"not launching this round{fix or _retry_hint(prov)}"
             )
         if verdict == "over-pace":
             log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
