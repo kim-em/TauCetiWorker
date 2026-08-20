@@ -260,7 +260,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
 
 
 def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
-    """What a --ignore-quota loop does with the pacer snapshot for its pinned agent.
+    """What --ignore-quota does with the pacer snapshot for its pinned agent — applied both by the loop
+    between rounds and by the round deciding what it will launch.
 
     --ignore-quota overrides PACING, not AVAILABILITY:
       "run"       — the provider is available (under pace), launch as usual.
@@ -323,19 +324,35 @@ def resolve_work_model(
     about the moment it was taken (see Quota._claude_pass), so where nothing has just refreshed it — a
     one-shot `tauceti work` — this is the difference between deciding on current telemetry and refusing
     on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
-    re-fetching would only ask the same question twice."""
+    re-fetching would only ask the same question twice.
+
+    --ignore-quota still reads usage. It overrides the soft burn-pace throttle, not availability, so the
+    read is what tells a pinned agent apart from a dead one; only --quota-cmd replaces the pacer
+    outright."""
     if dry:
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
         return agent, False
-    if ignore_quota and not quota_cmd:
-        if agent == "auto":
-            raise SystemExit(
-                "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
-            )
-        return agent, False
+    if ignore_quota and not quota_cmd and agent == "auto":
+        raise SystemExit(
+            "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
+        )
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
     chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
+    if ignore_quota and not quota_cmd:
+        # --ignore-quota overrides PACING, not AVAILABILITY — the same rule the loop applies between
+        # rounds (see cmd_loop). Reading usage costs no quota, and firing a round at an exhausted or
+        # unreadable provider only buys a clone, an engine launch, and a scoreboard full of errors.
+        verdict = _ignore_quota_verdict(chosen, snap.get(agent))
+        if verdict == "wait" and agent == "claude" and claude_pending_init(snap):
+            return "claude", True  # the one hard block a bounded, pace-respecting request may clear
+        if verdict == "wait":
+            prov = snap.get(agent)
+            why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
+            raise NoProgress(f"{agent} hard-blocked ({why}) — --ignore-quota still waits out a hard block")
+        if verdict == "over-pace":
+            log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+        return agent, False
     if chosen is None and claude_pending_init(snap):
         return "claude", True
     if chosen is None:
