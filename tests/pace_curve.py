@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -97,6 +98,95 @@ check("empty env -> default curve", live("") == DEFAULT)
 check("malformed env -> default curve, not a raise", live("0:0,90:0,100:oops") == DEFAULT)
 check("valid env is honoured", live("50:70") == [(0.0, 0.0), (50.0, 70.0), (100.0, 100.0)])
 os.environ.pop("TAUCETI_PACE", None)
+
+
+# --- the CLI validates the spec that will be USED ----------------------------------------------------
+# $TAUCETI_PACE is linted for every subcommand. `work`/`_round` are the ones that REPLACE it, so a
+# --pace they were given is what gets validated: a stale `export` in the operator's shell must not veto
+# the flag documented to override it. Nothing else may claim that exemption.
+_dispatched = []
+
+
+def cli(argv, env):
+    """Run `tauceti <argv>` as far as the pacing validation, with the commands it can dispatch to stubbed
+    out so nothing after it runs. Returns None when it got through, or the message it died with."""
+    was = os.environ.get("TAUCETI_PACE")
+    if env is None:
+        os.environ.pop("TAUCETI_PACE", None)
+    else:
+        os.environ["TAUCETI_PACE"] = env
+    _dispatched.clear()
+    saved_work, saved_workers = tc.cli.cmd_work, tc.cli.cmd_workers
+    # `workers add` writes the operator's real workers.toml, so stub it too: a regression here must not
+    # reach the filesystem, it must show up as this check failing.
+    tc.cli.cmd_work = lambda args, **_k: _dispatched.append(("work", getattr(args, "pace", None))) or 0
+    tc.cli.cmd_workers = lambda args: _dispatched.append(("workers", getattr(args, "pace", None))) or 0
+    try:
+        tc.cli.main(argv)
+        return None
+    except tc.Die as e:
+        return str(e)
+    finally:
+        tc.cli.cmd_work, tc.cli.cmd_workers = saved_work, saved_workers
+        os.environ.pop("TAUCETI_PACE", None)
+        if was is not None:
+            os.environ["TAUCETI_PACE"] = was
+
+
+def resolved(cmd, pace, env):
+    """What resolve_pace leaves in the environment for the pacer to read live, or the message it died
+    with. Validation and installation are one step, so this covers both."""
+    was = os.environ.get("TAUCETI_PACE")
+    if env is None:
+        os.environ.pop("TAUCETI_PACE", None)
+    else:
+        os.environ["TAUCETI_PACE"] = env
+    try:
+        tc.cli.resolve_pace(cmd, SimpleNamespace(pace=pace))
+        return os.environ.get("TAUCETI_PACE")
+    except tc.Die as e:
+        return str(e)
+    finally:
+        os.environ.pop("TAUCETI_PACE", None)
+        if was is not None:
+            os.environ["TAUCETI_PACE"] = was
+
+
+# The flag is not merely validated, it REPLACES the environment — the pacer reads $TAUCETI_PACE live, so
+# a validated flag that never lands there would leave the run on the stale curve it was meant to override.
+check("the flag is installed for the pacer to read", resolved("work", "50:70", None) == "50:70")
+check("...over a malformed env", resolved("work", "50:70", "50:") == "50:70")
+check("...and over a valid one", resolved("work", "50:70", "0:0,100:100") == "50:70")
+check("no flag leaves the env alone", resolved("work", None, "0:0,100:100") == "0:0,100:100")
+check("a command that cannot override does not install", resolved("workers", "50:70", None) is None)
+
+check("a malformed env is rejected, naming itself", "$TAUCETI_PACE" in (cli(["work"], "50:") or ""))
+check("a malformed flag is rejected, naming itself", "--pace" in (cli(["work", "--pace", "50:"], None) or ""))
+check("a valid flag overrides a malformed env", cli(["work", "--pace", "0:0,100:100"], "50:") is None)
+check("...and reaches the command that installs it", _dispatched == [("work", "0:0,100:100")])
+check("a malformed flag is caught even under a valid env", "--pace" in (cli(["work", "--pace", "50:"], "50:70") or ""))
+check("a valid env alone is fine", cli(["work"], "50:70") is None)
+check("...as is neither", cli(["work"], None) is None)
+# The hidden per-round entry point is the same command by another name.
+check("_round overrides too", cli(["_round", "--pace", "0:0,100:100"], "50:") is None)
+# `workers add --pace` records a curve for a worker launched LATER; it leaves this process's environment
+# alone, so it cannot excuse a malformed one that a manager spawned here would inherit.
+check(
+    "workers add does not excuse the env it leaves in place",
+    "$TAUCETI_PACE" in (cli(["workers", "add", "--pace", "0:0,100:100"], "50:") or ""),
+)
+check("...and nothing was dispatched", _dispatched == [])
+# A subcommand with no --pace at all still gets the lint.
+check("a parser without --pace still checks the env", "$TAUCETI_PACE" in (cli(["usage"], "50:") or ""))
+
+# A worker's stored curve is validated where it is configured, so a typo is a config error rather than a
+# worker that starts, rejects its own --pace, and crash-loops.
+try:
+    tc.WorkerSpec.from_dict({"id": "w1", "pace": "not-a-curve"}, 0)
+    check("a malformed pace in workers.toml is a config error", False)
+except tc.WorkersError as e:
+    check("a malformed pace in workers.toml is a config error", "workers[0].pace" in str(e))
+check("...and a valid one is kept", tc.WorkerSpec.from_dict({"id": "w1", "pace": "50:70"}, 0).pace == "50:70")
 
 
 # --- _classify_window honours the live curve --------------------------------------------------------
