@@ -109,7 +109,7 @@ CLAUDE_BOOTSTRAP_DROP_ENV = frozenset(
 # window, then ramp to the full quota by the reset. It holds usage below the identity line at every
 # point, so a window that would otherwise burn out early keeps a reserve for the work that arrives late
 # in the window, while still permitting the whole quota before the window rolls.
-# The older default, the identity line used% <= elapsed%, is still one spec away: `--pace 0:0,100:100`.
+# The older default, the identity line used% < elapsed%, is still one spec away: `--pace 0:0,100:100`.
 _DEFAULT_PACE = [(0.0, 0.0), (60.0, 40.0), (100.0, 100.0)]
 
 _PACE_CACHE: dict[str, list[tuple[float, float]]] = {}
@@ -154,9 +154,14 @@ def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
 
 def pace_curve() -> list[tuple[float, float]]:
     """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
-    see it; parse cached per raw spec). A spec that somehow reaches here malformed — the CLI validates
-    --pace up front — falls back to the default curve rather than silently unlocking spend: the default
-    is below the identity line at every point, so failing onto it can only tighten pacing."""
+    see it; parse cached per raw spec).
+
+    A malformed spec cannot reach here through a sanctioned path: the CLI rejects $TAUCETI_PACE for every
+    subcommand and --pace in cmd_work, and a worker's `pace` from workers.toml arrives as --pace. This
+    fallback is the last-resort guard for a path that outlives or bypasses that validation, and it
+    substitutes the DEFAULT curve — stricter than the identity line the pacer used to fall back on, but
+    not provably stricter than whatever the operator was reaching for. That is the trade: pace on a known
+    curve rather than crash the pacer, and let validation stay the thing that catches typos."""
     raw = os.environ.get("TAUCETI_PACE", "") or ""
     if raw not in _PACE_CACHE:
         try:

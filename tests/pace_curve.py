@@ -51,7 +51,7 @@ for bad in ("abc", "50", "50:", ":70", "150:10", "-5:10", "50:-1", "50:70,50:80"
 # non-finite values slip through float() but must be rejected (they'd unlock all spend / make NaN budgets)
 for bad in ("50:inf", "50:nan", "50:1e999", "nan:50", "inf:50", "50:-inf"):
     check(f"rejects non-finite {bad!r}", rejects(bad))
-# a spec with real (comma) structure but no points is a typo, not a request for identity
+# a spec with real (comma) structure but no points is a typo, not a request for the default
 for bad in (",", ",,", ", ,"):
     check(f"rejects empty-but-nonblank {bad!r}", rejects(bad))
 # but a genuinely blank/whitespace spec is 'unset' = the default, and stray commas around real points are fine
@@ -69,14 +69,32 @@ check("budget clamps above 100", tc.pace_budget(c, 200) == 100.0)
 ident = tc.parse_pace_curve("0:0,100:100")
 check("identity budget == elapsed", tc.pace_budget(ident, 37) == 37.0)
 
-# The default curve: two thirds of clock rate to the 60% mark, then a ramp to the full quota. It must
-# sit strictly below the identity line everywhere in between, so it can only ever tighten pacing.
+# The default curve: two thirds of clock rate to the 60% mark, then a ramp to the full quota. It sits
+# strictly below the identity line everywhere in between, so switching to it can only tighten pacing.
 d = tc.parse_pace_curve("")
 check("default at the knee", tc.pace_budget(d, 60) == 40.0)
 check("default before the knee", tc.pace_budget(d, 30) == 20.0)
 check("default after the knee", tc.pace_budget(d, 80) == 70.0)  # 40 + (20/40)*(100-40)
 check("default reaches the full quota", tc.pace_budget(d, 100) == 100.0)
 check("default is below identity everywhere between", all(tc.pace_budget(d, e) < e for e in range(1, 100)))
+
+
+# --- pace_curve: what the LIVE env resolves to -------------------------------------------------------
+# The CLI rejects a malformed spec up front, so this is the guard for a path that got past it. It must
+# resolve to the default rather than raising inside the pacer or unlocking spend.
+def live(spec):
+    if spec is None:
+        os.environ.pop("TAUCETI_PACE", None)
+    else:
+        os.environ["TAUCETI_PACE"] = spec
+    return tc.pace_curve()
+
+
+check("unset env -> default curve", live(None) == DEFAULT)
+check("empty env -> default curve", live("") == DEFAULT)
+check("malformed env -> default curve, not a raise", live("0:0,90:0,100:oops") == DEFAULT)
+check("valid env is honoured", live("50:70") == [(0.0, 0.0), (50.0, 70.0), (100.0, 100.0)])
+os.environ.pop("TAUCETI_PACE", None)
 
 
 # --- _classify_window honours the live curve --------------------------------------------------------
