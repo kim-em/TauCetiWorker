@@ -39,11 +39,6 @@ WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
 
-# How far a cache entry's recorded fetch time may sit in the FUTURE and still be believed. A payload is
-# paced against the instant it was fetched, so a future timestamp would place it where the budget line is
-# higher; only ordinary clock jitter is tolerated, and anything beyond reads as a cache miss.
-_CLOCK_SKEW_S = 5
-
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
 # so its usage figure no longer paces the current one (see _claude_record_state).
@@ -1101,12 +1096,14 @@ class Quota:
         if d.get("fp") != fp:
             return None
         # The fetch time is what a cached payload is judged against (see _cached_claude), so it has to be
-        # a real past instant. An age beyond the TTL is stale; a NEGATIVE age — a corrupt entry, state
-        # copied from a host with a different clock, or a wall-clock correction — would place the reading
-        # in the future, where the budget line is higher, and hand back a verdict nothing supports. Both
-        # are cache misses: re-fetching is cheap and always correct.
-        age = time.time() - d.get("fetched_at", 0)
-        if not _finite_num(age) or not -_CLOCK_SKEW_S <= age <= QUOTA_TTL[provider]:
+        # a real past instant — CHECKED BEFORE it is used in arithmetic, since a corrupt entry can hold a
+        # string or a list where a number belongs and subtracting that raises inside the pacer. An age
+        # beyond the TTL is stale; a negative one places the reading in the future, where the budget line
+        # is higher, and would hand back a verdict nothing supports. Every one of those is a cache miss:
+        # re-fetching is cheap and always correct, and this is the guarantee that time alone never buys
+        # permission, so it holds with no margin.
+        at = d.get("fetched_at")
+        if not _finite_num(at) or not 0 <= time.time() - at <= QUOTA_TTL[provider]:
             return None
         # A payload may also carry its own expiry: the point at which it stops describing the windows
         # it was fetched for (the earliest reset clock in it). The TTL is a staleness bound, NOT a
@@ -1785,8 +1782,11 @@ class Quota:
         )
 
     def _claude_from_payload(self, payload: dict) -> Provider:
-        """Provider straight from a payload, with no cache, reservation or bootstrap — the pure parse."""
-        return self._claude_provider(_claude_readings(payload))
+        """Provider straight from a payload, with no cache, reservation or bootstrap — the pure parse.
+        One instant for the parse and the pacing, as everywhere else: two readings of the clock would let
+        the windows and the schedule disagree about when 'now' was."""
+        now = time.time()
+        return self._claude_provider(_claude_readings(payload, now), now=now)
 
     def _reannotate(self, prov: Provider, windows: list[str], note: str) -> Provider:
         """Re-render `prov` with a different account of its idle windows (e.g. why a reservation was

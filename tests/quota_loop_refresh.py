@@ -6,6 +6,7 @@ change usage. Reusing the pre-round reading let loop mode launch round after rou
 Claude was exhausted. This pins the integration point without network access.
 """
 
+import json
 import shutil
 import sys
 import tempfile
@@ -137,19 +138,43 @@ try:
     honest = abs(from_fetch - (900 + tc.PACE_EASE_S)) < 5
 
     # An entry whose fetch time sits in the FUTURE would be paced where the budget line is higher, so it
-    # is not a cache entry at all. Same for one past the TTL.
+    # is not a cache entry at all — with no margin, since that is the whole guarantee. Same for one past
+    # the TTL, and for a timestamp that is not a number: the check has to happen BEFORE the arithmetic,
+    # or a corrupt entry raises inside the pacer instead of being re-fetched.
     cache._store_raw("claude", stale, "fp", time.time() + 7200, time.time() + 3600)
     future_refused = cache._cached_claude("fp") is None
+    cache._store_raw("claude", stale, "fp", time.time() + 7200, time.time() + 2)
+    barely_future_refused = cache._cached_claude("fp") is None
     cache._store_raw("claude", stale, "fp", time.time() + 7200, time.time() - 7200)
     expired_refused = cache._cached_claude("fp") is None
+    corrupt_refused = True
+    entry_file = cache.cache_dir / "quota-claude.json"
+    for junk in ("yesterday", [1], {"at": 1}, True, "MISSING"):
+        entry = {"fp": "fp", "payload": stale, "valid_until": time.time() + 7200}
+        if junk != "MISSING":
+            entry["fetched_at"] = junk
+        entry_file.write_text(json.dumps(entry))
+        try:
+            corrupt_refused = corrupt_refused and cache._cached_claude("fp") is None
+        except TypeError:
+            corrupt_refused = False
 finally:
     shutil.rmtree(cache.cache_dir, ignore_errors=True)
 
-cache_ok = round_trip and stable and honest and future_refused and expired_refused
+cache_ok = (
+    round_trip
+    and stable
+    and honest
+    and future_refused
+    and barely_future_refused
+    and expired_refused
+    and corrupt_refused
+)
 print(
     f"[{'OK ' if cache_ok else 'XX '}] the cache carries the fetch instant, and refuses what it cannot "
     f"trust: round_trip={round_trip!r} next_eligible_stable={stable!r} wake_from_fetch={from_fetch:.0f}s "
-    f"future_refused={future_refused!r} expired_refused={expired_refused!r}"
+    f"future_refused={future_refused and barely_future_refused!r} expired_refused={expired_refused!r} "
+    f"corrupt_refused={corrupt_refused!r}"
 )
 
 # Pin the actual driver integration too: both paced and --ignore-quota loops must
