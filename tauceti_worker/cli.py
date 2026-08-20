@@ -483,11 +483,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.cmd
 
-    # A malformed $TAUCETI_PACE must fail loudly, not silently degrade to the default curve (which is
-    # not what the operator asked for). Validate the effective env for every subcommand up front; --pace
-    # itself is validated (and sets this env) in cmd_work.
+    # A malformed pacing curve must fail loudly, not silently degrade to the default (which is not what
+    # the operator asked for). Validate the EFFECTIVE spec for every subcommand up front: --pace, where
+    # it was given, and $TAUCETI_PACE otherwise. Validating the env unconditionally would let a stale
+    # export in the shell veto the flag documented to override it. cmd_work re-validates the flag it
+    # applies, so a subcommand reaching this without one still gets checked.
     pace_env = os.environ.get("TAUCETI_PACE")
-    if pace_env is not None:
+    pace_arg = getattr(args, "pace", None)
+    if pace_arg is not None:
+        try:
+            parse_pace_curve(pace_arg)
+        except ValueError as e:
+            raise Die(f"--pace: {e}") from None
+    elif pace_env is not None:
         try:
             parse_pace_curve(pace_env)
         except ValueError as e:

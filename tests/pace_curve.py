@@ -99,6 +99,36 @@ check("valid env is honoured", live("50:70") == [(0.0, 0.0), (50.0, 70.0), (100.
 os.environ.pop("TAUCETI_PACE", None)
 
 
+# --- the CLI validates the EFFECTIVE spec ------------------------------------------------------------
+# Whichever spec would actually be used must fail loudly if it is malformed — and only that one. A stale
+# `export TAUCETI_PACE` in the operator's shell cannot veto the flag documented to override it.
+def cli(argv, env):
+    """Run `tauceti <argv>` as far as the pacing validation, with cmd_work stubbed out so nothing after
+    it runs. Returns None when it got through, or the message it died with."""
+    if env is None:
+        os.environ.pop("TAUCETI_PACE", None)
+    else:
+        os.environ["TAUCETI_PACE"] = env
+    saved = tc.cli.cmd_work
+    tc.cli.cmd_work = lambda *_a, **_k: 0
+    try:
+        tc.cli.main(argv)
+        return None
+    except tc.Die as e:
+        return str(e)
+    finally:
+        tc.cli.cmd_work = saved
+        os.environ.pop("TAUCETI_PACE", None)
+
+
+check("a malformed env is rejected, naming itself", "$TAUCETI_PACE" in (cli(["work"], "50:") or ""))
+check("a malformed flag is rejected, naming itself", "--pace" in (cli(["work", "--pace", "50:"], None) or ""))
+check("a valid flag overrides a malformed env", cli(["work", "--pace", "0:0,100:100"], "50:") is None)
+check("a malformed flag is caught even under a valid env", "--pace" in (cli(["work", "--pace", "50:"], "50:70") or ""))
+check("a valid env alone is fine", cli(["work"], "50:70") is None)
+check("...as is neither", cli(["work"], None) is None)
+
+
 # --- _classify_window honours the live curve --------------------------------------------------------
 def status(used, elapsed, pace):
     if pace is None:
