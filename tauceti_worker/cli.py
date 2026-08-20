@@ -787,8 +787,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
             time.sleep(int(slp))
             return 0
 
+        # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
+        # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
+        # rather than refuse the round on a cached verdict that may be an hour old.
         work_model, pending_init = resolve_work_model(
-            cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd
+            cfg, agent, dry=dry, ignore_quota=ignore_quota, quota_cmd=quota_cmd, fresh=not one_round
         )
         authoring_profile = None
         if work_model != "auto":
