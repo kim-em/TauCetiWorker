@@ -1379,8 +1379,8 @@ def run_in_bubble(
         )
 
     # Re-mirror the operator's fresh creds into the isolated home at the last moment before bubble seeds
-    # the container (provider-neutral: covers codex too, and the --ignore-quota / review / probe paths that
-    # never call the pacer). No-op when not isolated or on macOS.
+    # the container (provider-neutral: covers codex too, and the unpaced review / probe paths that never
+    # call the pacer). No-op when not isolated or on macOS.
     mirror_creds(cfg)
     # That re-mirror is the LAST thing to touch the credential before bubble seeds the container, so it
     # can hand the container an account rotated in since the round's earlier --account checks. Re-check

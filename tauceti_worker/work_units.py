@@ -196,12 +196,13 @@ def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
-    # before any work runs. The quota pacer does this too, but the --ignore-quota + pinned --agent
-    # fast path in resolve_work_model skips the pacer, and host-mode review never hits the bubble-seed
-    # mirror — so without this an operator token refresh (or account switch) never reaches a host
-    # worker, and its mirror ages out into 401s that silently burn review rounds. No-op when not
-    # isolated / on macOS, and a handful of small local reads + compares in steady state, so it is
-    # safe to run every round. Skipped under --dry-run, which must not mutate the credential mirror.
+    # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
+    # unpaced ones (kiro, the OpenRouter providers, --dry-run's early return) do not, and host-mode
+    # review never hits the bubble-seed mirror. Without this an operator token refresh (or account
+    # switch) never reaches a host worker, and its mirror ages out into 401s that silently burn review
+    # rounds. No-op when not isolated / on macOS, and a handful of small local reads + compares in
+    # steady state, so it is safe to run every round. Skipped under --dry-run, which must not mutate the
+    # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)

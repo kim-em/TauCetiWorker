@@ -11,7 +11,7 @@ from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
-from .quota import Provider, Quota, _glyph, _unavail_reason, quota_line
+from .quota import Provider, Quota, _glyph, _hours, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
@@ -301,6 +301,20 @@ def choose_model(
     return Quota(cfg).choose(None if agent == "auto" else agent, refresh=refresh, renew=renew)
 
 
+def _retry_hint(prov: Provider | None) -> str:
+    """When it is worth coming back, for a round that is about to exit rather than wait: the endpoint's
+    own Retry-After if it gave one, else the moment the blocking window frees. Empty when the snapshot
+    says nothing about timing — better silent than invented."""
+    after = prov.retry_after if prov else None
+    if not after and prov and prov.next_eligible:
+        after = prov.next_eligible - time.time()
+    if not after or after <= 0:
+        return ""
+    if after < 60:
+        return f"; retry in ~{round(after)}s"
+    return f"; retry in ~{round(after / 60)}m" if after < 90 * 60 else f"; retry in ~{_hours(after)}"
+
+
 def claude_pending_init(snap: dict) -> bool:
     """True when Claude is unavailable ONLY because a window has reset and nothing has opened the next
     cycle yet, and initializing it is within the operator's pace curve (Quota decides both, purely).
@@ -349,7 +363,12 @@ def resolve_work_model(
         if verdict == "wait":
             prov = snap.get(agent)
             why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
-            raise NoProgress(f"{agent} hard-blocked ({why}) — --ignore-quota still waits out a hard block")
+            # This round exits rather than sleeping — a loop parent is what waits — so say when to come
+            # back rather than implying the round will hold the line itself.
+            raise NoProgress(
+                f"{agent} hard-blocked ({why}) — --ignore-quota overrides pacing, not availability; "
+                f"not launching this round{_retry_hint(prov)}"
+            )
         if verdict == "over-pace":
             log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
         return agent, False
