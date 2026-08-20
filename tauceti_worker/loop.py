@@ -312,12 +312,18 @@ def claude_pending_init(snap: dict) -> bool:
 
 
 def resolve_work_model(
-    cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None
+    cfg: Config, agent: str, *, dry: bool, ignore_quota: bool, quota_cmd: str | None = None, fresh: bool = False
 ) -> tuple[str, bool]:
     """Turn the --agent dial into (concrete model, needs-launch-stage-bootstrap). 'auto' consults the
     pacer (or --quota-cmd); codex preferred, opus fallback. Kiro and OpenRouter agents are explicit
     and unpaced. Dry-run symbolic. The bootstrap flag never launches anything by itself — it says the round
-    must ask for launch authorization once it has a work unit in hand."""
+    must ask for launch authorization once it has a work unit in hand.
+
+    `fresh` forces the usage read rather than accepting a cached one. A cached reading is only evidence
+    about the moment it was taken (see Quota._claude_pass), so where nothing has just refreshed it — a
+    one-shot `tauceti work` — this is the difference between deciding on current telemetry and refusing
+    on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
+    re-fetching would only ask the same question twice."""
     if dry:
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
@@ -329,7 +335,7 @@ def resolve_work_model(
             )
         return agent, False
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
-    chosen, snap = choose_model(cfg, agent, quota_cmd, renew=True)
+    chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
     if chosen is None and claude_pending_init(snap):
         return "claude", True
     if chosen is None:

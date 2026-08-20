@@ -6,7 +6,9 @@ change usage. Reusing the pre-round reading let loop mode launch round after rou
 Claude was exhausted. This pins the integration point without network access.
 """
 
+import shutil
 import sys
+import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,12 +36,15 @@ try:
     tc.loop.choose_model(object(), "claude", None, refresh=True, renew=True)
     tc.loop.choose_model(object(), "auto", None)
     # resolve_work_model runs in the round that will launch the model it picks, so it renews an
-    # expiring access token; a bare choose_model (status, dashboard) must not.
+    # expiring access token; a bare choose_model (status, dashboard) must not. A `_round` child accepts
+    # the cached read its loop driver just forced; a one-shot `work` (fresh) has nothing behind it and
+    # must look for itself, or it would decide on a verdict as old as the TTL.
     tc.loop.resolve_work_model(object(), "claude", dry=False, ignore_quota=False)
+    tc.loop.resolve_work_model(object(), "claude", dry=False, ignore_quota=False, fresh=True)
 finally:
     tc.loop.Quota = saved
 
-want = [("claude", True, True), (None, False, False), ("claude", False, True)]
+want = [("claude", True, True), (None, False, False), ("claude", False, True), ("claude", True, True)]
 ok = calls == want
 print(f"[{'OK ' if ok else 'XX '}] loop refresh/renew vs ordinary cached read: got={calls!r} want={want!r}")
 
@@ -108,6 +113,44 @@ print(
     f"(fresh at that elapsed would be {if_reinterpreted!r})"
 )
 q._cached_claude = lambda _fp: (payload, time.time())
+
+# The same thing through the REAL cache: store an entry, read it back, and check what the file's own
+# recorded fetch time does to the verdict. The stubs above pin the pacing rule; this pins the plumbing
+# that has to carry the instant — and the entries that must not be believed at all.
+cache = tc.Quota.__new__(tc.Quota)
+cache.cache_dir = Path(tempfile.mkdtemp(prefix="tauceti-quota-cache-"))
+cache._idle_notes = lambda _readings: ({}, False)
+try:
+    cache._store_raw("claude", stale, "fp", time.time() + 7200, fetched_at)
+    served = cache._cached_claude("fp")
+    round_trip = served is not None and served[0] == stale and abs(served[1] - fetched_at) < 0.001
+    prov, _ = cache._claude_pass("fp", "token")
+    # next_eligible must be computed from the same instant as the windows, so re-reading one entry
+    # answers the same thing every time rather than sliding forward with the wall clock.
+    first = prov.next_eligible
+    again, _ = cache._claude_pass("fp", "token")
+    stable = first is not None and again.next_eligible == first
+    # ...and the wake-up it names is the one the snapshot supports: under the default curve the budget
+    # reaches 30% used at 45% elapsed, which for a 5h window is 15 minutes past the 40% the reading was
+    # taken at — measured from the FETCH time, not from now.
+    from_fetch = first - fetched_at
+    honest = abs(from_fetch - (900 + tc.PACE_EASE_S)) < 5
+
+    # An entry whose fetch time sits in the FUTURE would be paced where the budget line is higher, so it
+    # is not a cache entry at all. Same for one past the TTL.
+    cache._store_raw("claude", stale, "fp", time.time() + 7200, time.time() + 3600)
+    future_refused = cache._cached_claude("fp") is None
+    cache._store_raw("claude", stale, "fp", time.time() + 7200, time.time() - 7200)
+    expired_refused = cache._cached_claude("fp") is None
+finally:
+    shutil.rmtree(cache.cache_dir, ignore_errors=True)
+
+cache_ok = round_trip and stable and honest and future_refused and expired_refused
+print(
+    f"[{'OK ' if cache_ok else 'XX '}] the cache carries the fetch instant, and refuses what it cannot "
+    f"trust: round_trip={round_trip!r} next_eligible_stable={stable!r} wake_from_fetch={from_fetch:.0f}s "
+    f"future_refused={future_refused!r} expired_refused={expired_refused!r}"
+)
 
 # Pin the actual driver integration too: both paced and --ignore-quota loops must
 # make a fresh availability check before the child is authorized to launch.
@@ -186,4 +229,4 @@ status_ok = (
 )
 print(f"[{'OK ' if status_ok else 'XX '}] backoff preserves the child diagnostic: {backoff['detail']!r}")
 
-sys.exit(0 if ok and semantic_ok and frozen_ok and driver_ok and status_ok else 1)
+sys.exit(0 if ok and semantic_ok and frozen_ok and cache_ok and driver_ok and status_ok else 1)

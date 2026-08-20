@@ -39,6 +39,11 @@ WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
 
+# How far a cache entry's recorded fetch time may sit in the FUTURE and still be believed. A payload is
+# paced against the instant it was fetched, so a future timestamp would place it where the budget line is
+# higher; only ordinary clock jitter is tolerated, and anything beyond reads as a cache miss.
+_CLOCK_SKEW_S = 5
+
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
 # so its usage figure no longer paces the current one (see _claude_record_state).
@@ -1095,7 +1100,13 @@ class Quota:
         # for the wrong account and must be re-fetched immediately, not served until the TTL lapses.
         if d.get("fp") != fp:
             return None
-        if time.time() - d.get("fetched_at", 0) > QUOTA_TTL[provider]:
+        # The fetch time is what a cached payload is judged against (see _cached_claude), so it has to be
+        # a real past instant. An age beyond the TTL is stale; a NEGATIVE age — a corrupt entry, state
+        # copied from a host with a different clock, or a wall-clock correction — would place the reading
+        # in the future, where the budget line is higher, and hand back a verdict nothing supports. Both
+        # are cache misses: re-fetching is cheap and always correct.
+        age = time.time() - d.get("fetched_at", 0)
+        if not _finite_num(age) or not -_CLOCK_SKEW_S <= age <= QUOTA_TTL[provider]:
             return None
         # A payload may also carry its own expiry: the point at which it stops describing the windows
         # it was fetched for (the earliest reset clock in it). The TTL is a staleness bound, NOT a
@@ -1110,9 +1121,18 @@ class Quota:
         entry = self._cached_entry(provider, fp)
         return None if entry is None else entry.get("payload")
 
-    def _store_raw(self, provider: str, payload: dict, fp: str | None, valid_until: float | None = None) -> None:
+    def _store_raw(
+        self,
+        provider: str,
+        payload: dict,
+        fp: str | None,
+        valid_until: float | None = None,
+        fetched_at: float | None = None,
+    ) -> None:
+        # `fetched_at` is the instant the caller OBSERVED this payload, kept whole (not truncated to the
+        # second) so that re-reading the entry reproduces the verdict the caller already acted on.
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        entry = {"fetched_at": int(time.time()), "fp": fp, "payload": payload}
+        entry = {"fetched_at": time.time() if fetched_at is None else fetched_at, "fp": fp, "payload": payload}
         if valid_until is not None:
             entry["valid_until"] = valid_until
         (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
@@ -1647,6 +1667,7 @@ class Quota:
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
         try:
             code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
+            observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
         except GitHubError as e:
             if cached is not None:
                 return self._from_cached_claude(cached)
@@ -1672,20 +1693,26 @@ class Quota:
         problem = _claude_payload_problem(payload)
         if problem:
             return Provider("claude", False, None, error=problem, retry_after=retry_after), None
-        readings = _claude_readings(payload)
+        readings = _claude_readings(payload, observed_at)
         # Cache ONLY a payload that is fully resolved, and only until the first reset it describes.
         # An idle/absent/malformed payload is never pinned: re-reading it is the only thing that can
         # resolve it, and one extra fetch per poll is the cheapest part of this system.
         valid_until = _claude_valid_until(readings)
         if valid_until is not None:
-            self._store_raw("claude", payload, fp, valid_until)
+            self._store_raw("claude", payload, fp, valid_until, observed_at)
         notes, bootstrap_recorded = self._idle_notes(readings)
-        return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded), readings
+        return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded, now=observed_at), readings
 
     def _from_cached_claude(self, cached: tuple[dict, float]) -> tuple[Provider, list[Reading]]:
         """A cached payload turned into a Provider AS OF ITS FETCH TIME. Both the readings and the pacing
         are taken at that instant, so serving this entry again later can only repeat the verdict it
-        already supported — never improve on it because the budget line has moved on."""
+        already supported — never improve on it because the budget line has moved on.
+
+        What this does NOT do is re-examine a verdict that was already permissive: an entry that was under
+        pace when fetched still reads that way, even though its usage figure is only a lower bound and a
+        sibling worker may have spent since. That is the deliberate availability trade behind the cache —
+        an endpoint blip should not stop a fleet — and it is bounded by the TTL and by the loop forcing a
+        read every cycle. The rule here is narrower and absolute: time alone never buys permission."""
         payload, at = cached
         readings = _claude_readings(payload, at)
         notes, bootstrap_recorded = self._idle_notes(readings)
@@ -1751,7 +1778,7 @@ class Quota:
             "opus" if avail else None,
             wins,
             err,
-            self._next_eligible(wins),
+            self._next_eligible(wins, now),
             None,
             eligible,
             idle if eligible else [],
@@ -1991,13 +2018,17 @@ class Quota:
         return True, "ok"
 
     @staticmethod
-    def _next_eligible(windows: list[Window]) -> float | None:
+    def _next_eligible(windows: list[Window], now: float | None = None) -> float | None:
         # Earliest moment a wait actually fixes something, over the windows currently blocking on TIME.
         # An exhausted window needs its reset. A window held by the PACE line does not: its usage is
         # fixed while we wait and the budget climbs, so it frees itself partway through the window (see
         # _pace_free_at). Waiting for the reset there parks a worker with quota in hand.
+        #
+        # `now` must be the instant the windows were OBSERVED, not the present, or the elapsed% and the
+        # seconds-to-reset it is paired with describe different moments and the answer is neither
+        # correct nor stable: re-reading one cached snapshot would move the wake-up every time.
         soon: list[float | None] = []
-        now = time.time()
+        now = time.time() if now is None else now
         for w in windows:
             if w.status in (STATUS_AT_BUDGET, STATUS_OVER_PACE):
                 paced = _pace_free_at(w, now)
