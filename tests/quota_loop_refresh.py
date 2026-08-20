@@ -7,6 +7,7 @@ Claude was exhausted. This pins the integration point without network access.
 """
 
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,7 +52,7 @@ payload = {
     "seven_day": {"utilization": 1, "resets_at": reset_weekly},
 }
 q = tc.Quota.__new__(tc.Quota)
-q._cached_claude = lambda _fp: payload
+q._cached_claude = lambda _fp: (payload, time.time())
 q._idle_notes = lambda _readings: ({}, False)
 stores = []
 q._store_raw = lambda *args: stores.append(args)
@@ -77,6 +78,36 @@ print(
     f"[{'OK ' if semantic_ok else 'XX '}] forced refresh fetches + stores, transient failure uses valid cache: "
     f"fetches={http_calls!r} stores={len(stores)} fallback={cached_fallback!r}"
 )
+
+# ...but a cached payload is only evidence about the MOMENT it was fetched. Usage never falls inside a
+# window, so a stale figure is a lower bound; pacing it against a budget that has climbed since would let
+# a reading that was over pace when taken authorize a launch on nothing but the passage of time. This
+# entry was over pace when fetched (30% used at 40% elapsed, budget 26.7%) and would read as under pace
+# now (60% elapsed, budget 40%) if the clock were allowed to reinterpret it.
+stale = {
+    "five_hour": {"utilization": 30, "resets_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat()},
+    "seven_day": {"utilization": 1, "resets_at": reset_weekly},
+}
+fetched_at = time.time() - 3599  # as old as the TTL allows
+q._cached_claude = lambda _fp: (stale, fetched_at)
+at_fetch = tc._classify_window("session", 30, 40, None, False).status
+if_reinterpreted = tc._classify_window("session", 30, 60, None, False).status
+frozen, _ = q._claude_pass("fp", "token")  # the ordinary cached read: one-shot `work`, status, dashboard
+tc.quota._http_get_json = offline
+stale_fallback, _ = q._claude_pass("fp", "token", refresh=True)  # ...and the failed forced refresh
+tc.quota._http_get_json = saved_http
+frozen_ok = (
+    (at_fetch, if_reinterpreted) == ("over-pace", "under-pace")
+    and [w.status for w in frozen.windows] == ["over-pace", "under-pace"]
+    and not frozen.available
+    and not stale_fallback.available
+)
+print(
+    f"[{'OK ' if frozen_ok else 'XX '}] a stale cached reading cannot go available on the clock alone: "
+    f"cached={[w.status for w in frozen.windows]!r} fallback_available={stale_fallback.available!r} "
+    f"(fresh at that elapsed would be {if_reinterpreted!r})"
+)
+q._cached_claude = lambda _fp: (payload, time.time())
 
 # Pin the actual driver integration too: both paced and --ignore-quota loops must
 # make a fresh availability check before the child is authorized to launch.
@@ -155,4 +186,4 @@ status_ok = (
 )
 print(f"[{'OK ' if status_ok else 'XX '}] backoff preserves the child diagnostic: {backoff['detail']!r}")
 
-sys.exit(0 if ok and semantic_ok and driver_ok and status_ok else 1)
+sys.exit(0 if ok and semantic_ok and frozen_ok and driver_ok and status_ok else 1)
