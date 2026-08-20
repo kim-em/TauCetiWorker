@@ -635,6 +635,29 @@ def _claude_valid_until(readings: list[Reading]) -> float | None:
     return min(r.resets_at for r in readings)
 
 
+def _codex_valid_until(payload: dict, observed_at: float) -> float | None:
+    """The same rule for codex, read off the raw payload: the earliest reset among the windows it
+    reports, or None when any present window does not say when it rolls.
+
+    Codex states a window as `reset_after_seconds` REMAINING rather than an absolute clock, which is
+    exactly why the entry needs an expiry: nothing in the payload itself goes stale, so without this a
+    cached response would keep describing a live window long after that window had rolled, pacing the new
+    one against the old one's usage."""
+    rl = payload.get("rate_limit")
+    if not isinstance(rl, dict):
+        return None
+    resets = []
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if w is None:  # not applicable to this account — see _codex_from_payload
+            continue
+        ra = w.get("reset_after_seconds") if isinstance(w, dict) else None
+        if not _finite_num(ra):
+            return None  # a window we cannot place in time; do not pin the payload at all
+        resets.append(observed_at + max(0, ra))
+    return min(resets) if resets else None
+
+
 def _idle_phrase(r: Reading) -> str:
     """The default account of an idle window: it reset, and nothing has opened the next cycle yet —
     plus, when the operator's pace curve is what forbids initializing it, that reason instead of the
@@ -1421,34 +1444,58 @@ class Quota:
         # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
         # token itself when no id is available.
         fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
-        cached = self._cached_raw("codex", fp)
-        payload = None if refresh else cached
-        if payload is None:
-            tok = (auth.get("tokens") or {}).get("access_token")
-            if not tok:
-                return Provider("codex", False, None, error="no codex access_token")
-            headers = {"Authorization": f"Bearer {tok}", "User-Agent": "codex-cli"}
-            acct = self._codex_account_id(auth)
-            if acct:
-                headers["ChatGPT-Account-Id"] = acct
-            try:
-                code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
-            except GitHubError as e:
-                if refresh and cached is not None:
-                    return self._codex_from_payload(cached)
-                return Provider("codex", False, None, error=str(e))
-            # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
-            # access token simply reads as unavailable until the operator's external refresher rotates it
-            # and mirror_creds picks it up next cycle.
-            if code != 200 or not payload:
-                if refresh and cached is not None and code != 401:
-                    return self._codex_from_payload(cached)
-                err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
-                return Provider("codex", False, None, error=err, retry_after=retry_after)
-            self._store_raw("codex", payload, fp)
-        return self._codex_from_payload(payload)
+        cached = self._cached_codex(fp)
+        if cached is not None and not refresh:
+            return self._codex_from_payload(*cached)
+        tok = (auth.get("tokens") or {}).get("access_token")
+        if not tok:
+            return Provider("codex", False, None, error="no codex access_token")
+        headers = {"Authorization": f"Bearer {tok}", "User-Agent": "codex-cli"}
+        acct = self._codex_account_id(auth)
+        if acct:
+            headers["ChatGPT-Account-Id"] = acct
+        try:
+            code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
+            observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
+        except GitHubError as e:
+            if cached is not None:
+                return self._codex_from_payload(*cached)
+            return Provider("codex", False, None, error=str(e))
+        # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
+        # access token simply reads as unavailable until the operator's external refresher rotates it
+        # and mirror_creds picks it up next cycle.
+        if code != 200 or not payload:
+            if cached is not None and code != 401:
+                return self._codex_from_payload(*cached)
+            err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
+            return Provider("codex", False, None, error=err, retry_after=retry_after)
+        # Cache ONLY a payload whose windows say when they roll, and only until the first of those. The
+        # endpoint reports time REMAINING, so re-reading an entry later would otherwise re-anchor every
+        # window to the new present: the reset slides away, and past its real reset the entry describes a
+        # window that has already rolled. An unresolvable payload is not pinned at all — re-reading it is
+        # the only thing that can resolve it.
+        valid_until = _codex_valid_until(payload, observed_at)
+        if valid_until is not None:
+            self._store_raw("codex", payload, fp, valid_until, observed_at)
+        return self._codex_from_payload(payload, observed_at)
 
-    def _codex_from_payload(self, payload: dict) -> Provider:
+    def _cached_codex(self, fp: str | None) -> tuple[dict, float] | None:
+        """A cached codex payload WITH the instant it describes, or None when it must not be served. As
+        for Claude (see _cached_claude), the fetch time is what the payload is judged against: codex
+        reports every clock as seconds REMAINING, so reading those numbers at a later instant silently
+        restates them about the present."""
+        entry = self._cached_entry("codex", fp)
+        payload = None if entry is None else entry.get("payload")
+        at = None if entry is None else entry.get("fetched_at")
+        if not isinstance(payload, dict) or not _finite_num(at):
+            return None
+        return payload, float(at)
+
+    def _codex_from_payload(self, payload: dict, now: float | None = None) -> Provider:
+        """`now` is the instant the payload describes — its fetch time for a cached one, not the present.
+        Every clock here is a REMAINING duration, so anchoring it to a later instant would quietly move
+        the window's reset out to meet it."""
+        now = time.time() if now is None else now
         rl = payload.get("rate_limit") or {}
         limit_reached = bool(rl.get("limit_reached"))
         wins = []
@@ -1473,7 +1520,7 @@ class Quota:
             resets = None
             if isinstance(lim, (int, float)) and lim > 0 and isinstance(ra, (int, float)):
                 elapsed = (lim - ra) / lim * 100
-                resets = time.time() + max(0, ra)
+                resets = now + max(0, ra)
             # Name by the window's own length, not its position: the endpoint has reordered which slot
             # carries the ~5h vs the ~7d window, and a positional label would call a weekly window 'session'.
             name = "session" if isinstance(lim, (int, float)) and lim <= 24 * 3600 else "weekly"
@@ -1481,7 +1528,7 @@ class Quota:
         # No usable window at all ⇒ fail-closed (unavailable), never fail-OPEN on an empty all(...) that
         # is vacuously True.
         avail = bool(wins) and all(x.status == "under-pace" for x in wins) and not limit_reached
-        nxt = self._next_eligible(wins)
+        nxt = self._next_eligible(wins, now)
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 
     # --- Claude ------------------------------------------------------------
