@@ -121,5 +121,50 @@ check(
 )
 os.environ.pop("TAUCETI_PACE", None)
 
+# --- a cached payload describes the moment it was fetched, not the present --------------------------
+# Codex states every clock as seconds REMAINING, so a payload re-read later would restate itself about
+# the new present: the reset slides away from us, and past its real reset the entry describes a window
+# that has already rolled. Both are settled by pinning the payload to its fetch instant and giving the
+# entry an expiry.
+NOW = 1_700_000_000.0
+live = {"rate_limit": {"limit_reached": False, "primary_window": win(50, HOUR5, 3600), "secondary_window": None}}
+p = q._codex_from_payload(live, NOW)
+check("a window's reset is anchored to the observation", [round(w.resets_at - NOW) for w in p.windows], [3600])
+check(
+    "...and re-reading it does not move that",
+    [round(w.resets_at - NOW) for w in q._codex_from_payload(live, NOW).windows],
+    [3600],
+)
+check(
+    "an hour later the same payload reads an hour later, not an hour longer",
+    [round(w.resets_at - NOW) for w in q._codex_from_payload(live, NOW + 3600).windows],
+    [7200],
+)
+check("the entry expires when its earliest window rolls", round(tc._codex_valid_until(live, NOW) - NOW), 3600)
+check(
+    "the EARLIEST of two windows decides",
+    round(
+        tc._codex_valid_until(
+            {"rate_limit": {"primary_window": win(1, WEEK, 90000), "secondary_window": win(1, HOUR5, 600)}}, NOW
+        )
+        - NOW
+    ),
+    600,
+)
+check(
+    "a window that cannot be placed in time is not pinned at all",
+    tc._codex_valid_until({"rate_limit": {"primary_window": win(1, WEEK, None), "secondary_window": None}}, NOW),
+    None,
+)
+check("nor is a payload with no rate_limit", tc._codex_valid_until({}, NOW), None)
+check(
+    "a null window is skipped, not treated as unplaceable",
+    round(
+        tc._codex_valid_until({"rate_limit": {"primary_window": win(1, WEEK, 4242), "secondary_window": None}}, NOW)
+        - NOW
+    ),
+    4242,
+)
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

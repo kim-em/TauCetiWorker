@@ -115,6 +115,40 @@ print(
 )
 q._cached_claude = lambda _fp: (payload, time.time())
 
+# The fallback after a failed forced refresh must RE-READ the cache rather than reuse what it validated
+# BEFORE the request. A usage fetch can block for its whole timeout, and an entry that was live when we
+# set out may have passed a reset it describes while we waited — so hand out a live entry first and
+# nothing second, and the fallback must decline rather than serve the stale one.
+reads = []
+
+
+def serving(entries):
+    def _cached(_fp):
+        reads.append(1)
+        return entries.pop(0) if entries else None
+
+    return _cached
+
+
+tc.quota._http_get_json = offline
+q._cached_claude = serving([(payload, time.time()), None])
+expired_mid_flight, _ = q._claude_pass("fp", "token", refresh=True)
+q._cached_claude = serving([None, (payload, time.time())])  # the other order: a concurrent writer filled it
+appeared_mid_flight, _ = q._claude_pass("fp", "token", refresh=True)
+tc.quota._http_get_json = saved_http
+q._cached_claude = lambda _fp: (payload, time.time())
+race_ok = (
+    len(reads) == 4  # two reads per pass: once before the request, once in the fallback
+    and not expired_mid_flight.available
+    and expired_mid_flight.error
+    and appeared_mid_flight.available
+)
+print(
+    f"[{'OK ' if race_ok else 'XX '}] the fallback re-reads the cache instead of trusting a pre-request "
+    f"copy: reads={len(reads)} expired_mid_flight={expired_mid_flight.available!r} "
+    f"appeared_mid_flight={appeared_mid_flight.available!r}"
+)
+
 # The same thing through the REAL cache: store an entry, read it back, and check what the file's own
 # recorded fetch time does to the verdict. The stubs above pin the pacing rule; this pins the plumbing
 # that has to carry the instant — and the entries that must not be believed at all.
@@ -254,4 +288,4 @@ status_ok = (
 )
 print(f"[{'OK ' if status_ok else 'XX '}] backoff preserves the child diagnostic: {backoff['detail']!r}")
 
-sys.exit(0 if ok and semantic_ok and frozen_ok and cache_ok and driver_ok and status_ok else 1)
+sys.exit(0 if ok and semantic_ok and race_ok and frozen_ok and cache_ok and driver_ok and status_ok else 1)
