@@ -53,7 +53,11 @@ def check(name, got, want):
 # for _next_eligible (a staticmethod), so a bare instance is enough.
 q = tc.Quota.__new__(tc.Quota)
 
-os.environ.pop("TAUCETI_PACE", None)  # the legacy identity curve: budget == elapsed%
+# This file is about reading the payload, not about the curve, so pin the identity line (budget ==
+# elapsed%) and keep the arithmetic in the expectations obvious. The shipped default is 60:40; what it
+# does to classification is pace_curve.py's business.
+IDENTITY = "0:0,100:100"
+os.environ["TAUCETI_PACE"] = IDENTITY
 
 
 def iso(delta_s: float) -> str:
@@ -168,7 +172,7 @@ check(
     (q._claude_from_payload(over).windows[0].status, tc._unavail_reason(q._claude_from_payload(over))[0]),
     ("over-pace", True),
 )
-os.environ.pop("TAUCETI_PACE", None)
+os.environ["TAUCETI_PACE"] = IDENTITY
 
 # --- the two windows are read independently -------------------------------------------------------
 # A session reset must not change how the weekly reads, and vice versa: they roll on separate clocks,

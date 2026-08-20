@@ -98,14 +98,19 @@ CLAUDE_BOOTSTRAP_DROP_ENV = frozenset(
 
 # --- pacing curve --------------------------------------------------------------------------------
 # The pacer decides a window is "under pace" while used% stays under a BUDGET that grows with elapsed
-# time. By default that budget is elapsed% itself (the legacy "used% <= elapsed%" identity line), but
-# the operator can supply a custom piecewise-linear curve via $TAUCETI_PACE / --pace as "time%:budget%"
-# control points, e.g. "0:10,50:70,90:90": allow 10% immediately, ramp to 70% by the halfway mark and
-# 90% by 90% of the window, then (unspecified time 100 defaults to budget 100) ramp to the full quota by
-# the deadline. Budget is a % of quota and MAY exceed 100 (a value >=100 means "no cap" — used% can't
-# exceed 100 anyway). This shapes only the soft PACE; a window at 100% used is still 'exhausted', and
-# missing/limit-reached data still fail-closed, both independent of the curve.
-_LEGACY_PACE = [(0.0, 0.0), (100.0, 100.0)]  # used% <= elapsed%
+# time. The operator supplies that budget as piecewise-linear "time%:budget%" control points via
+# $TAUCETI_PACE / --pace, e.g. "0:10,50:70,90:90": allow 10% immediately, ramp to 70% by the halfway
+# mark and 90% by 90% of the window, then (unspecified time 100 defaults to budget 100) ramp to the full
+# quota by the deadline. Budget is a % of quota and MAY exceed 100 (a value >=100 means "no cap" — used%
+# can't exceed 100 anyway). This shapes only the soft PACE; a window at 100% used is still 'exhausted',
+# and missing/limit-reached data still fail-closed, both independent of the curve.
+#
+# The default (nothing set) is "60:40": spend at two thirds of clock rate through the first 60% of a
+# window, then ramp to the full quota by the reset. It holds usage below the identity line at every
+# point, so a window that would otherwise burn out early keeps a reserve for the work that arrives late
+# in the window, while still permitting the whole quota before the window rolls.
+# The older default, the identity line used% < elapsed%, is still one spec away: `--pace 0:0,100:100`.
+_DEFAULT_PACE = [(0.0, 0.0), (60.0, 40.0), (100.0, 100.0)]
 
 _PACE_CACHE: dict[str, list[tuple[float, float]]] = {}
 
@@ -113,8 +118,8 @@ _PACE_CACHE: dict[str, list[tuple[float, float]]] = {}
 def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
     """Parse "t:b,t:b,..." into sorted (time%, budget%) control points, filling the endpoints the
     operator omits: time 0 -> budget 0, time 100 -> budget 100 (full quota by the deadline). An empty /
-    None spec is the legacy identity curve (used% <= elapsed%). Raises ValueError on a malformed spec so
-    the CLI can reject it up front."""
+    None spec is _DEFAULT_PACE. Raises ValueError on a malformed spec so the CLI can reject it up
+    front."""
     pts: dict[float, float] = {}
     for tok in (t.strip() for t in (spec or "").split(",")):
         if not tok:
@@ -136,12 +141,12 @@ def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
             raise ValueError(f"pace time {t} given twice with different budgets ({pts[t]} and {b})")
         pts[t] = b
     if not pts:
-        # No usable points: a blank/whitespace spec means "unset" (legacy identity); a spec with real
-        # structure that parsed to nothing (e.g. "," or ",,") is a typo, not a request for identity —
+        # No usable points: a blank/whitespace spec means "unset" (the default curve); a spec with real
+        # structure that parsed to nothing (e.g. "," or ",,") is a typo, not a request for the default —
         # reject it loudly.
         if (spec or "").strip():
             raise ValueError(f"no pace points in {spec!r} (want time:budget, e.g. 0:10,50:70)")
-        return list(_LEGACY_PACE)
+        return list(_DEFAULT_PACE)
     pts.setdefault(0.0, 0.0)
     pts.setdefault(100.0, 100.0)
     return sorted(pts.items())
@@ -149,14 +154,20 @@ def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
 
 def pace_curve() -> list[tuple[float, float]]:
     """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
-    see it; parse cached per raw spec). A spec that somehow reaches here malformed — the CLI validates
-    --pace up front — falls back to the strict legacy curve rather than silently unlocking spend."""
+    see it; parse cached per raw spec).
+
+    A malformed spec cannot reach here through a sanctioned path: the CLI rejects $TAUCETI_PACE for every
+    subcommand and --pace in cmd_work, and a worker's `pace` from workers.toml arrives as --pace. This
+    fallback is the last-resort guard for a path that outlives or bypasses that validation, and it
+    substitutes the DEFAULT curve — stricter than the identity line the pacer used to fall back on, but
+    not provably stricter than whatever the operator was reaching for. That is the trade: pace on a known
+    curve rather than crash the pacer, and let validation stay the thing that catches typos."""
     raw = os.environ.get("TAUCETI_PACE", "") or ""
     if raw not in _PACE_CACHE:
         try:
             _PACE_CACHE[raw] = parse_pace_curve(raw)
         except ValueError:
-            _PACE_CACHE[raw] = list(_LEGACY_PACE)
+            _PACE_CACHE[raw] = list(_DEFAULT_PACE)
     return _PACE_CACHE[raw]
 
 

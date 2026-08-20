@@ -103,7 +103,7 @@ check("limit_reached ⇒ exhausted", p.windows[0].status, "exhausted")
 check("limit_reached ⇒ unavailable", p.available, False)
 
 # Positive headroom, not "not over budget": a window with ZERO elapsed time has a zero budget under the
-# default identity curve, so 0% used sits exactly ON the line and there is no room for the request we
+# default curve, so 0% used sits exactly ON the line and there is no room for the request we
 # would be starting. It is a SOFT pacing block (real quota, wrong moment), and it clears itself seconds
 # later as the window ages — or immediately under a curve that grants budget up front.
 p = q._codex_from_payload(
