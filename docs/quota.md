@@ -17,9 +17,8 @@ that lands on Codex make no model request at all.
 ## Keeping the Claude token alive: `--auto-refresh`
 
 By default the worker never rotates a refresh token. When the Claude access token
-expires it reports Claude unavailable, and your next `claude` run (or one
-`--ignore-quota --agent claude` round) renews it. That is fine at a keyboard and
-fatal unattended: `work --loop` will sit at
+expires it reports Claude unavailable, and your next `claude` run renews it. That
+is fine at a keyboard and fatal unattended: `work --loop` will sit at
 `claude usage HTTP 401 (access token expired or rejected; log in again)` until
 someone intervenes.
 
@@ -52,8 +51,8 @@ On macOS, Claude Code keeps its credentials in the login Keychain rather than in
 a file. The pacer reads them from the Keychain, read-only. It never refreshes
 the Keychain, because that would log out your interactive `claude`. So on token
 expiry it simply reports Claude unavailable for the cycle, and your next `claude`
-run refreshes the Keychain so the pacer can read it again. One
-`--ignore-quota --agent claude` round does the same.
+run refreshes the Keychain so the pacer can read it again. `--auto-refresh` does
+nothing here, so that run is the only way back.
 
 A locked Keychain, which is what you get headless or over SSH, reports
 unavailable with a hint to `security unlock-keychain` first.

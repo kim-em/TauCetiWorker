@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import sys
 import time
 
 from .agents import resolve_authoring_profile
 from .config import Config, NoProgress, log
 from .constants import BACKOFF_BASE, BACKOFF_MAX, EX_NOPROGRESS, GH_MIN_BUDGET, INTERROUND, OPENROUTER_MODELS, POLL
 from .github import github_budget
-from .quota import Provider, Quota, _glyph, _unavail_reason, quota_line
+from .quota import Provider, Quota, _glyph, _hours, _unavail_reason, quota_line
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
 
@@ -127,8 +128,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     nap = max(POLL, int(prov.retry_after) if (prov and prov.retry_after) else 0)
                     if prov and not prov.retry_after and prov.next_eligible:
                         nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
+                    # A loop DOES wait this out, so the wording stays — but a rejected credential is not
+                    # something waiting fixes, and an unattended loop can poll on one indefinitely, so
+                    # name the command that ends it here too.
                     log(
-                        f"quota: {agent} hard-blocked ({why}) — --ignore-quota still waits out a hard block; sleeping {nap}s"
+                        f"quota: {agent} hard-blocked ({why}) — --ignore-quota still waits out a hard "
+                        f"block; sleeping {nap}s{_credential_hint(agent, prov)}"
                     )
                     report_runtime("waiting-quota", detail=why, next_action_at=time.time() + nap)
                     time.sleep(nap)
@@ -260,7 +265,8 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
 
 
 def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:
-    """What a --ignore-quota loop does with the pacer snapshot for its pinned agent.
+    """What --ignore-quota does with the pacer snapshot for its pinned agent — applied both by the loop
+    between rounds and by the round deciding what it will launch.
 
     --ignore-quota overrides PACING, not AVAILABILITY:
       "run"       — the provider is available (under pace), launch as usual.
@@ -300,6 +306,45 @@ def choose_model(
     return Quota(cfg).choose(None if agent == "auto" else agent, refresh=refresh, renew=renew)
 
 
+def _credential_hint(agent: str, prov: Provider | None) -> str:
+    """What to do about a provider that refused the credential, or "" when that is not what happened.
+
+    A 401 is not a quota condition and waiting does not fix it: something has to renew the token. The
+    worker will not do that behind the operator's back — refresh tokens are single-use, so rotating one
+    can log out an interactive session sharing it — which leaves two doors, and this says so rather than
+    reporting a wait that would never end."""
+    error = (prov.error if prov else None) or ""
+    # Match what THIS pacer writes, not any text mentioning a token: each provider phrases its own
+    # refusal (see Quota.codex / Quota._claude_pass), and a transport error that happens to carry `401`
+    # or "token expired" from something in between is not our credential being rejected.
+    if "usage HTTP 401" not in error and "token expired; refresh left to the operator" not in error:
+        return ""
+    if agent != "claude":
+        return ". Run `codex login` to renew the credential"
+    if sys.platform == "darwin":
+        # The Keychain is the store here and the worker never writes it, so --auto-refresh does nothing
+        # and offering it would send the operator after a flag that cannot help.
+        return ". Run `claude` to renew the Keychain credential"
+    return (
+        ". Run `claude` to renew the credential, or --auto-refresh to let an unattended worker rotate it"
+        " (see docs/quota.md)"
+    )
+
+
+def _retry_hint(prov: Provider | None) -> str:
+    """When it is worth coming back, for a round that is about to exit rather than wait: the endpoint's
+    own Retry-After if it gave one, else the moment the blocking window frees. Empty when the snapshot
+    says nothing about timing — better silent than invented."""
+    after = prov.retry_after if prov else None
+    if not after and prov and prov.next_eligible:
+        after = prov.next_eligible - time.time()
+    if not after or after <= 0:
+        return ""
+    if after < 60:
+        return f"; retry in ~{max(1, round(after))}s"
+    return f"; retry in ~{round(after / 60)}m" if after < 90 * 60 else f"; retry in ~{_hours(after)}"
+
+
 def claude_pending_init(snap: dict) -> bool:
     """True when Claude is unavailable ONLY because a window has reset and nothing has opened the next
     cycle yet, and initializing it is within the operator's pace curve (Quota decides both, purely).
@@ -323,19 +368,44 @@ def resolve_work_model(
     about the moment it was taken (see Quota._claude_pass), so where nothing has just refreshed it — a
     one-shot `tauceti work` — this is the difference between deciding on current telemetry and refusing
     on an hour-old verdict. A `_round` child leaves it off: the loop driver refreshed seconds ago, and
-    re-fetching would only ask the same question twice."""
+    re-fetching would only ask the same question twice.
+
+    --ignore-quota still reads usage. It overrides the soft burn-pace throttle, not availability, so the
+    read is what tells a pinned agent apart from a dead one; only --quota-cmd replaces the pacer
+    outright."""
     if dry:
         return agent, False
     if agent in OPENROUTER_MODELS or agent == "kiro":
         return agent, False
-    if ignore_quota and not quota_cmd:
-        if agent == "auto":
-            raise SystemExit(
-                "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
-            )
-        return agent, False
+    if ignore_quota and not quota_cmd and agent == "auto":
+        raise SystemExit(
+            "--ignore-quota needs an explicit paced --agent (codex/claude); 'auto' can't choose without the pacer"
+        )
     # The round is deciding what it will actually launch, so the token it hands the agent must be live.
     chosen, snap = choose_model(cfg, agent, quota_cmd, refresh=fresh, renew=True)
+    if ignore_quota and not quota_cmd:
+        # --ignore-quota overrides PACING, not AVAILABILITY — the same rule the loop applies between
+        # rounds (see cmd_loop). Reading usage costs no quota, and firing a round at an exhausted or
+        # unreadable provider only buys a clone, an engine launch, and a scoreboard full of errors.
+        verdict = _ignore_quota_verdict(chosen, snap.get(agent))
+        if verdict == "wait" and agent == "claude" and claude_pending_init(snap):
+            return "claude", True  # the one hard block a bounded, pace-respecting request may clear
+        if verdict == "wait":
+            prov = snap.get(agent)
+            why = prov.error if (prov and prov.error) else (_unavail_reason(prov)[1] if prov else "unavailable")
+            # This round exits rather than sleeping — a loop parent is what waits — so say when to come
+            # back rather than implying the round will hold the line itself. An expired credential is
+            # the case an operator can fix in one command, and this used to be that command: the round
+            # skipped the read, launched, and the agent CLI renewed on its way up. It no longer does, so
+            # the message has to hand the recovery back.
+            fix = _credential_hint(agent, prov)
+            raise NoProgress(
+                f"{agent} hard-blocked ({why}) — --ignore-quota overrides pacing, not availability; "
+                f"not launching this round{fix or _retry_hint(prov)}"
+            )
+        if verdict == "over-pace":
+            log(f"quota: {agent} over-pace; --ignore-quota set — running anyway")
+        return agent, False
     if chosen is None and claude_pending_init(snap):
         return "claude", True
     if chosen is None:

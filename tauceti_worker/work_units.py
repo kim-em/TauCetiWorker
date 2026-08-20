@@ -196,12 +196,13 @@ def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
 
 def run_round(w: Worker, opts: RoundOpts) -> int:
     # Re-mirror the operator's (externally-refreshed) credentials into this worker's isolated home
-    # before any work runs. The quota pacer does this too, but the --ignore-quota + pinned --agent
-    # fast path in resolve_work_model skips the pacer, and host-mode review never hits the bubble-seed
-    # mirror — so without this an operator token refresh (or account switch) never reaches a host
-    # worker, and its mirror ages out into 401s that silently burn review rounds. No-op when not
-    # isolated / on macOS, and a handful of small local reads + compares in steady state, so it is
-    # safe to run every round. Skipped under --dry-run, which must not mutate the credential mirror.
+    # before any work runs. The quota pacer does this too, and every paced path now reaches it — but the
+    # unpaced ones (kiro, the OpenRouter providers, --dry-run's early return) do not, and host-mode
+    # review never hits the bubble-seed mirror. Without this an operator token refresh (or account
+    # switch) never reaches a host worker, and its mirror ages out into 401s that silently burn review
+    # rounds. No-op when not isolated / on macOS, and a handful of small local reads + compares in
+    # steady state, so it is safe to run every round. Skipped under --dry-run, which must not mutate the
+    # credential mirror.
     if not opts.dry_run:
         mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
@@ -642,9 +643,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # PR the loop picks would abort identically, so charging it to whichever PR happened to be
             # this round's candidate is charging a PR for someone else's outage. Three of them strand
             # that PR at MAX_REVIEW_ERRORS: dropped from review candidacy and given a public "Review
-            # stuck" issue, for a condition it had nothing to do with. A review worker running
-            # --ignore-quota does not pace, so it keeps launching into an exhausted window and would
-            # spread those strikes across unrelated PRs. Warn loudly and back off instead.
+            # stuck" issue, for a condition it had nothing to do with. The round checks availability
+            # before it launches, but a provider can go down between that check and the review, or during
+            # it — and a worker running --ignore-quota keeps working through the soft blocks either side
+            # of that, so it meets the case often. Warn loudly and back off instead.
             warn_red(
                 f"review #{pr}: the reviewer's provider is unavailable, so the round stopped without "
                 f"posting anything. This is machine-wide (every PR's review would stop the same way), "
