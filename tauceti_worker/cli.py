@@ -484,12 +484,18 @@ def main(argv: list[str] | None = None) -> int:
     cmd = args.cmd
 
     # A malformed pacing curve must fail loudly, not silently degrade to the default (which is not what
-    # the operator asked for). Validate the EFFECTIVE spec for every subcommand up front: --pace, where
-    # it was given, and $TAUCETI_PACE otherwise. Validating the env unconditionally would let a stale
-    # export in the shell veto the flag documented to override it. cmd_work re-validates the flag it
-    # applies, so a subcommand reaching this without one still gets checked.
+    # the operator asked for). $TAUCETI_PACE is checked for EVERY subcommand, as a configuration lint:
+    # most do not pace, but a malformed export is a mistake worth naming wherever it is noticed, and any
+    # child they spawn would inherit it.
+    #
+    # `work`/`_round` are the commands that replace it: cmd_work installs their --pace into the
+    # environment, so where one was given it is the spec that will be used and the env is about to be
+    # overwritten. Validating the env there anyway would let a stale export in the shell veto the flag
+    # documented to override it. `workers add --pace` is NOT this: it records a curve for a worker to be
+    # launched later, leaves this process's environment alone, and is validated as configuration (see
+    # WorkerSpec.from_dict) rather than as an override.
+    pace_arg = getattr(args, "pace", None) if cmd in ("work", "_round") else None
     pace_env = os.environ.get("TAUCETI_PACE")
-    pace_arg = getattr(args, "pace", None)
     if pace_arg is not None:
         try:
             parse_pace_curve(pace_arg)

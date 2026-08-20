@@ -99,34 +99,66 @@ check("valid env is honoured", live("50:70") == [(0.0, 0.0), (50.0, 70.0), (100.
 os.environ.pop("TAUCETI_PACE", None)
 
 
-# --- the CLI validates the EFFECTIVE spec ------------------------------------------------------------
-# Whichever spec would actually be used must fail loudly if it is malformed — and only that one. A stale
-# `export TAUCETI_PACE` in the operator's shell cannot veto the flag documented to override it.
+# --- the CLI validates the spec that will be USED ----------------------------------------------------
+# $TAUCETI_PACE is linted for every subcommand. `work`/`_round` are the ones that REPLACE it, so a
+# --pace they were given is what gets validated: a stale `export` in the operator's shell must not veto
+# the flag documented to override it. Nothing else may claim that exemption.
+_dispatched = []
+
+
 def cli(argv, env):
-    """Run `tauceti <argv>` as far as the pacing validation, with cmd_work stubbed out so nothing after
-    it runs. Returns None when it got through, or the message it died with."""
+    """Run `tauceti <argv>` as far as the pacing validation, with the commands it can dispatch to stubbed
+    out so nothing after it runs. Returns None when it got through, or the message it died with."""
+    was = os.environ.get("TAUCETI_PACE")
     if env is None:
         os.environ.pop("TAUCETI_PACE", None)
     else:
         os.environ["TAUCETI_PACE"] = env
-    saved = tc.cli.cmd_work
-    tc.cli.cmd_work = lambda *_a, **_k: 0
+    _dispatched.clear()
+    saved_work, saved_workers = tc.cli.cmd_work, tc.cli.cmd_workers
+    # `workers add` writes the operator's real workers.toml, so stub it too: a regression here must not
+    # reach the filesystem, it must show up as this check failing.
+    tc.cli.cmd_work = lambda args, **_k: _dispatched.append(("work", getattr(args, "pace", None))) or 0
+    tc.cli.cmd_workers = lambda args: _dispatched.append(("workers", getattr(args, "pace", None))) or 0
     try:
         tc.cli.main(argv)
         return None
     except tc.Die as e:
         return str(e)
     finally:
-        tc.cli.cmd_work = saved
+        tc.cli.cmd_work, tc.cli.cmd_workers = saved_work, saved_workers
         os.environ.pop("TAUCETI_PACE", None)
+        if was is not None:
+            os.environ["TAUCETI_PACE"] = was
 
 
 check("a malformed env is rejected, naming itself", "$TAUCETI_PACE" in (cli(["work"], "50:") or ""))
 check("a malformed flag is rejected, naming itself", "--pace" in (cli(["work", "--pace", "50:"], None) or ""))
 check("a valid flag overrides a malformed env", cli(["work", "--pace", "0:0,100:100"], "50:") is None)
+check("...and reaches the command that installs it", _dispatched == [("work", "0:0,100:100")])
 check("a malformed flag is caught even under a valid env", "--pace" in (cli(["work", "--pace", "50:"], "50:70") or ""))
 check("a valid env alone is fine", cli(["work"], "50:70") is None)
 check("...as is neither", cli(["work"], None) is None)
+# The hidden per-round entry point is the same command by another name.
+check("_round overrides too", cli(["_round", "--pace", "0:0,100:100"], "50:") is None)
+# `workers add --pace` records a curve for a worker launched LATER; it leaves this process's environment
+# alone, so it cannot excuse a malformed one that a manager spawned here would inherit.
+check(
+    "workers add does not excuse the env it leaves in place",
+    "$TAUCETI_PACE" in (cli(["workers", "add", "--pace", "0:0,100:100"], "50:") or ""),
+)
+check("...and nothing was dispatched", _dispatched == [])
+# A subcommand with no --pace at all still gets the lint.
+check("a parser without --pace still checks the env", "$TAUCETI_PACE" in (cli(["usage"], "50:") or ""))
+
+# A worker's stored curve is validated where it is configured, so a typo is a config error rather than a
+# worker that starts, rejects its own --pace, and crash-loops.
+try:
+    tc.WorkerSpec.from_dict({"id": "w1", "pace": "not-a-curve"}, 0)
+    check("a malformed pace in workers.toml is a config error", False)
+except tc.WorkersError as e:
+    check("a malformed pace in workers.toml is a config error", "workers[0].pace" in str(e))
+check("...and a valid one is kept", tc.WorkerSpec.from_dict({"id": "w1", "pace": "50:70"}, 0).pace == "50:70")
 
 
 # --- _classify_window honours the live curve --------------------------------------------------------

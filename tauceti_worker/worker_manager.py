@@ -31,6 +31,7 @@ from typing import NoReturn
 
 from .constants import AGENTS, ALLOWED_TASKS
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
+from .quota import parse_pace_curve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, read_json, update_status
 
@@ -177,6 +178,19 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _pace(value, where: str) -> str | None:
+    """A pacing curve, checked here at the CONFIGURATION boundary. Without this a typo passes `workers
+    apply --check`, and the manager discovers it only by launching a worker that rejects its own --pace
+    and dies — which reads as a crash-looping worker rather than a bad line in workers.toml."""
+    spec = _string(value, where, optional=True)
+    if spec is not None:
+        try:
+            parse_pace_curve(spec)
+        except ValueError as e:
+            raise WorkersError(f"{where}: {e}") from None
+    return spec
+
+
 # Names the manager or the worker's own bootstrap owns. Setting one from the config would break the
 # thing it configures, and the failure would read as a worker bug rather than a configuration error:
 # the first four decide which state file the worker heartbeats into, whether it knows it is managed,
@@ -290,7 +304,7 @@ class WorkerSpec:
             source=_string(raw.get("source"), f"workers[{index}].source", optional=True),
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
-            pace=_string(raw.get("pace"), f"workers[{index}].pace", optional=True),
+            pace=_pace(raw.get("pace"), f"workers[{index}].pace"),
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,

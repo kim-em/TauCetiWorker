@@ -111,7 +111,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
 | `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |
-| `pace` | string | unset | Pacing curve as `time%:budget%` points, for example `0:10,50:70,90:90` |
+| `pace` | string | unset | Pacing curve as `time%:budget%` points, for example `0:10,50:70,90:90`; rejected by `apply --check` if malformed |
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
 | `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
 | `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
