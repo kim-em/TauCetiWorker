@@ -643,9 +643,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # PR the loop picks would abort identically, so charging it to whichever PR happened to be
             # this round's candidate is charging a PR for someone else's outage. Three of them strand
             # that PR at MAX_REVIEW_ERRORS: dropped from review candidacy and given a public "Review
-            # stuck" issue, for a condition it had nothing to do with. A review worker running
-            # --ignore-quota does not pace, so it keeps launching into an exhausted window and would
-            # spread those strikes across unrelated PRs. Warn loudly and back off instead.
+            # stuck" issue, for a condition it had nothing to do with. The round checks availability
+            # before it launches, but a provider can go down between that check and the review, or during
+            # it — and a worker running --ignore-quota keeps working through the soft blocks either side
+            # of that, so it meets the case often. Warn loudly and back off instead.
             warn_red(
                 f"review #{pr}: the reviewer's provider is unavailable, so the round stopped without "
                 f"posting anything. This is machine-wide (every PR's review would stop the same way), "

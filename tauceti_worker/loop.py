@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import sys
 import time
 
 from .agents import resolve_authoring_profile
@@ -127,8 +128,12 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str) -> int:
                     nap = max(POLL, int(prov.retry_after) if (prov and prov.retry_after) else 0)
                     if prov and not prov.retry_after and prov.next_eligible:
                         nap = max(nap, min(int(prov.next_eligible - time.time()) + 5, 3600))
+                    # A loop DOES wait this out, so the wording stays — but a rejected credential is not
+                    # something waiting fixes, and an unattended loop can poll on one indefinitely, so
+                    # name the command that ends it here too.
                     log(
-                        f"quota: {agent} hard-blocked ({why}) — --ignore-quota still waits out a hard block; sleeping {nap}s"
+                        f"quota: {agent} hard-blocked ({why}) — --ignore-quota still waits out a hard "
+                        f"block; sleeping {nap}s{_credential_hint(agent, prov)}"
                     )
                     report_runtime("waiting-quota", detail=why, next_action_at=time.time() + nap)
                     time.sleep(nap)
@@ -309,13 +314,17 @@ def _credential_hint(agent: str, prov: Provider | None) -> str:
     can log out an interactive session sharing it — which leaves two doors, and this says so rather than
     reporting a wait that would never end."""
     error = (prov.error if prov else None) or ""
-    # Each provider phrases its own refusal: claude names the status code, codex says what it means. Match
-    # both, since neither wording contains the other.
-    if "401" not in error and "token expired" not in error:
+    # Match what THIS pacer writes, not any text mentioning a token: each provider phrases its own
+    # refusal (see Quota.codex / Quota._claude_pass), and a transport error that happens to carry `401`
+    # or "token expired" from something in between is not our credential being rejected.
+    if "usage HTTP 401" not in error and "token expired; refresh left to the operator" not in error:
         return ""
     if agent != "claude":
         return ". Run `codex login` to renew the credential"
-    # --auto-refresh is Claude-only, and a no-op on macOS where the Keychain is the store.
+    if sys.platform == "darwin":
+        # The Keychain is the store here and the worker never writes it, so --auto-refresh does nothing
+        # and offering it would send the operator after a flag that cannot help.
+        return ". Run `claude` to renew the Keychain credential"
     return (
         ". Run `claude` to renew the credential, or --auto-refresh to let an unattended worker rotate it"
         " (see docs/quota.md)"
@@ -332,7 +341,7 @@ def _retry_hint(prov: Provider | None) -> str:
     if not after or after <= 0:
         return ""
     if after < 60:
-        return f"; retry in ~{round(after)}s"
+        return f"; retry in ~{max(1, round(after))}s"
     return f"; retry in ~{round(after / 60)}m" if after < 90 * 60 else f"; retry in ~{_hours(after)}"
 
 
