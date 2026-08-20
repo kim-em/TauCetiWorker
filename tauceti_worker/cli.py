@@ -106,7 +106,7 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_QUOTA_CMD      default for --quota-cmd
-  TAUCETI_PACE           pacing curve "t:b,..." (default = strict used% < elapsed%); see --pace
+  TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
@@ -300,9 +300,10 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         metavar="T:B[,T:B...]",
         help="pacing curve as `time%%:budget%%` control points, e.g. `0:10,50:70,90:90`: cap used%% at "
         "budget%% once time%% of the window has elapsed, linearly interpolated between points. An "
-        "unspecified time 0 defaults to budget 0 and time 100 to budget 100. Default (unset) is the "
-        "strict rule used%% < elapsed%%. Overrides $TAUCETI_PACE for this run (inherited by loop "
-        "children)",
+        "unspecified time 0 defaults to budget 0 and time 100 to budget 100. Default (unset) is "
+        "`60:40` — 40%% of the quota through the first 60%% of a window, then a ramp to the full quota "
+        "by the reset; `0:0,100:100` restores the plain used%% < elapsed%% rule. Overrides "
+        "$TAUCETI_PACE for this run (inherited by loop children)",
     )
     p.add_argument(
         "--worker-id",
@@ -482,9 +483,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cmd = args.cmd
 
-    # A malformed $TAUCETI_PACE must fail loudly, not silently degrade to identity pacing (which can be
-    # LOOSER than intended). Validate the effective env for every subcommand up front; --pace itself is
-    # validated (and sets this env) in cmd_work.
+    # A malformed $TAUCETI_PACE must fail loudly, not silently degrade to the default curve (which is
+    # not what the operator asked for). Validate the effective env for every subcommand up front; --pace
+    # itself is validated (and sets this env) in cmd_work.
     pace_env = os.environ.get("TAUCETI_PACE")
     if pace_env is not None:
         try:
@@ -665,7 +666,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     if getattr(args, "auto_refresh", None):
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"
     # --pace overrides the env and is inherited by loop children (read live via pace_curve()). Validate
-    # up front so a typo fails loudly here rather than silently falling back to the strict legacy curve.
+    # up front so a typo fails loudly here rather than silently falling back to the default curve.
     if getattr(args, "pace", None) is not None:
         try:
             parse_pace_curve(args.pace)

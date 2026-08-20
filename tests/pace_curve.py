@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """The pacer's under/over-pace threshold is a piecewise-linear budget curve from $TAUCETI_PACE
-(--pace), defaulting to the legacy identity used% <= elapsed%. Verify parsing (incl. endpoint fill and
-rejection of bad specs), interpolation, and that _classify_window actually honours the curve.
-Dependency-free; no network."""
+(--pace), defaulting to `60:40`. Verify parsing (incl. endpoint fill and rejection of bad specs),
+interpolation, and that _classify_window actually honours the curve. Dependency-free; no network."""
 
 import os
 import sys
@@ -22,8 +21,10 @@ def check(name, cond):
 
 
 # --- parse_pace_curve: shape + endpoint fill --------------------------------------------------------
-check("empty -> legacy identity", tc.parse_pace_curve("") == [(0.0, 0.0), (100.0, 100.0)])
-check("None -> legacy identity", tc.parse_pace_curve(None) == [(0.0, 0.0), (100.0, 100.0)])
+DEFAULT = [(0.0, 0.0), (60.0, 40.0), (100.0, 100.0)]  # the shipped default, spelled out
+check("the default curve is 60:40", tc._DEFAULT_PACE == DEFAULT)
+check("empty -> default curve", tc.parse_pace_curve("") == DEFAULT)
+check("None -> default curve", tc.parse_pace_curve(None) == DEFAULT)
 check(
     "fills both endpoints (0->0, 100->100)",
     tc.parse_pace_curve("50:70") == [(0.0, 0.0), (50.0, 70.0), (100.0, 100.0)],
@@ -53,8 +54,8 @@ for bad in ("50:inf", "50:nan", "50:1e999", "nan:50", "inf:50", "50:-inf"):
 # a spec with real (comma) structure but no points is a typo, not a request for identity
 for bad in (",", ",,", ", ,"):
     check(f"rejects empty-but-nonblank {bad!r}", rejects(bad))
-# but a genuinely blank/whitespace spec is 'unset' = identity, and stray commas around real points are fine
-check("blank -> identity", tc.parse_pace_curve("   ") == [(0.0, 0.0), (100.0, 100.0)])
+# but a genuinely blank/whitespace spec is 'unset' = the default, and stray commas around real points are fine
+check("blank -> default curve", tc.parse_pace_curve("   ") == DEFAULT)
 check("tolerates stray commas", tc.parse_pace_curve("50:70,") == [(0.0, 0.0), (50.0, 70.0), (100.0, 100.0)])
 
 
@@ -65,8 +66,17 @@ check("budget interpolated midway 0..50", tc.pace_budget(c, 25) == 40.0)  # 10 +
 check("budget interpolated 50..90", tc.pace_budget(c, 70) == 80.0)  # 70 + (20/40)*(90-70)
 check("budget clamps below 0", tc.pace_budget(c, -10) == 10.0)  # e clamped to 0 -> 10
 check("budget clamps above 100", tc.pace_budget(c, 200) == 100.0)
-ident = tc.parse_pace_curve("")
+ident = tc.parse_pace_curve("0:0,100:100")
 check("identity budget == elapsed", tc.pace_budget(ident, 37) == 37.0)
+
+# The default curve: two thirds of clock rate to the 60% mark, then a ramp to the full quota. It must
+# sit strictly below the identity line everywhere in between, so it can only ever tighten pacing.
+d = tc.parse_pace_curve("")
+check("default at the knee", tc.pace_budget(d, 60) == 40.0)
+check("default before the knee", tc.pace_budget(d, 30) == 20.0)
+check("default after the knee", tc.pace_budget(d, 80) == 70.0)  # 40 + (20/40)*(100-40)
+check("default reaches the full quota", tc.pace_budget(d, 100) == 100.0)
+check("default is below identity everywhere between", all(tc.pace_budget(d, e) < e for e in range(1, 100)))
 
 
 # --- _classify_window honours the live curve --------------------------------------------------------
@@ -78,8 +88,10 @@ def status(used, elapsed, pace):
     return tc._classify_window("session", used, elapsed, None, False).status
 
 
-check("identity: used 60 @ elapsed 50 -> over-pace", status(60, 50, None) == "over-pace")
-check("identity: used 40 @ elapsed 50 -> under-pace", status(40, 50, None) == "under-pace")
+check("default: used 40 @ elapsed 50 -> over-pace", status(40, 50, None) == "over-pace")  # budget 33.3
+check("default: used 30 @ elapsed 50 -> under-pace", status(30, 50, None) == "under-pace")
+check("identity: used 60 @ elapsed 50 -> over-pace", status(60, 50, "0:0,100:100") == "over-pace")
+check("identity: used 40 @ elapsed 50 -> under-pace", status(40, 50, "0:0,100:100") == "under-pace")
 check("curve 50:70: used 60 @ elapsed 50 -> under-pace", status(60, 50, "50:70") == "under-pace")
 check("curve 50:70: used 80 @ elapsed 50 -> over-pace", status(80, 50, "50:70") == "over-pace")
 check("curve tail uncapped: used 95 @ elapsed 100 -> under-pace", status(95, 100, "90:90") == "under-pace")
