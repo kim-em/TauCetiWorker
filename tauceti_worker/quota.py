@@ -637,15 +637,19 @@ def _claude_valid_until(readings: list[Reading]) -> float | None:
 
 def _codex_clocks(w: object) -> tuple[float, float] | None:
     """(window_length, seconds_remaining) for one codex window, or None when what it reports cannot be a
-    clock. Both numbers must be real and finite (`isinstance(x, int)` alone would accept `true`, which
-    JSON allows and which would sail through the arithmetic below as 1), the window must have positive
-    length, and the remainder must be neither negative nor longer than the window itself — a window
-    cannot have more time left than it lasts. A window failing this reads as `unknown`, which is
-    fail-closed, rather than as an elapsed fraction computed from nonsense."""
+    clock we may pace against.
+
+    Both numbers must be real and finite (`isinstance(x, int)` alone would accept `true`, which JSON
+    allows and which would sail through the arithmetic below as 1), and the remainder must lie in
+    (0, limit]. `ra == limit` is a window that just opened, which the endpoint does report. `ra == 0` is
+    NOT a live window: it says this one is rolling over as we read it, and it computes to 100% elapsed,
+    where the budget is the whole quota — so every usage figure short of 100 would read as `under-pace`
+    on a window a request would no longer land in. A window failing this reads as `unknown`, which is
+    fail-closed, rather than as an elapsed fraction computed from a clock we cannot place."""
     if not isinstance(w, dict):
         return None
     lim, ra = w.get("limit_window_seconds"), w.get("reset_after_seconds")
-    if not _finite_num(lim) or not _finite_num(ra) or lim <= 0 or not 0 <= ra <= lim:
+    if not _finite_num(lim) or not _finite_num(ra) or lim <= 0 or not 0 < ra <= lim:
         return None
     return float(lim), float(ra)
 
@@ -1469,9 +1473,13 @@ class Quota:
         acct = self._codex_account_id(auth)
         if acct:
             headers["ChatGPT-Account-Id"] = acct
+        # ONE instant for this response, taken BEFORE the request rather than after it. Every codex clock
+        # is a duration REMAINING, measured when the server built the snapshot; anchoring it to the moment
+        # the bytes finished arriving would push the deadline out by however long the fetch took, which is
+        # the same expiry bug in miniature. Anchoring early can only expire the entry sooner than it must.
+        observed_at = time.time()
         try:
             code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
-            observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
         except GitHubError as e:
             # Re-read the entry rather than reusing the tuple from before the request: a usage fetch can
             # block for its whole timeout, and an entry that was live when we set out may have passed its
@@ -1818,7 +1826,12 @@ class Quota:
             return None
         if _claude_payload_problem(payload) is not None:
             return None
-        if _claude_valid_until(_claude_readings(payload)) is None:
+        # Derive the deadline and check it has not PASSED, not merely that it exists. `_cached_entry`
+        # enforces whatever expiry was stored, but an entry written before that rule carries none — and a
+        # reading stays `active` for CLAUDE_RESET_SKEW_S past its reset, so "still parses" is not "still
+        # describes this window".
+        valid_until = _claude_valid_until(_claude_readings(payload))
+        if valid_until is None or time.time() >= valid_until:
             return None
         return payload, float(fetched_at)
 

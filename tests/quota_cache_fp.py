@@ -105,6 +105,20 @@ for junk in (-1, True, float("nan"), "600", None, 5 * 3600 + 1):
     check(f"reset_after_seconds={junk!r} ⇒ not cacheable", tc._codex_valid_until(bad, at), None)
     check("...and reads as unknown, not available", q._codex_from_payload(bad, at).windows[0].status, "unknown")
 check("an unplaceable codex payload has no expiry to store", tc._codex_valid_until({"rate_limit": {}}, at), None)
+# A reset that is happening RIGHT NOW is not a window a request can land in: it computes to 100% elapsed,
+# where the budget is the whole quota, so any usage short of 100 would read as under-pace on a window
+# already rolling. A window that just OPENED (ra == lim) is fine and the endpoint does report it.
+zero = {
+    "rate_limit": {"primary_window": {"used_percent": 20, "limit_window_seconds": 5 * 3600, "reset_after_seconds": 0}}
+}
+check("reset_after_seconds=0 ⇒ unknown, not under-pace", q._codex_from_payload(zero, at).windows[0].status, "unknown")
+check("...and not cacheable either", tc._codex_valid_until(zero, at), None)
+fresh_win = {
+    "rate_limit": {
+        "primary_window": {"used_percent": 0, "limit_window_seconds": 5 * 3600, "reset_after_seconds": 5 * 3600}
+    }
+}
+check("a just-opened window is still read", q._codex_from_payload(fresh_win, at).windows[0].elapsed, 0.0)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
