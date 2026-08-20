@@ -292,6 +292,67 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
 PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
 
 
+# Stages whose agent edits the checkout. `review` and `progress` do not, and a bubble round works
+# inside the container, so the host checkout would say nothing about it either way.
+FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "roadmap"}
+_MAX_CHANGED_FILES = 25
+
+
+def _checkout_head(cfg: Config) -> str | None:
+    """The checkout's HEAD before a round, or None when there is nothing to compare against."""
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(cfg.checkout), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.strip() or None if p.returncode == 0 else None
+
+
+def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
+    """Record what the round actually did to the working tree, from git rather than from the log.
+
+    The transcript is not a reliable answer to "what did this round write". An agent may edit through
+    a structured tool, a `python3 - <<EOF` heredoc, or `apply_patch`, and a long command is truncated
+    before its target path is reached; an attempt to recover the paths by pattern-matching command
+    text was tried and withdrawn (it claimed writes for `jq '.a > .b'` and missed `2>err.log`). git
+    already knows exactly, so ask it.
+
+    Both halves matter. A round that finished normally has committed and pushed, so its work is in
+    `pre..HEAD` and the tree is clean; a round that died mid-edit left the tree dirty and committed
+    nothing. Reporting only one of the two would miss whichever case actually occurred.
+
+    Best effort throughout: this is a log line. Any git failure is silently nothing rather than an
+    error on a round that may well have succeeded."""
+
+    def git(*args) -> str:
+        try:
+            p = subprocess.run(["git", "-C", str(cfg.checkout), *args], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return p.stdout if p.returncode == 0 else ""
+
+    committed = git("diff", "--stat", f"{pre_head}..HEAD") if pre_head else ""
+    dirty = [ln for ln in git("status", "--porcelain").splitlines() if ln.strip()]
+    if not committed.strip() and not dirty:
+        return
+    if committed.strip():
+        lines = [ln for ln in committed.splitlines() if ln.strip()]
+        log(f"  files committed this round ({len(lines) - 1} changed):")
+        for ln in lines[:_MAX_CHANGED_FILES]:
+            log(f"    {ln.strip()}")
+        if len(lines) > _MAX_CHANGED_FILES:
+            log(f"    … {len(lines) - _MAX_CHANGED_FILES} more")
+    if dirty:
+        # Uncommitted work after the round is worth seeing: it is what a round that gave up, or
+        # verified and then edited again, leaves behind.
+        log(f"  files left uncommitted ({len(dirty)}):")
+        for ln in dirty[:_MAX_CHANGED_FILES]:
+            log(f"    {ln.strip()}")
+        if len(dirty) > _MAX_CHANGED_FILES:
+            log(f"    … {len(dirty) - _MAX_CHANGED_FILES} more")
+
+
 def _open_pr_numbers(w: Worker) -> set[int] | None:
     try:
         return {p["number"] for p in w.gh.pr_list(["number"], state="open")}
@@ -467,7 +528,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     log(f"→ {stage.upper()}: {what}   [{detail}]")
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED else None
+    pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
     rc = fn(w, sv, c, opts, bubble)
+    if stage in FILE_CHANGE_STAGES and not bubble:
+        log_round_file_changes(w.cfg, pre_head)
     # A model round that exits 0 but leaves no mark on GitHub did no real work. Usually benign: another
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
