@@ -478,34 +478,41 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def resolve_pace(cmd: str | None, args) -> None:
+    """Settle the pacing curve for this process: validate the spec that will actually be used, and
+    install a --pace override into $TAUCETI_PACE so the pacer (which reads it live) and any loop child
+    see it.
+
+    A malformed curve must fail loudly, not silently degrade to the default, which is not what the
+    operator asked for. $TAUCETI_PACE is checked for EVERY subcommand as a configuration lint: most do
+    not pace, but a stale export is a mistake worth naming wherever it is noticed, and a child spawned
+    from here would inherit it.
+
+    `work`/`_round` are the commands that REPLACE it. Where one carries --pace, that flag is the spec
+    this run uses and the environment is overwritten below, so validating the environment as well would
+    let a stale export veto the flag documented to override it. `workers add --pace` is not this: it
+    records a curve for a worker launched later, leaves this environment alone, and is validated as
+    configuration (see WorkerSpec.from_dict).
+
+    Validation and installation live together, one step before dispatch, so no code can run against a
+    curve that has been checked but not applied — or applied but not checked."""
+    override = getattr(args, "pace", None) if cmd in ("work", "_round") else None
+    spec, source = (override, "--pace") if override is not None else (os.environ.get("TAUCETI_PACE"), "$TAUCETI_PACE")
+    if spec is not None:
+        try:
+            parse_pace_curve(spec)
+        except ValueError as e:
+            raise Die(f"{source}: {e}") from None
+    if override is not None:
+        os.environ["TAUCETI_PACE"] = override
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     cmd = args.cmd
 
-    # A malformed pacing curve must fail loudly, not silently degrade to the default (which is not what
-    # the operator asked for). $TAUCETI_PACE is checked for EVERY subcommand, as a configuration lint:
-    # most do not pace, but a malformed export is a mistake worth naming wherever it is noticed, and any
-    # child they spawn would inherit it.
-    #
-    # `work`/`_round` are the commands that replace it: cmd_work installs their --pace into the
-    # environment, so where one was given it is the spec that will be used and the env is about to be
-    # overwritten. Validating the env there anyway would let a stale export in the shell veto the flag
-    # documented to override it. `workers add --pace` is NOT this: it records a curve for a worker to be
-    # launched later, leaves this process's environment alone, and is validated as configuration (see
-    # WorkerSpec.from_dict) rather than as an override.
-    pace_arg = getattr(args, "pace", None) if cmd in ("work", "_round") else None
-    pace_env = os.environ.get("TAUCETI_PACE")
-    if pace_arg is not None:
-        try:
-            parse_pace_curve(pace_arg)
-        except ValueError as e:
-            raise Die(f"--pace: {e}") from None
-    elif pace_env is not None:
-        try:
-            parse_pace_curve(pace_env)
-        except ValueError as e:
-            raise Die(f"$TAUCETI_PACE: {e}") from None
+    resolve_pace(cmd, args)
 
     if cmd is None:
         return cmd_tui(args)
@@ -679,14 +686,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool) -> int:
     # --auto-refresh likewise, so a loop child renews on the same authority the driver was given.
     if getattr(args, "auto_refresh", None):
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"
-    # --pace overrides the env and is inherited by loop children (read live via pace_curve()). Validate
-    # up front so a typo fails loudly here rather than silently falling back to the default curve.
-    if getattr(args, "pace", None) is not None:
-        try:
-            parse_pace_curve(args.pace)
-        except ValueError as e:
-            raise Die(f"--pace: {e}") from None
-        os.environ["TAUCETI_PACE"] = args.pace
+    # --pace is settled in resolve_pace, before dispatch, together with the environment it overrides.
     # --stream restores live agent output (default redirects it to a log file). Set in the env so loop
     # children inherit it.
     if getattr(args, "stream", False):

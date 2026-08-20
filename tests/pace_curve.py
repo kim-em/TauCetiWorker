@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -131,6 +132,33 @@ def cli(argv, env):
         if was is not None:
             os.environ["TAUCETI_PACE"] = was
 
+
+def resolved(cmd, pace, env):
+    """What resolve_pace leaves in the environment for the pacer to read live, or the message it died
+    with. Validation and installation are one step, so this covers both."""
+    was = os.environ.get("TAUCETI_PACE")
+    if env is None:
+        os.environ.pop("TAUCETI_PACE", None)
+    else:
+        os.environ["TAUCETI_PACE"] = env
+    try:
+        tc.cli.resolve_pace(cmd, SimpleNamespace(pace=pace))
+        return os.environ.get("TAUCETI_PACE")
+    except tc.Die as e:
+        return str(e)
+    finally:
+        os.environ.pop("TAUCETI_PACE", None)
+        if was is not None:
+            os.environ["TAUCETI_PACE"] = was
+
+
+# The flag is not merely validated, it REPLACES the environment — the pacer reads $TAUCETI_PACE live, so
+# a validated flag that never lands there would leave the run on the stale curve it was meant to override.
+check("the flag is installed for the pacer to read", resolved("work", "50:70", None) == "50:70")
+check("...over a malformed env", resolved("work", "50:70", "50:") == "50:70")
+check("...and over a valid one", resolved("work", "50:70", "0:0,100:100") == "50:70")
+check("no flag leaves the env alone", resolved("work", None, "0:0,100:100") == "0:0,100:100")
+check("a command that cannot override does not install", resolved("workers", "50:70", None) is None)
 
 check("a malformed env is rejected, naming itself", "$TAUCETI_PACE" in (cli(["work"], "50:") or ""))
 check("a malformed flag is rejected, naming itself", "--pace" in (cli(["work", "--pace", "50:"], None) or ""))
