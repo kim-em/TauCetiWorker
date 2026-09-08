@@ -302,7 +302,8 @@ def run_round(w: Worker, opts: RoundOpts) -> int:
         mirror_creds(w.cfg)
     sv = survey(w.cfg, w.gh, w.rs, w.counters, deep=True)
     if sv.github_failed:
-        raise NoProgress("gh pr list failed (GitHub API?) — aborting round, not falling through to authoring")
+        detail = "; ".join(sv.errors) or "gh pr list failed (no diagnostic available)"
+        raise NoProgress(f"{detail} — aborting round, not falling through to authoring")
 
     log(f"open PRs: {sv.status_label_line()}")
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
